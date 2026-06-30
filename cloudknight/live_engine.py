@@ -38,6 +38,7 @@ from .auction_analyzer import (AuctionAnalyzer, AuctionSnapshot,
 from .signal_hunter import (SignalHunter, TradeSignal, SignalResult, TradingPlan)
 from .stock_pool import PoolManager
 from .data_manager import DataFetcher
+from .paper_trader import PaperTrader, SNAPSHOT_FILE as PAPER_SNAPSHOT_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class LiveTradingEngine:
         self.hunter = SignalHunter()
         self.pool_mgr = PoolManager()
         self.fetcher = DataFetcher()
+        self.paper_trader = PaperTrader()
 
         # 运行状态
         self.state = EngineState.STOPPED
@@ -651,13 +653,60 @@ class LiveTradingEngine:
         self._todays_decisions = []
         self.hunter.clear_cache()
 
-    def _save_daily_summary(self):
-        """保存每日交易总结"""
+    def _save_daily_summary(self, force: bool = False):
+        """保存每日收盘总结（已存在则跳过）"""
         today = datetime.now().strftime("%Y%m%d")
         filepath = os.path.join(LIVE_LOG_DIR, f"summary_{today}.json")
 
+        if os.path.exists(filepath) and not force:
+            logger.info(f"今日总结已存在，跳过生成: {filepath}")
+            return
+
+        logger.info("正在生成当日收盘总结...")
+
+        # 重置不可用数据源标记
+        if hasattr(self, "fetcher"):
+            self.fetcher._unavailable_sources.clear()
+
+        # ── 1. 市场总览（指数 + 成交量 + 估值） ──
+        market_overview = self._build_market_overview()
+
+        # ── 2. 技术指标（各指数 MACD/KDJ/RSI） ──
+        tech_indicators = self._build_tech_indicators()
+
+        # ── 3. 情绪评估 ──
+        sentiment = self._build_sentiment_assessment(market_overview)
+
+        # ── 4. 牛熊行情研判 ──
+        market_trend = self._build_market_trend()
+
+        # ── 5. 涨跌停统计 ──
+        limit_stats = self._build_limit_stats()
+
+        # ── 6. 策略盈亏 ──
+        strategy_pnl = self._collect_strategy_pnl()
+
+        # ── 7. 热门板块详情 ──
+        hot_sectors = self._build_hot_sectors()
+
+        # ── 8. 涨停个股完整列表 ──
+        limit_up_details = self._build_limit_up_details()
+
+        # ── 9. 次日交易计划 ──
+        next_day_plan = self._build_next_day_plan()
+
         summary = {
             "date": today,
+            "generated_at": datetime.now().isoformat(),
+            "market_overview": market_overview,
+            "technical_indicators": tech_indicators,
+            "sentiment": sentiment,
+            "market_trend": market_trend,
+            "limit_stats": limit_stats,
+            "strategy_pnl": strategy_pnl,
+            "hot_sectors": hot_sectors,
+            "limit_up_details": limit_up_details,
+            "next_day_plan": next_day_plan,
             "phase_logs": [
                 {"time": l.timestamp.isoformat(),
                  "phase": l.phase.value,
@@ -674,9 +723,416 @@ class LiveTradingEngine:
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
-            logger.info(f"每日总结已保存: {filepath}")
+            logger.info(f"收盘总结已保存: {filepath}")
         except Exception as e:
             logger.warning(f"保存总结失败: {e}")
+
+    # ── 总结子模块 ─────────────────────────────────────────
+
+    def _build_market_overview(self) -> dict:
+        """构建市场总览"""
+        overview = {"indices": {}, "total_volume": 0, "sh_pe": 0, "activity": {}}
+
+        try:
+            # 指数分析
+            indices = self.market.analyze_indices(days=60)
+            for idx in indices.values():
+                overview["indices"][idx.name] = {
+                    "code": idx.code,
+                    "close": idx.close,
+                    "pct_change": idx.pct_change,
+                    "amplitude": idx.amplitude,
+                    "volume_ratio": idx.volume_ratio,
+                    "trend_score": idx.trend_score,
+                    "trend_rating": idx.trend_rating,
+                }
+
+            # 市场活跃度
+            activity = self.fetcher.fetch_market_activity()
+            overview["activity"] = activity
+
+            # 两市总成交额
+            vol_info = self.fetcher.fetch_market_total_volume()
+            overview["total_volume"] = vol_info.get("total_volume", 0)
+            overview["sh_pe"] = vol_info.get("sh_pe", 0)
+            overview["sz_total_mv"] = vol_info.get("sz_total_mv", 0)
+            overview["sh_total_mv"] = vol_info.get("sh_total_mv", 0)
+
+        except Exception as e:
+            logger.warning(f"构建市场总览失败: {e}")
+
+        return overview
+
+    def _build_tech_indicators(self) -> dict:
+        """构建各关键指数技术指标"""
+        result = {}
+        try:
+            key_codes = {
+                "000001": "上证指数", "399001": "深证成指",
+                "399006": "创业板指", "000300": "沪深300",
+            }
+            for code, name in key_codes.items():
+                df = self.fetcher.fetch_index_daily(code)
+                if df is None or df.empty:
+                    continue
+                col_map = {"日期": "date", "收盘": "close", "开盘": "open",
+                           "最高": "high", "最低": "low", "成交量": "volume"}
+                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                required = ["close", "high", "low"]
+                if not all(c in df.columns for c in required):
+                    continue
+
+                from .indicators import analyze_macd, analyze_kdj, analyze_rsi
+                m = analyze_macd(df.tail(60))
+                k = analyze_kdj(df.tail(60))
+                r = analyze_rsi(df.tail(60))
+
+                result[name] = {
+                    "macd_signal": m.signal,
+                    "macd_trend": m.trend,
+                    "macd_strength": m.strength,
+                    "kdj_signal": k.signal,
+                    "kdj_trend": k.trend,
+                    "rsi_value": r.details.get("rsi", r.details.get("RSI", 50)) if r.details else 50,
+                    "rsi_trend": r.trend,
+                }
+        except Exception as e:
+            logger.warning(f"构建技术指标失败: {e}")
+        return result
+
+    def _build_sentiment_assessment(self, market_overview: dict) -> dict:
+        """综合情绪评估 - 包含贪婪/恐惧指数"""
+        try:
+            sentiment_raw = self.market.get_market_sentiment()
+            score = sentiment_raw.get("score", 50)
+
+            # 贪婪/恐惧映射
+            if score >= 80:
+                emotion = "极度贪婪"
+                emotion_code = "extreme_greed"
+            elif score >= 65:
+                emotion = "贪婪"
+                emotion_code = "greed"
+            elif score >= 45:
+                emotion = "中性"
+                emotion_code = "neutral"
+            elif score >= 30:
+                emotion = "恐惧"
+                emotion_code = "fear"
+            else:
+                emotion = "极度恐惧"
+                emotion_code = "extreme_fear"
+
+            # 市场过热/过冷判断
+            activity = market_overview.get("activity", {})
+            up_count = int(activity.get("上涨", 0))
+            down_count = int(activity.get("下跌", 0))
+            limit_up = int(activity.get("涨停", 0))
+            limit_down = int(activity.get("跌停", 0))
+
+            if limit_up > 100 and up_count > down_count * 3:
+                heat = "过热"
+            elif limit_down > 50 and down_count > up_count * 2:
+                heat = "过冷"
+            elif up_count > down_count * 2:
+                heat = "偏热"
+            elif down_count > up_count * 2:
+                heat = "偏冷"
+            else:
+                heat = "正常"
+
+            return {
+                "assessment": sentiment_raw.get("sentiment", "neutral"),
+                "score": score,
+                "emotion": emotion,
+                "emotion_code": emotion_code,
+                "market_heat": heat,
+                "factors": sentiment_raw.get("factors", {}),
+            }
+        except Exception as e:
+            logger.warning(f"构建情绪评估失败: {e}")
+            return {"assessment": "neutral", "score": 50, "emotion": "未知", "emotion_icon": "❓", "market_heat": "未知", "factors": {}}
+
+    def _build_market_trend(self) -> dict:
+        """构建牛熊行情研判"""
+        try:
+            return self.market.diagnose_market_trend(days=120)
+        except Exception as e:
+            logger.warning(f"牛熊研判失败: {e}")
+            return {"phase": "未知", "phase_code": "unknown", "confidence": 0, "advice": "", "signals": []}
+
+    def _build_limit_stats(self) -> dict:
+        """构建涨跌停统计数据"""
+        import pandas as pd
+
+        stats = {
+            "limit_up": 0, "limit_down": 0,
+            "limit_up_real": 0, "limit_down_real": 0,
+            "up_count": 0, "down_count": 0, "flat_count": 0,
+            "max_consecutive": 0, "first_board_count": 0,
+            "consecutive_boards": [],
+            "top_limit_up_sectors": [],
+        }
+
+        try:
+            today_str = datetime.now().strftime("%Y%m%d")
+
+            # 市场活跃度（涨跌家数）
+            activity = self.fetcher.fetch_market_activity()
+            stats["limit_up"] = int(activity.get("涨停", 0))
+            stats["limit_up_real"] = int(activity.get("真实涨停", 0))
+            stats["limit_down"] = int(activity.get("跌停", 0))
+            stats["limit_down_real"] = int(activity.get("真实跌停", 0))
+            stats["up_count"] = int(activity.get("上涨", 0))
+            stats["down_count"] = int(activity.get("下跌", 0))
+            stats["flat_count"] = int(activity.get("平盘", 0))
+
+            # 涨停池详情
+            zt_df = self.fetcher.fetch_limit_up_pool(today_str)
+            if not zt_df.empty:
+                # 最高连板
+                if "连板数" in zt_df.columns:
+                    lb_nums = pd.to_numeric(zt_df["连板数"], errors="coerce").dropna()
+                    if not lb_nums.empty:
+                        stats["max_consecutive"] = int(lb_nums.max())
+
+                # 首板数
+                if "连板数" in zt_df.columns:
+                    first_boards = zt_df[pd.to_numeric(zt_df["连板数"], errors="coerce") == 1]
+                    stats["first_board_count"] = len(first_boards)
+
+                # 连板股列表（>=2板）
+                if "连板数" in zt_df.columns and "名称" in zt_df.columns:
+                    lb_boards = zt_df[pd.to_numeric(zt_df["连板数"], errors="coerce") >= 2]
+                    for _, row in lb_boards.iterrows():
+                        stats["consecutive_boards"].append({
+                            "code": str(row.get("代码", "")),
+                            "name": str(row.get("名称", "")),
+                            "consecutive": int(row["连板数"]),
+                            "reason": str(row.get("涨停统计", "")),
+                        })
+                    stats["consecutive_boards"] = stats["consecutive_boards"][:20]
+
+                # 涨停行业分布
+                if "所属行业" in zt_df.columns:
+                    sector_counts = zt_df["所属行业"].value_counts().head(5)
+                    stats["top_limit_up_sectors"] = [
+                        {"sector": str(k), "count": int(v)}
+                        for k, v in sector_counts.items()
+                    ]
+
+        except Exception as e:
+            logger.warning(f"构建涨跌统计失败: {e}")
+
+        return stats
+
+    def _collect_strategy_pnl(self) -> dict:
+        """收集各策略当日盈亏（从 PaperTrader 赛马数据读取）"""
+        result = {}
+        strategy_keys = ["dragon", "sparrow", "turtle", "value"]
+        strategy_labels = {
+            "dragon": "龙头战法", "sparrow": "麻雀战法",
+            "turtle": "海龟战法", "value": "价值投资",
+        }
+
+        try:
+            # 优先从 PaperTrader 内存读取
+            if self.paper_trader and self.paper_trader.accounts:
+                rankings = self.paper_trader.get_rankings()
+                for r in rankings:
+                    key = next((k for k, v in strategy_labels.items()
+                               if v == r.strategy_label), None)
+                    if key:
+                        result[key] = {
+                            "label": r.strategy_label,
+                            "rank": r.rank,
+                            "total_equity": r.total_equity,
+                            "total_return_pct": r.total_return,
+                            "daily_return_pct": r.daily_return if r.daily_return is not None else 0,
+                            "position_count": r.position_count,
+                            "max_drawdown": r.max_drawdown,
+                            "trades": r.trades,
+                        }
+
+            # 若内存为空，尝试从保存文件读取历史数据
+            if not result and os.path.exists(PAPER_SNAPSHOT_FILE):
+                with open(PAPER_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                    race_data = json.load(f)
+                accounts = race_data.get("accounts", {})
+                for key, acc in accounts.items():
+                    label = strategy_labels.get(key, key)
+                    snapshots = acc.get("daily_snapshots", [])
+                    latest = snapshots[-1] if snapshots else {}
+                    result[key] = {
+                        "label": label,
+                        "rank": 0,
+                        "total_equity": latest.get("equity", acc.get("initial_capital", DEFAULT_CAPITAL)),
+                        "total_return_pct": round(
+                            (latest.get("equity", acc.get("initial_capital", DEFAULT_CAPITAL))
+                             / acc.get("initial_capital", DEFAULT_CAPITAL) - 1) * 100, 2
+                        ),
+                        "daily_return_pct": 0,
+                        "position_count": latest.get("positions", 0),
+                        "max_drawdown": 0,
+                        "trades": 0,
+                    }
+        except Exception as e:
+            logger.warning(f"收集策略盈亏失败: {e}")
+
+        # 补全缺失策略为初始状态
+        for key in strategy_keys:
+            if key not in result:
+                result[key] = {
+                    "label": strategy_labels.get(key, key),
+                    "rank": 0, "total_equity": DEFAULT_CAPITAL,
+                    "total_return_pct": 0, "daily_return_pct": 0,
+                    "position_count": 0, "max_drawdown": 0, "trades": 0,
+                }
+
+        return result
+
+    def _build_hot_sectors(self) -> dict:
+        """构建热门板块详情（按涨停家数排名 + 板块内五日涨幅Top10成分股 + 涨停交叉统计）"""
+        import pandas as pd
+
+        result = {
+            "top_sectors": [],
+            "limit_up_by_sector": {},
+            "generated_at": datetime.now().isoformat(),
+        }
+
+        try:
+            # 1. 获取涨停池数据（用于交叉统计和板块排名）
+            today_str = datetime.now().strftime("%Y%m%d")
+            zt_df = self.fetcher.fetch_limit_up_pool(today_str)
+            zt_by_sector: Dict[str, List[dict]] = {}
+
+            if not zt_df.empty and "所属行业" in zt_df.columns:
+                for _, row in zt_df.iterrows():
+                    sec = str(row.get("所属行业", ""))
+                    if sec not in zt_by_sector:
+                        zt_by_sector[sec] = []
+                    zt_by_sector[sec].append({
+                        "code": str(row.get("代码", "")),
+                        "name": str(row.get("名称", "")),
+                        "price": round(float(row.get("最新价", 0) or 0), 2),
+                        "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
+                        "consecutive": int(pd.to_numeric(row.get("连板数", 0), errors="coerce").__float__() or 0),
+                        "first_time": str(row.get("首次封板时间", "")),
+                        "last_time": str(row.get("最后封板时间", "")),
+                        "turnover": round(float(row.get("换手率", 0) or 0), 2),
+                        "volume_amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
+                        "float_mv": round(float(row.get("流通市值", 0) or 0) / 1e8, 2),
+                        "reason": str(row.get("涨停统计", row.get("涨停原因", ""))),
+                    })
+
+            # 2. 获取板块分析结果（已按涨停家数排名，包含五日涨幅Top10成分股）
+            sectors = self.market.analyze_sectors(top_n=10)
+            if not sectors:
+                logger.warning("analyze_sectors 返回空列表，热门板块无数据")
+
+            # 3. 组装板块数据（交叉涨停龙头）
+            for s in sectors:
+                sec_name = s.name
+                zt_count = len(zt_by_sector.get(sec_name, []))
+                sector_data = {
+                    "name": sec_name,
+                    "code": s.code,
+                    "pct_change": s.pct_change,
+                    "strength_rank": s.strength_rank,
+                    "trend": s.trend,
+                    "volume_surge": s.volume_surge,
+                    "limit_up_count": zt_count,
+                    "total_stocks": s.total_stocks,
+                    "leading_stocks": s.leading_stocks,  # 领涨股 Top3（五日涨幅）
+                    "top_stocks": s.top_stocks,          # 板块内五日涨幅 Top10 详细数据
+                    # 板块内涨停龙头（取当日涨幅最高的5只）
+                    "limit_up_leaders": sorted(
+                        zt_by_sector.get(sec_name, []),
+                        key=lambda x: x["pct_change"], reverse=True
+                    )[:5],
+                }
+                result["top_sectors"].append(sector_data)
+
+            result["limit_up_by_sector"] = {
+                k: len(v) for k, v in zt_by_sector.items()
+            }
+
+        except Exception as e:
+            logger.warning(f"构建热门板块数据失败: {e}", exc_info=True)
+
+        return result
+
+    def _build_limit_up_details(self) -> dict:
+        """构建涨停个股完整详情列表"""
+        import pandas as pd
+
+        result = {
+            "stocks": [],
+            "total_count": 0,
+            "first_board_count": 0,
+            "consecutive_leaders": [],
+        }
+
+        try:
+            today_str = datetime.now().strftime("%Y%m%d")
+            zt_df = self.fetcher.fetch_limit_up_pool(today_str)
+            if zt_df.empty:
+                return result
+
+            result["total_count"] = len(zt_df)
+
+            for _, row in zt_df.iterrows():
+                consecutive = int(pd.to_numeric(row.get("连板数", 0), errors="coerce").__float__() or 0)
+                stock_info = {
+                    "code": str(row.get("代码", "")),
+                    "name": str(row.get("名称", "")),
+                    "price": round(float(row.get("最新价", 0) or 0), 2),
+                    "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
+                    "limit_price": round(float(row.get("涨停价", 0) or 0), 2),
+                    "consecutive": consecutive,
+                    "sector": str(row.get("所属行业", "")),
+                    "first_time": str(row.get("首次封板时间", "")),
+                    "last_time": str(row.get("最后封板时间", "")),
+                    "turnover": round(float(row.get("换手率", 0) or 0), 2),
+                    "volume_amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),  # 亿
+                    "float_mv": round(float(row.get("流通市值", 0) or 0) / 1e8, 2),  # 亿
+                    "total_mv": round(float(row.get("总市值", 0) or 0) / 1e8, 2),  # 亿
+                    "seal_amount": round(float(row.get("封单资金", 0) or 0) / 1e8, 2),  # 亿
+                    "reason": str(row.get("涨停统计", row.get("涨停原因", ""))),
+                }
+                result["stocks"].append(stock_info)
+
+                if consecutive == 1:
+                    result["first_board_count"] += 1
+                elif consecutive >= 3:
+                    result["consecutive_leaders"].append(stock_info)
+
+            # 按连板数排序
+            result["stocks"].sort(key=lambda x: (-x["consecutive"], -x["pct_change"]))
+            result["consecutive_leaders"].sort(key=lambda x: -x["consecutive"])
+
+        except Exception as e:
+            logger.warning(f"构建涨停详情失败: {e}")
+
+        return result
+
+    def _build_next_day_plan(self) -> dict:
+        """构建次日交易计划概览"""
+        plan = {}
+        for strategy_name in STRATEGIES:
+            pool = self.pool_mgr.get_pool(strategy_name)
+            if not pool:
+                continue
+            ranked = pool.ranked()
+            top5 = [{"code": item.code, "name": item.name, "score": item.score}
+                    for item in ranked[:5]]
+            plan[strategy_name] = {
+                "label": STRATEGIES.get(strategy_name, strategy_name),
+                "pool_size": len(ranked),
+                "top5": top5,
+            }
+        return plan
 
     def _add_log(self, phase: TradingPhase, event: str):
         """添加引擎日志"""

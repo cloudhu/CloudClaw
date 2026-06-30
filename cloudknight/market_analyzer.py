@@ -52,9 +52,11 @@ class SectorAnalysis:
     code: str
     pct_change: float
     strength_rank: int          # 板块强度排名
-    leading_stocks: List[str]   # 领涨股
+    leading_stocks: List[str]   # 领涨股（前3名，简短字符串）
     volume_surge: bool          # 是否放量
     trend: str                  # 趋势方向
+    top_stocks: List[Dict] = field(default_factory=list)  # 板块内涨幅Top10详细数据
+    total_stocks: int = 0       # 板块成分股总数
 
 
 @dataclass
@@ -172,50 +174,129 @@ class MarketAnalyzer:
         return results
 
     def analyze_sectors(self, top_n: int = 10) -> List[SectorAnalysis]:
-        """分析行业板块热度排名
+        """分析热门板块 - 按涨停家数排名 Top N，板块内按五日涨幅选 Top10 成分股
+
+        不依赖板块指数接口（避免网络不可用时数据为空），直接使用涨停池数据：
+          1. 从涨停池统计各行业涨停家数 → 热门板块排名
+          2. 获取板块成分股，计算五日涨幅 → 板块内 Top10
+          3. 若成分股接口不可用，降级使用涨停池内该行业股票作为成分股
 
         Returns:
-            板块分析结果列表，按强度排序
+            板块分析结果列表，按涨停家数降序排列
         """
+        import pandas as pd
+
         results = []
         try:
-            import akshare as ak
-            # 获取行业板块行情
-            df = ak.stock_board_industry_name_em()
-            if df is None or df.empty:
+            today_str = datetime.now().strftime("%Y%m%d")
+
+            # 1. 获取涨停池数据
+            zt_df = self.fetcher.fetch_limit_up_pool(today_str)
+            if zt_df is None or zt_df.empty:
+                logger.warning("涨停池数据为空，无法分析热门板块")
                 return results
 
-            # 按涨跌幅排序
-            if "涨跌幅" in df.columns:
-                df = df.sort_values("涨跌幅", ascending=False)
+            if "所属行业" not in zt_df.columns:
+                logger.warning("涨停池缺少「所属行业」列，无法统计板块涨停家数")
+                return results
 
-            for i, (_, row) in enumerate(df.head(top_n).iterrows()):
-                name = str(row.get("板块名称", row.get("板块", "")))
-                code = str(row.get("板块代码", row.get("代码", "")))
-                pct = float(row.get("涨跌幅", 0))
+            # 2. 按行业统计涨停家数，降序取 Top N 作为热门板块
+            sector_zt_counts = zt_df["所属行业"].value_counts().head(top_n)
 
-                # 获取领涨股
+            for rank_idx, (sec_name, zt_count) in enumerate(sector_zt_counts.items()):
+                # 该行业涨停股的平均涨跌幅作为板块参考涨跌幅
+                sec_zt = zt_df[zt_df["所属行业"] == sec_name]
+                avg_pct = float(sec_zt["涨跌幅"].mean()) if "涨跌幅" in sec_zt.columns else 0.0
+
                 leaders = []
+                top_stocks = []
+                total_stocks = 0
+                detail = None
+
+                # 3. 尝试获取板块全部成分股（含多级备用链路）
                 try:
-                    detail = ak.stock_board_concept_cons_em(symbol=name)
-                    if detail is not None and not detail.empty and "涨跌幅" in detail.columns:
-                        top3 = detail.nlargest(3, "涨跌幅")
-                        leaders = [f"{r.get('代码', '')}({r.get('涨跌幅', 0):.1f}%)"
-                                   for _, r in top3.iterrows()]
-                except Exception:
-                    pass
+                    detail = self.fetcher.fetch_industry_stocks(industry=sec_name, board_code="")
+                except Exception as e:
+                    logger.debug(f"获取板块 {sec_name} 成分股失败: {e}")
+
+                # 4. 降级：若成分股接口不可用，用涨停池内该行业股票作为成分股
+                use_zt_fallback = False
+                if detail is None or detail.empty or "代码" not in detail.columns:
+                    logger.info(f"板块 {sec_name} 成分股接口不可用，降级使用涨停池数据")
+                    # 从涨停池中提取该行业所有股票构造 detail
+                    detail = sec_zt.copy()
+                    # 统一列名
+                    col_rename = {}
+                    for src, dst in [
+                        ("代码", "代码"), ("名称", "名称"), ("最新价", "最新价"),
+                        ("涨跌幅", "涨跌幅"), ("成交量", "成交量"), ("成交额", "成交额"),
+                        ("换手率", "换手率"), ("流通市值", "总市值"),
+                    ]:
+                        if src in detail.columns:
+                            col_rename[src] = dst
+                    if col_rename:
+                        detail = detail.rename(columns=col_rename)
+                    use_zt_fallback = True
+
+                if detail is not None and not detail.empty and "代码" in detail.columns:
+                    total_stocks = len(detail)
+
+                    codes = [
+                        str(r.get("代码", ""))
+                        for _, r in detail.iterrows()
+                        if str(r.get("代码", ""))
+                    ]
+
+                    # 5. 批量计算五日涨幅（仅对涨停池降级时的少量股票计算）
+                    gains_5d: Dict[str, float] = {}
+                    if codes:
+                        gains_5d = self.fetcher.fetch_batch_5day_gains(codes)
+
+                    # 6. 组装个股数据，按五日涨幅降序取 Top10
+                    stock_list = []
+                    for _, row in detail.iterrows():
+                        code = str(row.get("代码", ""))
+                        if not code:
+                            continue
+                        stock_list.append({
+                            "code": code,
+                            "name": str(row.get("名称", "")),
+                            "price": round(float(row.get("最新价", 0) or 0), 2),
+                            "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
+                            "pct_5d": round(gains_5d.get(code, 0.0), 2),
+                            "volume": round(float(row.get("成交量", 0) or 0) / 1e4, 1),
+                            "amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
+                            "turnover": round(float(row.get("换手率", 0) or 0), 2),
+                            "pe": round(float(row.get("市盈率-动态", 0) or 0), 1),
+                        })
+
+                    # 按五日涨幅降序
+                    stock_list.sort(key=lambda x: x["pct_5d"], reverse=True)
+                    top_stocks = stock_list[:10]
+
+                    # 领涨股 Top3（按五日涨幅）
+                    top3 = stock_list[:3]
+                    leaders = [
+                        f"{s['code']}({s['pct_5d']:.1f}%)"
+                        for s in top3
+                    ]
 
                 results.append(SectorAnalysis(
-                    name=name, code=code,
-                    pct_change=round(pct, 2),
-                    strength_rank=i + 1,
+                    name=sec_name,
+                    code="",
+                    pct_change=round(avg_pct, 2),
+                    strength_rank=rank_idx + 1,
                     leading_stocks=leaders,
-                    volume_surge=pct > 2.0,
-                    trend="up" if pct > 0 else ("down" if pct < 0 else "flat")
+                    volume_surge=zt_count >= 3,
+                    trend="up",
+                    top_stocks=top_stocks,
+                    total_stocks=total_stocks,
                 ))
-        except Exception as e:
-            logger.warning(f"获取板块数据失败: {e}")
 
+        except Exception as e:
+            logger.warning(f"获取板块数据失败: {e}", exc_info=True)
+
+        logger.info(f"板块分析完成（按涨停家数）, 获取 {len(results)} 个热门板块")
         return results
 
     def get_market_sentiment(self) -> Dict[str, Any]:
@@ -269,6 +350,121 @@ class MarketAnalyzer:
                 "macd": i.macd_signal, "kdj": i.kdj_signal
             } for i in indices.values()}
         }
+
+    def diagnose_market_trend(self, days: int = 120) -> Dict[str, Any]:
+        """牛熊行情研判 - 基于多指数长期趋势分析
+
+        判断依据:
+          - MA20/MA60/MA120/MA250 排列形态（多头/空头排列）
+          - 当前价在年线上方/下方
+          - MACD 周线级别趋势
+          - 涨跌比与成交量趋势
+        """
+        result: Dict[str, Any] = {
+            "phase": "震荡",
+            "phase_code": "neutral",
+            "confidence": 50,
+            "bull_bear_score": 50,
+            "signals": [],
+            "advice": "",
+        }
+
+        try:
+            start = (datetime.now() - timedelta(days=days + 60)).strftime("%Y%m%d")
+            fetcher = DataFetcher()
+
+            # 分析关键指数趋势
+            key_indices = {
+                "sh000001": "上证指数", "sz399001": "深证成指",
+                "sh000300": "沪深300", "sh000905": "中证500",
+            }
+
+            bull_signals = 0
+            bear_signals = 0
+            total_checks = 0
+
+            for code, name in key_indices.items():
+                clean = code[2:]
+                df = fetcher.fetch_index_daily(clean, start_date=start)
+                if df is None or df.empty or len(df) < 60:
+                    continue
+
+                col_map = {"日期": "date", "收盘": "close", "成交量": "volume"}
+                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                if "close" not in df.columns:
+                    continue
+
+                df = df.tail(days)
+                close = df["close"]
+
+                # 均线排列
+                ma20 = close.rolling(20).mean().iloc[-1]
+                ma60 = close.rolling(60).mean().iloc[-1]
+                ma120 = close.rolling(120).mean().iloc[-1] if len(df) >= 120 else ma60
+                latest = close.iloc[-1]
+
+                # 多头排列: 价格 > MA20 > MA60 > MA120
+                if latest > ma20 > ma60 > ma120:
+                    bull_signals += 1
+                # 空头排列: 价格 < MA20 < MA60 < MA120
+                elif latest < ma20 < ma60 < ma120:
+                    bear_signals += 1
+                elif latest > ma20 > ma60:
+                    bull_signals += 0.5
+                elif latest < ma20 < ma60:
+                    bear_signals += 0.5
+
+                # 年线位置
+                if len(df) >= 250:
+                    ma250 = close.rolling(250).mean().iloc[-1]
+                    if latest > ma250:
+                        bull_signals += 0.5
+                    else:
+                        bear_signals += 0.5
+
+                total_checks += 1
+
+            if total_checks == 0:
+                return result
+
+            max_signal = total_checks * 2  # 每指数最多 2 个信号
+            score = (bull_signals / max_signal) * 100 if max_signal > 0 else 50
+            score = max(0, min(100, score))
+            result["bull_bear_score"] = round(score, 1)
+
+            # 牛熊判定
+            if score >= 75:
+                result["phase"] = "强势牛市"
+                result["phase_code"] = "strong_bull"
+                result["confidence"] = round(score)
+                result["advice"] = "多头格局确立，趋势跟踪策略优先，持仓可适当激进"
+            elif score >= 60:
+                result["phase"] = "偏多震荡"
+                result["phase_code"] = "weak_bull"
+                result["confidence"] = round(score)
+                result["advice"] = "短期偏强但趋势未完全确立，控制仓位分批建仓"
+            elif score >= 40:
+                result["phase"] = "震荡市"
+                result["phase_code"] = "neutral"
+                result["confidence"] = 50
+                result["advice"] = "方向不明，轻仓参与高确定性机会，严格控制止损"
+            elif score >= 25:
+                result["phase"] = "偏空震荡"
+                result["phase_code"] = "weak_bear"
+                result["confidence"] = round(100 - score)
+                result["advice"] = "市场偏弱，以防守为主，减少新开仓，持有头寸收紧止损"
+            else:
+                result["phase"] = "弱势熊市"
+                result["phase_code"] = "strong_bear"
+                result["confidence"] = round(100 - score)
+                result["advice"] = "空头趋势明确，建议空仓或极轻仓防守，等待右侧信号"
+
+            result["signals"].append(f"多头信号: {bull_signals}/{max_signal}, 空头信号: {bear_signals}/{max_signal}")
+
+        except Exception as e:
+            logger.warning(f"牛熊研判失败: {e}")
+
+        return result
 
     def get_market_snapshot(self) -> MarketSnapshot:
         """获取市场全景快照

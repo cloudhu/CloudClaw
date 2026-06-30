@@ -8,6 +8,8 @@ CloudKnight - 云侠量化交易系统 v2
     python main.py                      # 进入交互模式
     python main.py <股票代码>             # 快速分析个股
     python main.py live                 # 启动实时交易引擎
+    python main.py web                  # 启动数据仪表盘
+    python main.py web --port 8080      # 指定端口启动仪表盘
     python main.py --version            # 显示版本号
     python main.py version              # 查看详细版本信息
 """
@@ -124,6 +126,32 @@ A股交易时间线:
     print("\n实时引擎已停止。")
 
 
+
+def regenerate_summary():
+    """强制重新生成今日收盘总结"""
+    if not check_dependencies():
+        print("请先安装缺失的依赖后再生成收盘总结。")
+        return
+
+    from cloudknight.live_engine import LiveTradingEngine
+
+    print("正在生成今日收盘总结（强制模式）...")
+    engine = LiveTradingEngine()
+    engine._save_daily_summary(force=True)
+    print("收盘总结生成完毕！")
+def start_dashboard():
+    """启动数据仪表盘 Web 服务"""
+    import sys
+    port = 8080
+    for i, a in enumerate(sys.argv):
+        if a == "--port" and i + 1 < len(sys.argv):
+            port = int(sys.argv[i + 1])
+            break
+
+    from cloudknight.web_server import start_dashboard as _start
+    _start(port=port)
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         arg = sys.argv[1].lower()
@@ -133,6 +161,10 @@ if __name__ == "__main__":
             show_version(verbose=True)
         elif arg == "live":
             start_live_engine()
+        elif arg == "web":
+            start_dashboard()
+        elif arg == "summary":
+            regenerate_summary()
         else:
             check_dependencies()
             from cloudknight.cli import main
