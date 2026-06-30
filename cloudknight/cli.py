@@ -456,6 +456,50 @@ class CloudKnightCLI(cmd.Cmd):
                 pool.clear()
                 pool.save()
                 print(f"\n{pool.strategy_label} 池已清空")
+
+        elif cmd == "eval":
+            """评估池内标的层级（focus/watch/broad/eliminated）"""
+            strategy = args[1] if len(args) > 1 else None
+            if strategy:
+                pool = self.pool_mgr.get_pool(strategy)
+                if pool is None:
+                    return print(f"未知策略: {strategy}")
+                result = pool.evaluate_pool(verbose=True)
+                self._show_eval_result(strategy, result)
+            else:
+                print("\n评估所有策略池层级...")
+                results = self.pool_mgr.evaluate_all(verbose=True)
+                for key, result in results.items():
+                    self._show_eval_result(key, result)
+
+        elif cmd == "maintain":
+            """完整池维护：评估 + 淘汰 + 补入"""
+            strategy = args[1] if len(args) > 1 else None
+            if strategy:
+                print(f"\n维护 [{STRATEGIES.get(strategy, strategy)}] 股票池...")
+                result = self.pool_mgr.maintenance_one(strategy, verbose=True)
+                self._show_maintenance_result(strategy, result)
+            else:
+                print("\n维护所有策略池...")
+                results = self.pool_mgr.maintenance_all(verbose=True)
+                for key, result in results.items():
+                    if result.get("skipped"):
+                        continue
+                    self._show_maintenance_result(key, result)
+
+        elif cmd == "tiers":
+            """查看各策略池的层级统计"""
+            overview = self.pool_mgr.tier_overview()
+            print(f"\n═══ 股票池层级统计 ═══")
+            for key, counts in overview.items():
+                label = STRATEGIES.get(key, key)
+                total = sum(counts.values())
+                parts = []
+                for t, c in counts.items():
+                    t_label = {"focus": "精选", "watch": "观察", "broad": "备选", "eliminated": "淘汰"}.get(t, t)
+                    parts.append(f"{t_label}:{c}")
+                print(f"  {label}: 共{total}只 | {' | '.join(parts)}")
+
         else:
             print(f"未知子命令: {cmd}")
 
@@ -474,6 +518,30 @@ class CloudKnightCLI(cmd.Cmd):
         print(tabulate(table_data,
                        headers=["策略", "数量", "均分", "最近筛选", "Top5 代码(评分)"],
                        tablefmt="grid"))
+
+    def _show_eval_result(self, strategy: str, result: dict):
+        """显示层级评估结果"""
+        label = STRATEGIES.get(strategy, strategy)
+        print(f"\n  [{label}] 层级评估结果:")
+        tier_order = [("focus", "🎯 精选"), ("watch", "👀 观察"), ("broad", "📋 备选"), ("eliminated", "❌ 淘汰")]
+        for tier, t_label in tier_order:
+            codes = result.get(tier, [])
+            if codes:
+                print(f"    {t_label}: {len(codes)} 只 - {', '.join(codes[:10])}{'...' if len(codes) > 10 else ''}")
+
+    def _show_maintenance_result(self, strategy: str, result: dict):
+        """显示维护结果"""
+        label = STRATEGIES.get(strategy, strategy)
+        if result.get("error"):
+            print(f"  [{label}] 维护失败: {result['error']}")
+            return
+        tc = result.get("tier_counts", {})
+        parts = []
+        tiers = [("focus", "精选"), ("watch", "观察"), ("broad", "备选")]
+        for t, t_label in tiers:
+            parts.append(f"{t_label}:{tc.get(t, 0)}")
+        print(f"  [{label}] 评估{result.get('evaluated', 0)}只 | 淘汰{result.get('eliminated', 0)}只 | "
+              f"补入{result.get('replenished', 0)}只 | {' | '.join(parts)}")
 
     def _show_pool_list(self, strategy: str):
         pool = self.pool_mgr.get_pool(strategy)

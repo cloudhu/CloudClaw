@@ -147,6 +147,10 @@ body {
 .tag-sell { background: rgba(39,174,96,0.15); color: var(--green); }
 .tag-active { background: rgba(52,152,219,0.15); color: var(--accent); }
 .tag-removed { background: rgba(108,128,153,0.15); color: var(--text-dim); }
+.tag-focus { background: rgba(231,76,60,0.18); color: #e74c3c; font-weight:700; }
+.tag-watch { background: rgba(241,196,15,0.18); color: #f1c40f; }
+.tag-broad { background: rgba(52,152,219,0.15); color: var(--accent); }
+.tag-eliminated { background: rgba(108,128,153,0.12); color: var(--text-dim); text-decoration:line-through; }
 
 /* Layout grid */
 .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
@@ -244,7 +248,15 @@ body {
   <div class="tab-panel" id="tab-pools">
     <div style="display:flex;gap:8px;margin-bottom:14px;" id="pool-tab-buttons"></div>
     <div class="card-row" id="pool-stats"></div>
+    <div class="card-row" id="pool-tier-cards"></div>
     <div class="chart-box"><div class="chart-title">股票池列表 <span id="pool-name" style="color:var(--text-dim)"></span></div>
+      <div style="margin-bottom:10px;display:flex;gap:6px;align-items:center;" id="pool-tier-filter">
+        <span style="color:var(--text-dim);font-size:12px;">层级:</span>
+        <button class="tier-filter-btn active" data-tier="" style="background:var(--accent);color:#fff;border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">全部</button>
+        <button class="tier-filter-btn" data-tier="focus" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">🎯 精选</button>
+        <button class="tier-filter-btn" data-tier="watch" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">👀 观察</button>
+        <button class="tier-filter-btn" data-tier="broad" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">📋 备选</button>
+      </div>
       <div class="table-wrap"><table id="table-pool"><thead id="table-pool-head"></thead><tbody></tbody></table></div>
     </div>
   </div>
@@ -294,7 +306,7 @@ body {
           <button onclick="document.getElementById('sector-top10-panel').style.display='none'" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:18px;">&times;</button>
         </div>
         <div class="table-wrap">
-          <table id="table-sector-top10"><thead><tr><th>排名</th><th>代码</th><th>名称</th><th>最新价</th><th>涨跌幅</th><th>成交量(万手)</th><th>成交额(亿)</th><th>换手率</th><th>市盈率</th></tr></thead><tbody></tbody></table>
+          <table id="table-sector-top10"><thead><tr><th>排名</th><th>代码</th><th>名称</th><th>最新价</th><th>日涨幅</th><th>五日涨幅</th><th>成交量(万手)</th><th>成交额(亿)</th><th>换手率</th><th>市盈率</th></tr></thead><tbody></tbody></table>
         </div>
       </div>
     </div>
@@ -596,6 +608,7 @@ function renderPositionsTable(positions) {
 // ═══ 4. 股票池 ═══════════════════════════════════════════
 let allPools = {};
 let currentPool = 'dragon';
+let currentTier = '';  // '' means all
 async function loadPools() {
   allPools = await API('/pools');
   // 池切换按钮
@@ -603,9 +616,20 @@ async function loadPools() {
     `<button class="pool-tab" data-key="${k}" style="background:${k===currentPool?'var(--accent)':'var(--panel)'};color:${k===currentPool?'#fff':'var(--text-dim)'};border:1px solid var(--border);padding:6px 16px;border-radius:4px;cursor:pointer;">${v.label} (${v.total_items})</button>`
   ).join('');
   $$('.pool-tab').forEach(b => b.addEventListener('click', function() {
-    currentPool = this.dataset.key;
+    currentPool = this.dataset.key; currentTier = '';
     $$('.pool-tab').forEach(x => { x.style.background='var(--panel)'; x.style.color='var(--text-dim)'; });
     this.style.background='var(--accent)'; this.style.color='#fff';
+    document.querySelectorAll('.tier-filter-btn').forEach(b => { b.classList.remove('active'); b.style.background='var(--panel)'; b.style.color='var(--text-dim)'; });
+    document.querySelector('.tier-filter-btn[data-tier=""]').classList.add('active');
+    document.querySelector('.tier-filter-btn[data-tier=""]').style.background='var(--accent)';
+    document.querySelector('.tier-filter-btn[data-tier=""]').style.color='#fff';
+    renderPool();
+  }));
+  // 层级筛选按钮绑定
+  document.querySelectorAll('.tier-filter-btn').forEach(b => b.addEventListener('click', function() {
+    currentTier = this.dataset.tier;
+    document.querySelectorAll('.tier-filter-btn').forEach(b => { b.classList.remove('active'); b.style.background='var(--panel)'; b.style.color='var(--text-dim)'; });
+    this.classList.add('active'); this.style.background='var(--accent)'; this.style.color='#fff';
     renderPool();
   }));
   renderPool();
@@ -614,31 +638,69 @@ async function loadPools() {
 function renderPool() {
   const pool = allPools[currentPool];
   if (!pool) return;
+  const tc = pool.tier_counts || {};
   $('#pool-name').textContent = `${pool.label} | 筛选日期: ${dateLabel(pool.last_screened)}`;
   $('#pool-stats').innerHTML = `
     <div class="card"><div class="card-label">池内标的</div><div class="card-value">${pool.total_items}</div></div>
     <div class="card"><div class="card-label">上次筛选</div><div class="card-value" style="font-size:16px">${dateLabel(pool.last_screened)||'--'}</div></div>
   `;
+  // 层级统计卡片
+  const tierColors = { focus:'#e74c3c', watch:'#f1c40f', broad:'#3498db' };
+  const tierIcons = { focus:'🎯', watch:'👀', broad:'📋' };
+  $('#pool-tier-cards').innerHTML = ['focus','watch','broad'].map(t => `
+    <div class="card" style="border-left:3px solid ${tierColors[t]};flex:1;min-width:100px;">
+      <div class="card-label">${tierIcons[t]} ${t==='focus'?'精选层':t==='watch'?'观察层':'备选层'}</div>
+      <div class="card-value" style="color:${tierColors[t]};font-size:20px;">${tc[t]||0}</div>
+    </div>
+  `).join('');
 
-  const items = pool.items || [];
+  let items = pool.items || [];
+  // 只显示 active 且未被移除的
+  items = items.filter(it => it.status === 'active');
+  // 层级筛选
+  if (currentTier) {
+    items = items.filter(it => it.tier === currentTier);
+  }
+  // 排序：先按层级（focus→watch→broad），再按评分降序
+  const tierOrder = { focus:0, watch:1, broad:2 };
+  items.sort((a,b) => {
+    const ta = tierOrder[a.tier] ?? 9;
+    const tb = tierOrder[b.tier] ?? 9;
+    if (ta !== tb) return ta - tb;
+    return (b.score||0) - (a.score||0);
+  });
+
   if (!items.length) {
-    $('#table-pool-head').innerHTML = ''; $('#table-pool tbody').innerHTML = '<tr><td class="empty">池中暂无标的</td></tr>';
+    $('#table-pool-head').innerHTML = ''; $('#table-pool tbody').innerHTML = '<tr><td class="empty">该层级暂无标的</td></tr>';
     return;
   }
-  // 动态表头
+  // 动态表头：层级 + 基本列 + 涨幅列 + 评分维度
   const sample = items[0];
-  const cols = ['code','name','score','status','screened_at'];
+  const cols = ['tier','code','name','score','screened_at'];
+  const gainCols = ['cumulative_gain_pct','daily_gain_pct','max_gain_pct'];
   const extraCols = sample.components ? Object.keys(sample.components) : [];
-  const allCols = [...cols, ...extraCols];
-  const labels = { code:'代码', name:'名称', score:'评分', status:'状态', screened_at:'入池日期' };
+  const allCols = [...cols, ...gainCols, ...extraCols];
+  const labels = { tier:'层级', code:'代码', name:'名称', score:'评分', screened_at:'入池日期',
+    cumulative_gain_pct:'累计涨幅', daily_gain_pct:'当日涨幅', max_gain_pct:'最大涨幅' };
   $('#table-pool-head').innerHTML = '<tr>'+allCols.map(c => `<th>${labels[c]||c}</th>`).join('')+'</tr>';
+
+  const fmtGain = (val) => val == null ? '<span style="color:var(--text-dim)">--</span>' : `<span class="${val>=0?'pnl-pos':'pnl-neg'}" style="font-weight:600">${fmtPct(val)}</span>`;
+  const tierBadge = (t) => {
+    if (t === 'focus') return '<span class="tag tag-focus">🎯 精选</span>';
+    if (t === 'watch') return '<span class="tag tag-watch">👀 观察</span>';
+    if (t === 'broad') return '<span class="tag tag-broad">📋 备选</span>';
+    return '<span class="tag tag-removed">--</span>';
+  };
 
   $('#table-pool tbody').innerHTML = items.map(item => `
     <tr>
+      <td>${tierBadge(item.tier)}</td>
       <td>${item.code||''}</td><td>${item.name||''}</td>
-      <td style="font-weight:600;color:${(item.score||0)>=70?'var(--red)':(item.score||0)>=40?'var(--orange)':'var(--text-dim)'}">${(item.score||0).toFixed(1)}</td>
-      <td><span class="tag ${item.status==='active'?'tag-active':'tag-removed'}">${item.status}</span></td>
+      <td style="font-weight:600;color:${(item.score||0)>=80?'var(--red)':(item.score||0)>=60?'var(--orange)':'var(--text-dim)'}">${(item.score||0).toFixed(1)}</td>
       <td>${dateLabel(item.screened_at)}</td>
+      <td>${fmtGain(item.cumulative_gain_pct)}</td>
+      <td>${fmtGain(item.daily_gain_pct)}</td>
+      <td>${fmtGain(item.max_gain_pct)}</td>
       ${extraCols.map(c => `<td>${item.components?.[c]?.toFixed?.(1) ?? item.components?.[c] ?? ''}</td>`).join('')}
     </tr>
   `).join('');
@@ -875,14 +937,17 @@ function showSectorTop10(sectorIdx) {
   const s = sectors[sectorIdx];
   if (!s || !s.top_stocks || !s.top_stocks.length) return;
 
-  $('#sector-top10-title').textContent = `📈 ${s.name} — 涨幅Top10成分股 (共${s.total_stocks||0}只)`;
+  $('#sector-top10-title').textContent = `📈 ${s.name} — 五日涨幅Top10成分股 (共${s.total_stocks||0}只，按近5日涨幅排序)`;
+  const all5dZero = s.top_stocks.every(st => !(st.pct_5d));
+  const render5d = (v) => all5dZero ? '<span style="color:var(--text-dim);font-size:11px;">--</span>' : ((v||0)>=0?'red':'green');
   $('#table-sector-top10 tbody').innerHTML = s.top_stocks.map((st, i) => `
     <tr>
       <td><strong>#${i+1}</strong></td>
       <td><span style="color:var(--accent);">${st.code}</span></td>
       <td>${st.name}</td>
       <td>${(st.price||0).toFixed(2)}</td>
-      <td class="${(st.pct_change||0)>=0?'red':'green'}"><strong>${fmtPct(st.pct_change)}</strong></td>
+      <td class="${(st.pct_change||0)>=0?'red':'green'}">${fmtPct(st.pct_change)}</td>
+      <td class="${render5d(st.pct_5d)}"><strong>${all5dZero ? '--' : fmtPct(st.pct_5d)}</strong></td>
       <td>${(st.volume||0).toFixed(0)}</td>
       <td>${(st.amount||0).toFixed(2)}</td>
       <td>${(st.turnover||0).toFixed(2)}%</td>

@@ -34,6 +34,38 @@ os.makedirs(POOL_DIR, exist_ok=True)
 MAX_POOL_SIZE = 30         # 每种策略池最多保留 30 只
 SCREEN_SAMPLE_SIZE = 200   # 一次筛选最多遍历 200 只
 
+# 层级定义
+TIER_FOCUS = "focus"       # 精选层：评分 ≥ 80，可直接候选开仓
+TIER_WATCH = "watch"       # 观察层：评分 60-80，持续跟踪等待信号
+TIER_BROAD = "broad"       # 备选层：评分 40-60，潜力储备
+TIER_ELIMINATED = "eliminated"  # 淘汰层：已剔除
+
+TIER_THRESHOLDS = {
+    TIER_FOCUS: 80,
+    TIER_WATCH: 60,
+    TIER_BROAD: 40,
+}  # 评分 ≥ threshold 才有资格进入该层
+
+TIER_LABELS = {
+    TIER_FOCUS: "精选",
+    TIER_WATCH: "观察",
+    TIER_BROAD: "备选",
+    TIER_ELIMINATED: "淘汰",
+}
+
+# 淘汰条件阈值
+ELIMINATE_DRAWDOWN = -8.0     # 累计跌幅超过 8% 淘汰
+ELIMINATE_SCORE_FLOOR = 30    # 评分低于 30 分淘汰
+ELIMINATE_DAYS_STALE = 20     # 入池超过 N 天仍未晋级则淘汰
+
+# 维护频率（按策略）
+MAINTENANCE_INTERVALS = {
+    "dragon_head": 1,      # 龙头：每日
+    "sparrow": 2,          # 麻雀：每2天
+    "turtle": 5,           # 海龟：每周(5个交易日)
+    "value_invest": 10,    # 价值：每2周
+}
+
 
 # ─── 数据结构 ─────────────────────────────────────────────
 
@@ -46,9 +78,13 @@ class StockPoolItem:
     components: Dict[str, float] = field(default_factory=dict)  # 各维度得分
     screened_at: str = ""                  # 入池日期
     status: str = "active"                 # active | traded | removed
+    entry_price: float = 0.0               # 入池时的收盘价
+    max_price: float = 0.0                 # 入池后最高收盘价
+    tier: str = ""                         # 层级: focus/watch/broad/eliminated
+    evaluated_at: str = ""                 # 上次评估日期
 
     def to_dict(self) -> Dict:
-        return {
+        d = {
             "code": self.code,
             "name": self.name,
             "score": round(self.score, 1),
@@ -56,6 +92,14 @@ class StockPoolItem:
             "screened_at": self.screened_at,
             "status": self.status,
         }
+        if self.tier:
+            d["tier"] = self.tier
+        if self.evaluated_at:
+            d["evaluated_at"] = self.evaluated_at
+        if self.entry_price > 0:
+            d["entry_price"] = round(self.entry_price, 2)
+            d["max_price"] = round(max(self.max_price, self.entry_price), 2)
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict) -> "StockPoolItem":
@@ -63,7 +107,33 @@ class StockPoolItem:
             code=d["code"], name=d.get("name", ""), score=d.get("score", 0),
             components=d.get("components", {}), screened_at=d.get("screened_at", ""),
             status=d.get("status", "active"),
+            entry_price=d.get("entry_price", 0.0),
+            max_price=d.get("max_price", 0.0),
+            tier=d.get("tier", ""),
+            evaluated_at=d.get("evaluated_at", ""),
         )
+
+    def compute_tier(self, cumulative_gain: float = 0) -> str:
+        """根据评分和累计涨幅计算当前应属层级"""
+        s = self.score
+
+        # 硬淘汰条件
+        if self.status != "active":
+            return TIER_ELIMINATED
+        if s < ELIMINATE_SCORE_FLOOR:
+            return TIER_ELIMINATED
+        if cumulative_gain <= ELIMINATE_DRAWDOWN:
+            return TIER_ELIMINATED
+
+        # 评分阈值判定
+        if s >= TIER_THRESHOLDS[TIER_FOCUS]:
+            return TIER_FOCUS
+        elif s >= TIER_THRESHOLDS[TIER_WATCH]:
+            return TIER_WATCH
+        elif s >= TIER_THRESHOLDS[TIER_BROAD]:
+            return TIER_BROAD
+        else:
+            return TIER_ELIMINATED
 
 
 # ─── 评分器基类 ──────────────────────────────────────────
@@ -172,6 +242,7 @@ class DragonHeadScorer(BaseScorer):
         return StockPoolItem(
             code=code, name=name, score=round(total, 1),
             components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
         )
 
     def _count_limit_days(self, df: pd.DataFrame) -> int:
@@ -256,6 +327,7 @@ class SparrowScorer(BaseScorer):
         return StockPoolItem(
             code=code, name=name, score=round(total, 1),
             components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
         )
 
     def _volume_price_score(self, df: pd.DataFrame, window: int = 3) -> float:
@@ -358,6 +430,7 @@ class TurtleScorer(BaseScorer):
         return StockPoolItem(
             code=code, name=name, score=round(total, 1),
             components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
         )
 
 
@@ -440,6 +513,7 @@ class ValueInvestScorer(BaseScorer):
         return StockPoolItem(
             code=code, name=name, score=round(total, 1),
             components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
         )
 
 
@@ -659,6 +733,249 @@ class StrategyStockPool:
             logger.warning(f"加载池 {self.strategy_key} 失败: {e}")
             return False
 
+    def refresh_gains(self, verbose: bool = False) -> Dict[str, Dict]:
+        """刷新池内所有股票的涨幅数据（累计/当日/最大）
+        
+        对于没有 entry_price 的旧数据，自动从入池日K线回填。
+        返回: {code: {cumulative_gain_pct, daily_gain_pct, max_gain_pct}}
+        """
+        fetcher = self._get_fetcher()
+        gains = {}
+
+        active_items = [it for it in self.items.values() if it.status == "active"]
+        if not active_items:
+            return gains
+
+        if verbose:
+            logger.info(f"  [{self.strategy_label}] 刷新涨幅，共 {len(active_items)} 只...")
+
+        need_save = False
+
+        for item in active_items:
+            try:
+                df = fetcher.fetch_daily_kline(item.code, start_date="20240101")
+                if df.empty or len(df) < 1:
+                    continue
+
+                df_std = self._normalize_df(df)
+                latest = df_std.iloc[-1]
+                current_close = float(latest["close"])
+                daily_pct = float(latest.get("pct_change", 0) or 0)
+
+                # 回填 entry_price（旧数据缺失时，从入池日K线获取收盘价）
+                if item.entry_price <= 0 and item.screened_at and "date" in df_std.columns:
+                    df_std["_date_str"] = df_std["date"].astype(str)
+                    entry_rows = df_std[df_std["_date_str"] >= str(item.screened_at)]
+                    if not entry_rows.empty:
+                        item.entry_price = round(float(entry_rows.iloc[0]["close"]), 2)
+                        item.max_price = item.entry_price
+                        need_save = True
+
+                entry = item.entry_price if item.entry_price > 0 else current_close
+
+                # 当日涨幅
+                daily_gain = round(daily_pct, 2)
+
+                # 累计涨幅
+                cumulative = round((current_close / entry - 1) * 100, 2) if entry > 0 else 0
+
+                # 最大涨幅：从入池日后的K线中找最高收盘价
+                max_close = current_close
+                if item.screened_at and "date" in df_std.columns and len(df_std) > 1:
+                    df_std["_date_str"] = df_std["date"].astype(str)
+                    mask = df_std["_date_str"] >= str(item.screened_at)
+                    if mask.any():
+                        max_close = float(df_std.loc[mask, "close"].max())
+                max_gain = round((max_close / entry - 1) * 100, 2) if entry > 0 else 0
+
+                gains[item.code] = {
+                    "cumulative_gain_pct": cumulative,
+                    "daily_gain_pct": daily_gain,
+                    "max_gain_pct": max_gain,
+                    "current_price": round(current_close, 2),
+                }
+
+                # 更新记录的 max_price
+                if max_close > item.max_price:
+                    item.max_price = round(max_close, 2)
+                    need_save = True
+
+            except Exception as e:
+                logger.debug(f"刷新涨幅 {item.code} 异常: {e}")
+                continue
+
+        # 保存更新后的数据
+        if need_save:
+            self.save()
+
+        if verbose:
+            updated = len(gains)
+            logger.info(f"  [{self.strategy_label}] 涨幅刷新完成: {updated}/{len(active_items)} 只")
+
+        return gains
+
+    # ─── 层级评估与池维护 ────────────────────────────
+
+    def evaluate_pool(self, verbose: bool = False) -> Dict[str, List[str]]:
+        """评估池内所有标的，分配层级（focus/watch/broad/eliminated）
+
+        流程：
+        1. 刷新涨幅数据
+        2. 基于当前评分 + 累计涨幅重新分配层级
+        3. 自动剔除不达标标的
+
+        返回: {focus: [...], watch: [...], broad: [...], eliminated: [...]}
+        """
+        # 先刷新涨幅
+        gains = self.refresh_gains(verbose=False)
+
+        today = datetime.now().strftime("%Y%m%d")
+        result: Dict[str, List[str]] = {
+            TIER_FOCUS: [], TIER_WATCH: [], TIER_BROAD: [], TIER_ELIMINATED: []
+        }
+
+        need_save = False
+        elim_count = 0
+
+        for item in self.items.values():
+            if item.status != "active":
+                continue
+
+            gain_info = gains.get(item.code, {})
+            cum_gain = gain_info.get("cumulative_gain_pct", 0) or 0
+
+            # 计算应属层级
+            new_tier = item.compute_tier(cum_gain)
+            item.evaluated_at = today
+
+            # 检查是否需要淘汰
+            if new_tier == TIER_ELIMINATED:
+                item.tier = TIER_ELIMINATED
+                item.status = "removed"
+                elim_count += 1
+                result[TIER_ELIMINATED].append(item.code)
+                need_save = True
+                if verbose:
+                    reason = f"评分{item.score:.0f}" if item.score < ELIMINATE_SCORE_FLOOR else f"累计跌幅{cum_gain:.1f}%"
+                    logger.info(f"  [{self.strategy_label}] 淘汰 {item.code} {item.name}: {reason}")
+            else:
+                if item.tier != new_tier:
+                    if verbose and item.tier:
+                        logger.info(f"  [{self.strategy_label}] {item.code} {item.name}: "
+                                    f"{TIER_LABELS.get(item.tier, '?')} → {TIER_LABELS[new_tier]}")
+                    item.tier = new_tier
+                    need_save = True
+                result[new_tier].append(item.code)
+
+        if need_save:
+            self.save()
+
+        if verbose:
+            focus_n = len(result[TIER_FOCUS])
+            watch_n = len(result[TIER_WATCH])
+            broad_n = len(result[TIER_BROAD])
+            logger.info(f"  [{self.strategy_label}] 评估完成: "
+                        f"精选{focus_n} | 观察{watch_n} | 备选{broad_n} | 淘汰{elim_count}")
+
+        return result
+
+    def maintenance(self, verbose: bool = False) -> Dict:
+        """执行一次完整的池维护（评估 + 淘汰 + 补入）
+
+        1. 评估现有标的层级
+        2. 淘汰不达标标的
+        3. 如果池中数量不足，从市场补充筛选
+        4. 更新最后维护日期
+
+        返回: {evaluated, eliminated, replenished, tier_counts, error}
+        """
+        result = {"evaluated": 0, "eliminated": 0, "replenished": 0,
+                  "tier_counts": {}, "error": None}
+
+        try:
+            # 1. 评估层级
+            tier_result = self.evaluate_pool(verbose=verbose)
+            active = sum(1 for it in self.items.values() if it.status == "active")
+            result["tier_counts"] = {
+                tier: len(codes) for tier, codes in tier_result.items() if tier != TIER_ELIMINATED
+            }
+            result["evaluated"] = active + len(tier_result[TIER_ELIMINATED])
+            result["eliminated"] = len(tier_result[TIER_ELIMINATED])
+
+            # 2. 补入：如果 active 总数 < MAX_POOL_SIZE，从市场筛选补充
+            if active < MAX_POOL_SIZE:
+                need = MAX_POOL_SIZE - active
+                fetcher = self._get_fetcher()
+                stock_pool = fetcher.build_stock_pool(filter_st=True, filter_new=True)
+
+                # 排除已在池中的代码
+                existing = set(self.items.keys())
+                fresh_pool = [c for c in stock_pool if c not in existing]
+
+                if fresh_pool:
+                    candidates: List[StockPoolItem] = []
+                    for code in fresh_pool[:SCREEN_SAMPLE_SIZE]:
+                        try:
+                            df = fetcher.fetch_daily_kline(str(code), start_date="20240101")
+                            if df.empty or len(df) < 20:
+                                continue
+                            df_std = self._normalize_df(df)
+                            name = str(code)
+                            extra = {}
+                            if self.strategy_key == "value_invest":
+                                extra = self._get_finance_extra(fetcher, code)
+                            item = self.scorer.score(str(code), name, df_std, extra)
+                            if item.score >= TIER_THRESHOLDS[TIER_BROAD]:  # 至少达到备选
+                                item.tier = item.compute_tier(0)
+                                item.evaluated_at = datetime.now().strftime("%Y%m%d")
+                                candidates.append(item)
+                        except Exception:
+                            continue
+
+                    # 按评分降序取前 need 只
+                    candidates.sort(key=lambda x: x.score, reverse=True)
+                    for item in candidates[:need]:
+                        self.items[item.code] = item
+                        result["replenished"] += 1
+                        if verbose:
+                            logger.info(f"  [{self.strategy_label}] 补入 {item.code} {item.name} "
+                                        f"评分{item.score:.0f} → {TIER_LABELS.get(item.tier, '?')}")
+
+            self.save()
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"[{self.strategy_label}] 维护异常: {e}")
+
+        return result
+
+    def tier_summary(self) -> Dict[str, int]:
+        """返回各层级数量统计"""
+        counts = {TIER_FOCUS: 0, TIER_WATCH: 0, TIER_BROAD: 0, TIER_ELIMINATED: 0}
+        for item in self.items.values():
+            if item.tier and item.status == "active":
+                counts[item.tier] = counts.get(item.tier, 0) + 1
+        return counts
+
+    def get_by_tier(self, tier: str) -> List[StockPoolItem]:
+        """获取指定层级的所有标的（按评分降序）"""
+        items = [it for it in self.items.values()
+                 if it.tier == tier and it.status == "active"]
+        items.sort(key=lambda x: x.score, reverse=True)
+        return items
+
+    def should_maintain(self) -> bool:
+        """检查是否需要进行维护（基于策略的维护频率）"""
+        interval = MAINTENANCE_INTERVALS.get(self.strategy_key, 5)
+        if not self.last_screened:
+            return True
+        try:
+            last_date = datetime.strptime(self.last_screened, "%Y%m%d")
+            days_passed = (datetime.now() - last_date).days
+            return days_passed >= interval
+        except ValueError:
+            return True
+
 
 # ─── 全局池管理器 ────────────────────────────────────────
 
@@ -737,3 +1054,43 @@ class PoolManager:
     def load_all(self):
         for pool in self.pools.values():
             pool.load()
+
+    def refresh_all_gains(self, verbose: bool = False) -> Dict[str, Dict[str, Dict]]:
+        """刷新所有策略池的涨幅数据"""
+        all_gains = {}
+        for key, pool in self.pools.items():
+            all_gains[key] = pool.refresh_gains(verbose=verbose)
+        return all_gains
+
+    def evaluate_all(self, verbose: bool = False) -> Dict[str, Dict[str, List[str]]]:
+        """评估所有策略池的层级"""
+        results = {}
+        for key, pool in self.pools.items():
+            if verbose:
+                logger.info(f"评估 {pool.strategy_label}...")
+            results[key] = pool.evaluate_pool(verbose=verbose)
+        return results
+
+    def maintenance_all(self, verbose: bool = False) -> Dict[str, Dict]:
+        """对所有策略池执行维护（评估 + 淘汰 + 补入）"""
+        results = {}
+        for key, pool in self.pools.items():
+            if pool.should_maintain():
+                if verbose:
+                    logger.info(f"\n维护 {pool.strategy_label}（频率: {MAINTENANCE_INTERVALS.get(key, 5)}天）...")
+                results[key] = pool.maintenance(verbose=verbose)
+            else:
+                results[key] = {"skipped": True,
+                                "reason": f"距上次维护不足{MAINTENANCE_INTERVALS.get(key, 5)}天"}
+        return results
+
+    def maintenance_one(self, strategy_key: str, verbose: bool = False) -> Dict:
+        """对指定策略池执行维护"""
+        pool = self.pools.get(strategy_key)
+        if pool is None:
+            return {"error": f"未知策略: {strategy_key}"}
+        return pool.maintenance(verbose=verbose)
+
+    def tier_overview(self) -> Dict[str, Dict[str, int]]:
+        """返回所有池的层级统计"""
+        return {key: pool.tier_summary() for key, pool in self.pools.items()}

@@ -28,7 +28,7 @@ from .config import (
     DATA_DIR, LIVE_LOG_DIR, LIVE_TRADE_DIR,
     DEFAULT_CAPITAL, STRATEGIES,
 )
-from .stock_pool import POOL_DIR
+from .stock_pool import POOL_DIR, TIER_FOCUS, TIER_WATCH, TIER_BROAD, TIER_LABELS, TIER_THRESHOLDS
 
 # ─── 常量和路径 ─────────────────────────────────────────────
 
@@ -69,6 +69,100 @@ def _list_summary_files() -> List[str]:
     return dates
 
 
+def _inject_pool_gains(items: List[dict]) -> List[dict]:
+    """为股票池数据注入累计涨幅、当日涨幅、最大涨幅、层级"""
+    from .data_manager import DataFetcher
+    if not items:
+        return items
+
+    fetcher = DataFetcher()
+    col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+               "最低": "low", "成交量": "volume", "涨跌幅": "pct_change"}
+
+    for item in items:
+        code = item.get("code", "")
+        entry_price = item.get("entry_price", 0) or 0
+
+        # 确保 tier 字段存在
+        tier = item.get("tier", "")
+        score = item.get("score", 0) or 0
+
+        try:
+            df = fetcher.fetch_daily_kline(str(code), start_date="20240101")
+            if df.empty or len(df) < 1:
+                _set_default_gains(item)
+                item["tier"] = tier or _score_to_tier(score)
+                continue
+
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            latest = df.iloc[-1]
+            current_close = float(latest.get("close", 0) or 0)
+            daily_pct = float(latest.get("pct_change", 0) or 0)
+            screened_at = item.get("screened_at", "")
+
+            # 当日涨幅
+            item["daily_gain_pct"] = round(daily_pct, 2)
+
+            # 回填 entry_price
+            if entry_price <= 0 and screened_at and "date" in df.columns:
+                df["_date_str"] = df["date"].astype(str)
+                entry_rows = df[df["_date_str"] >= str(screened_at)]
+                if not entry_rows.empty:
+                    entry_price = round(float(entry_rows.iloc[0]["close"]), 2)
+
+            # 累计涨幅
+            if entry_price > 0 and current_close > 0:
+                cum_gain = round((current_close / entry_price - 1) * 100, 2)
+                item["cumulative_gain_pct"] = cum_gain
+            else:
+                item["cumulative_gain_pct"] = None
+                cum_gain = 0
+
+            # 最大涨幅
+            if entry_price > 0 and screened_at and "date" in df.columns and len(df) > 1:
+                df["_date_str"] = df["date"].astype(str)
+                mask = df["_date_str"] >= str(screened_at)
+                if mask.any():
+                    max_close = float(df.loc[mask, "close"].max())
+                    item["max_gain_pct"] = round((max_close / entry_price - 1) * 100, 2)
+                else:
+                    item["max_gain_pct"] = round((current_close / entry_price - 1) * 100, 2)
+            elif entry_price > 0 and current_close > 0:
+                item["max_gain_pct"] = round((current_close / entry_price - 1) * 100, 2)
+            else:
+                item["max_gain_pct"] = None
+
+            # 层级：优先用已持久化的，否则实时计算
+            if tier:
+                item["tier"] = tier
+            else:
+                item["tier"] = _score_to_tier(score, cum_gain)
+
+        except Exception:
+            _set_default_gains(item)
+            item["tier"] = tier or _score_to_tier(score)
+
+    return items
+
+
+def _score_to_tier(score: float, cum_gain: float = 0) -> str:
+    """根据评分和累计涨幅计算层级"""
+    if score >= 80:
+        return TIER_FOCUS
+    elif score >= 60:
+        return TIER_WATCH
+    elif score >= 40:
+        return TIER_BROAD
+    else:
+        return "eliminated"
+
+
+def _set_default_gains(item: dict):
+    item["cumulative_gain_pct"] = None
+    item["daily_gain_pct"] = None
+    item["max_gain_pct"] = None
+
+
 def _list_trade_files() -> List[str]:
     """列出所有交割单文件"""
     pattern = os.path.join(LIVE_TRADE_DIR, "*.json")
@@ -79,6 +173,13 @@ def _list_trade_files() -> List[str]:
         dates.append(base)
     dates.sort(reverse=True)
     return dates
+
+
+def _api_key_to_pool_key(api_key: str) -> str:
+    """API 短键 → 池文件键映射"""
+    mapping = {"dragon": "dragon_head", "sparrow": "sparrow",
+               "turtle": "turtle", "value": "value_invest"}
+    return mapping.get(api_key, api_key)
 
 
 def _read_pool(strategy_key: str) -> Optional[dict]:
@@ -308,33 +409,82 @@ def create_app() -> FastAPI:
     # ── API: 股票池 ──────────────────────────────────────
     @app.get("/api/pools")
     async def get_all_pools():
-        """获取所有策略股票池"""
+        """获取所有策略股票池（含涨幅数据和层级统计）"""
         pools = {}
         for key in STRATEGY_KEYS:
             label = STRATEGY_LABELS[key]
             data = _read_pool(key)
             items = data.get("items", []) if data else []
+            # 注入涨幅数据和层级
+            items = _inject_pool_gains(items)
+            # 层级统计（只统计 active 的）
+            active_items = [it for it in items if it.get("status") == "active"]
+            tier_counts = {"focus": 0, "watch": 0, "broad": 0}
+            for it in active_items:
+                t = it.get("tier", "")
+                if t in tier_counts:
+                    tier_counts[t] += 1
             pools[key] = {
                 "label": label,
                 "last_screened": data.get("last_screened") if data else None,
-                "total_items": len(items),
+                "total_items": len(active_items),
+                "tier_counts": tier_counts,
                 "items": items,
             }
         return pools
 
     @app.get("/api/pool/{key}")
     async def get_pool(key: str):
-        """获取单个策略股票池"""
+        """获取单个策略股票池（含涨幅数据和层级统计）"""
         if key not in STRATEGY_KEYS:
             raise HTTPException(404, f"未知策略: {key}")
         data = _read_pool(key)
         if not data:
-            return {"label": STRATEGY_LABELS[key], "last_screened": None, "items": []}
+            return {"label": STRATEGY_LABELS[key], "last_screened": None, "items": [],
+                    "tier_counts": {"focus": 0, "watch": 0, "broad": 0}}
+        items = _inject_pool_gains(data.get("items", []))
+        active_items = [it for it in items if it.get("status") == "active"]
+        tier_counts = {"focus": 0, "watch": 0, "broad": 0}
+        for it in active_items:
+            t = it.get("tier", "")
+            if t in tier_counts:
+                tier_counts[t] += 1
         return {
             "label": STRATEGY_LABELS[key],
             "last_screened": data.get("last_screened"),
-            "items": data.get("items", []),
+            "total_items": len(active_items),
+            "tier_counts": tier_counts,
+            "items": items,
         }
+
+    @app.post("/api/pool/{key}/evaluate")
+    async def evaluate_pool(key: str):
+        """触发指定策略池的层级评估"""
+        if key not in STRATEGY_KEYS:
+            raise HTTPException(404, f"未知策略: {key}")
+        try:
+            from .stock_pool import PoolManager
+            pm = PoolManager()
+            pool = pm.get_pool(_api_key_to_pool_key(key))
+            if pool is None:
+                raise HTTPException(404, f"策略池不存在: {key}")
+            result = pool.evaluate_pool(verbose=False)
+            return {"success": True, "tier_result": {k: len(v) for k, v in result.items()}}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.post("/api/pool/{key}/maintenance")
+    async def maintenance_pool(key: str):
+        """触发指定策略池的完整维护（评估 + 淘汰 + 补入）"""
+        if key not in STRATEGY_KEYS:
+            raise HTTPException(404, f"未知策略: {key}")
+        try:
+            from .stock_pool import PoolManager
+            pm = PoolManager()
+            result = pm.maintenance_one(_api_key_to_pool_key(key), verbose=False)
+            return {"success": True, **result}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
     # ── API: 交易记录（交割单） ───────────────────────────
     @app.get("/api/trades")
@@ -573,6 +723,10 @@ body {
 .tag-sell { background: rgba(39,174,96,0.15); color: var(--green); }
 .tag-active { background: rgba(52,152,219,0.15); color: var(--accent); }
 .tag-removed { background: rgba(108,128,153,0.15); color: var(--text-dim); }
+.tag-focus { background: rgba(231,76,60,0.18); color: #e74c3c; font-weight:700; }
+.tag-watch { background: rgba(241,196,15,0.18); color: #f1c40f; }
+.tag-broad { background: rgba(52,152,219,0.15); color: var(--accent); }
+.tag-eliminated { background: rgba(108,128,153,0.12); color: var(--text-dim); text-decoration:line-through; }
 
 /* Layout grid */
 .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
@@ -670,7 +824,15 @@ body {
   <div class="tab-panel" id="tab-pools">
     <div style="display:flex;gap:8px;margin-bottom:14px;" id="pool-tab-buttons"></div>
     <div class="card-row" id="pool-stats"></div>
+    <div class="card-row" id="pool-tier-cards"></div>
     <div class="chart-box"><div class="chart-title">股票池列表 <span id="pool-name" style="color:var(--text-dim)"></span></div>
+      <div style="margin-bottom:10px;display:flex;gap:6px;align-items:center;" id="pool-tier-filter">
+        <span style="color:var(--text-dim);font-size:12px;">层级:</span>
+        <button class="tier-filter-btn active" data-tier="" style="background:var(--accent);color:#fff;border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">全部</button>
+        <button class="tier-filter-btn" data-tier="focus" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">🎯 精选</button>
+        <button class="tier-filter-btn" data-tier="watch" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">👀 观察</button>
+        <button class="tier-filter-btn" data-tier="broad" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">📋 备选</button>
+      </div>
       <div class="table-wrap"><table id="table-pool"><thead id="table-pool-head"></thead><tbody></tbody></table></div>
     </div>
   </div>
@@ -1022,6 +1184,7 @@ function renderPositionsTable(positions) {
 // ═══ 4. 股票池 ═══════════════════════════════════════════
 let allPools = {};
 let currentPool = 'dragon';
+let currentTier = '';  // '' means all
 async function loadPools() {
   allPools = await API('/pools');
   // 池切换按钮
@@ -1029,9 +1192,20 @@ async function loadPools() {
     `<button class="pool-tab" data-key="${k}" style="background:${k===currentPool?'var(--accent)':'var(--panel)'};color:${k===currentPool?'#fff':'var(--text-dim)'};border:1px solid var(--border);padding:6px 16px;border-radius:4px;cursor:pointer;">${v.label} (${v.total_items})</button>`
   ).join('');
   $$('.pool-tab').forEach(b => b.addEventListener('click', function() {
-    currentPool = this.dataset.key;
+    currentPool = this.dataset.key; currentTier = '';
     $$('.pool-tab').forEach(x => { x.style.background='var(--panel)'; x.style.color='var(--text-dim)'; });
     this.style.background='var(--accent)'; this.style.color='#fff';
+    document.querySelectorAll('.tier-filter-btn').forEach(b => { b.classList.remove('active'); b.style.background='var(--panel)'; b.style.color='var(--text-dim)'; });
+    document.querySelector('.tier-filter-btn[data-tier=""]').classList.add('active');
+    document.querySelector('.tier-filter-btn[data-tier=""]').style.background='var(--accent)';
+    document.querySelector('.tier-filter-btn[data-tier=""]').style.color='#fff';
+    renderPool();
+  }));
+  // 层级筛选按钮绑定
+  document.querySelectorAll('.tier-filter-btn').forEach(b => b.addEventListener('click', function() {
+    currentTier = this.dataset.tier;
+    document.querySelectorAll('.tier-filter-btn').forEach(b => { b.classList.remove('active'); b.style.background='var(--panel)'; b.style.color='var(--text-dim)'; });
+    this.classList.add('active'); this.style.background='var(--accent)'; this.style.color='#fff';
     renderPool();
   }));
   renderPool();
@@ -1040,31 +1214,69 @@ async function loadPools() {
 function renderPool() {
   const pool = allPools[currentPool];
   if (!pool) return;
+  const tc = pool.tier_counts || {};
   $('#pool-name').textContent = `${pool.label} | 筛选日期: ${dateLabel(pool.last_screened)}`;
   $('#pool-stats').innerHTML = `
     <div class="card"><div class="card-label">池内标的</div><div class="card-value">${pool.total_items}</div></div>
     <div class="card"><div class="card-label">上次筛选</div><div class="card-value" style="font-size:16px">${dateLabel(pool.last_screened)||'--'}</div></div>
   `;
+  // 层级统计卡片
+  const tierColors = { focus:'#e74c3c', watch:'#f1c40f', broad:'#3498db' };
+  const tierIcons = { focus:'🎯', watch:'👀', broad:'📋' };
+  $('#pool-tier-cards').innerHTML = ['focus','watch','broad'].map(t => `
+    <div class="card" style="border-left:3px solid ${tierColors[t]};flex:1;min-width:100px;">
+      <div class="card-label">${tierIcons[t]} ${t==='focus'?'精选层':t==='watch'?'观察层':'备选层'}</div>
+      <div class="card-value" style="color:${tierColors[t]};font-size:20px;">${tc[t]||0}</div>
+    </div>
+  `).join('');
 
-  const items = pool.items || [];
+  let items = pool.items || [];
+  // 只显示 active 且未被移除的
+  items = items.filter(it => it.status === 'active');
+  // 层级筛选
+  if (currentTier) {
+    items = items.filter(it => it.tier === currentTier);
+  }
+  // 排序：先按层级（focus→watch→broad），再按评分降序
+  const tierOrder = { focus:0, watch:1, broad:2 };
+  items.sort((a,b) => {
+    const ta = tierOrder[a.tier] ?? 9;
+    const tb = tierOrder[b.tier] ?? 9;
+    if (ta !== tb) return ta - tb;
+    return (b.score||0) - (a.score||0);
+  });
+
   if (!items.length) {
-    $('#table-pool-head').innerHTML = ''; $('#table-pool tbody').innerHTML = '<tr><td class="empty">池中暂无标的</td></tr>';
+    $('#table-pool-head').innerHTML = ''; $('#table-pool tbody').innerHTML = '<tr><td class="empty">该层级暂无标的</td></tr>';
     return;
   }
-  // 动态表头
+  // 动态表头：层级 + 基本列 + 涨幅列 + 评分维度
   const sample = items[0];
-  const cols = ['code','name','score','status','screened_at'];
+  const cols = ['tier','code','name','score','screened_at'];
+  const gainCols = ['cumulative_gain_pct','daily_gain_pct','max_gain_pct'];
   const extraCols = sample.components ? Object.keys(sample.components) : [];
-  const allCols = [...cols, ...extraCols];
-  const labels = { code:'代码', name:'名称', score:'评分', status:'状态', screened_at:'入池日期' };
+  const allCols = [...cols, ...gainCols, ...extraCols];
+  const labels = { tier:'层级', code:'代码', name:'名称', score:'评分', screened_at:'入池日期',
+    cumulative_gain_pct:'累计涨幅', daily_gain_pct:'当日涨幅', max_gain_pct:'最大涨幅' };
   $('#table-pool-head').innerHTML = '<tr>'+allCols.map(c => `<th>${labels[c]||c}</th>`).join('')+'</tr>';
+
+  const fmtGain = (val) => val == null ? '<span style="color:var(--text-dim)">--</span>' : `<span class="${val>=0?'pnl-pos':'pnl-neg'}" style="font-weight:600">${fmtPct(val)}</span>`;
+  const tierBadge = (t) => {
+    if (t === 'focus') return '<span class="tag tag-focus">🎯 精选</span>';
+    if (t === 'watch') return '<span class="tag tag-watch">👀 观察</span>';
+    if (t === 'broad') return '<span class="tag tag-broad">📋 备选</span>';
+    return '<span class="tag tag-removed">--</span>';
+  };
 
   $('#table-pool tbody').innerHTML = items.map(item => `
     <tr>
+      <td>${tierBadge(item.tier)}</td>
       <td>${item.code||''}</td><td>${item.name||''}</td>
-      <td style="font-weight:600;color:${(item.score||0)>=70?'var(--red)':(item.score||0)>=40?'var(--orange)':'var(--text-dim)'}">${(item.score||0).toFixed(1)}</td>
-      <td><span class="tag ${item.status==='active'?'tag-active':'tag-removed'}">${item.status}</span></td>
+      <td style="font-weight:600;color:${(item.score||0)>=80?'var(--red)':(item.score||0)>=60?'var(--orange)':'var(--text-dim)'}">${(item.score||0).toFixed(1)}</td>
       <td>${dateLabel(item.screened_at)}</td>
+      <td>${fmtGain(item.cumulative_gain_pct)}</td>
+      <td>${fmtGain(item.daily_gain_pct)}</td>
+      <td>${fmtGain(item.max_gain_pct)}</td>
       ${extraCols.map(c => `<td>${item.components?.[c]?.toFixed?.(1) ?? item.components?.[c] ?? ''}</td>`).join('')}
     </tr>
   `).join('');
