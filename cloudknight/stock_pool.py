@@ -726,6 +726,10 @@ class PoolManager:
         """返回所有池概览"""
         return [p.summary() for p in self.pools.values()]
 
+    def summary(self) -> Dict[str, int]:
+        """返回各策略池股票数量的简单汇总"""
+        return {key: pool.size for key, pool in self.pools.items()}
+
     def save_all(self):
         for pool in self.pools.values():
             pool.save()

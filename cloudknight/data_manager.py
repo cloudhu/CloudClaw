@@ -204,8 +204,13 @@ class DataFetcher:
             return cached
         ak = _ensure_akshare()
         try:
-            df = ak.stock_zh_index_daily(symbol=f"sh{index_code}")
+            # 自动判断交易所前缀：3开头=深市，其他=沪市
+            prefix = "sz" if index_code.startswith("3") else "sh"
+            symbol = f"{prefix}{index_code}"
+            df = ak.stock_zh_index_daily(symbol=symbol)
             if df is not None and not df.empty:
+                # 统一 date 列为字符串进行比较
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
                 df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
                 self.cache.set(f"index_{index_code}", df, start_date=start_date, end_date=end_date)
             return df

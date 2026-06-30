@@ -17,6 +17,7 @@ from .strategies import (DragonHeadStrategy, SparrowStrategy,
 from .backtest_engine import BacktestEngine
 from .paper_trader import PaperTrader
 from .stock_pool import PoolManager
+from .trading_calendar import TradingCalendar, TradingPhase, get_phase_label
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class CloudKnightCLI(cmd.Cmd):
         self.pool_mgr = PoolManager()
         self.current_strategy_cls = None   # 策略类（AKQ 策略不持有实例状态）
         self.stock_pool: List[str] = []
+        self.calendar = TradingCalendar()
+        self._live_engine = None           # 实时引擎引用（懒加载）
 
     def do_help(self, arg):
         print("""
@@ -72,6 +75,13 @@ class CloudKnightCLI(cmd.Cmd):
   race history        从年初开始历史回放赛马
   race reset          重置赛马
   race save           手动保存赛马状态
+实时交易:
+  live start          启动实时交易引擎
+  live status         查看运行状态
+  live market         查看市场快照
+  live signals        查看最新信号
+  live log [行数]     查看引擎日志
+  live stop           停止实时引擎
 系统:
   status              系统状态
   help                帮助信息
@@ -508,22 +518,210 @@ class CloudKnightCLI(cmd.Cmd):
             pass
         return code
 
+    # ─── 实时交易 ────────────────────────────────────
+
+    def do_live(self, arg):
+        """实时交易引擎控制"""
+        args = arg.strip().split()
+        cmd = args[0].lower() if args else "help"
+
+        if cmd == "start":
+            self._live_start()
+        elif cmd == "status":
+            self._live_status()
+        elif cmd == "market":
+            self._live_market()
+        elif cmd == "signals":
+            self._live_signals()
+        elif cmd == "log":
+            n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+            self._live_log(n)
+        elif cmd == "stop":
+            self._live_stop()
+        else:
+            print("\n实时交易引擎命令:")
+            print("  live start    - 启动实时交易引擎")
+            print("  live status   - 查看运行状态")
+            print("  live market   - 查看市场快照")
+            print("  live signals  - 查看最新交易信号")
+            print("  live log [N]  - 查看最近 N 条引擎日志")
+            print("  live stop     - 停止实时引擎")
+
+    def _live_start(self):
+        """启动实时交易引擎"""
+        if self._live_engine is not None:
+            eng = self._live_engine
+            if eng["engine"].state.value in ("running", "starting"):
+                return print("\n实时引擎已在运行中！")
+
+        from .live_engine import LiveTradingEngine
+        import threading
+
+        engine = LiveTradingEngine()
+        engine.pool_mgr = self.pool_mgr  # 共享股票池
+
+        cal = TradingCalendar()
+        today = cal.get_current_phase()
+        is_trade = cal.is_trading_day()
+
+        print(f"\n═══ 启动实时交易引擎 ═══")
+        print(f"当前阶段: {get_phase_label(today)}")
+        print(f"交易日: {'是' if is_trade else '否'}")
+
+        # 启动引擎
+        engine.start()
+
+        # 保存引用
+        self._live_engine = {"engine": engine, "calendar": cal}
+
+        # 后台日志输出线程
+        def _log_printer():
+            last_idx = 0
+            while engine.state.value not in ("stopped", "stopping"):
+                logs = engine.get_recent_logs(50)
+                for i in range(last_idx, len(logs)):
+                    entry = logs[i]
+                    phase = get_phase_label(entry.phase)
+                    ts = entry.timestamp.strftime("%H:%M:%S")
+                    print(f"  [{ts}] [{phase}] {entry.event}")
+                last_idx = max(last_idx, len(logs))
+                import time
+                time.sleep(2)
+
+        threading.Thread(target=_log_printer, daemon=True).start()
+
+    def _live_status(self):
+        """查看实时引擎状态"""
+        if self._live_engine is None:
+            return print("\n实时引擎未启动。使用 live start 启动")
+
+        eng = self._live_engine["engine"]
+        status = eng.get_status()
+
+        print(f"\n═══ 实时引擎状态 ═══")
+        print(f"运行状态: {status['state']}")
+        print(f"当前阶段: {status['phase_label']}")
+        print(f"交易日: {'是' if status['is_trading_day'] else '否'}")
+        print(f"日志条数: {status['log_count']}")
+        print(f"今日决策: {status['decisions_today']} 条")
+
+        # 信号详情
+        sd = status.get("signal_details", {})
+        if sd:
+            print(f"\n最新扫描信号 ({status['latest_signals']} 条):")
+            for name, info in sd.items():
+                print(f"  [{info['strategy']}] "
+                      f"买{info['buy']} 卖{info['sell']} "
+                      f"({info['count']}条, {info['duration']}s)")
+
+    def _live_market(self):
+        """查看市场快照"""
+        from .market_analyzer import MarketAnalyzer
+
+        print("\n正在获取市场全景数据...")
+        analyzer = MarketAnalyzer()
+        sentiment = analyzer.get_market_sentiment()
+
+        print(f"\n═══ 市场情绪 ═══")
+        print(f"情绪: {sentiment['sentiment'].upper()}")
+        print(f"评分: {sentiment['score']}/100")
+
+        if "indices" in sentiment:
+            print(f"\n核心指数:")
+            status = sentiment["indices"]
+            for code, info in status.items():
+                print(f"  {info['name']}: {info['pct']:+.2f}% "
+                      f"趋势{info['trend']} MACD:{info['macd']} KDJ:{info['kdj']}")
+
+        if "factors" in sentiment:
+            print(f"\n情绪因子:")
+            for k, v in sentiment["factors"].items():
+                bar = "█" * (v // 5) + "░" * (20 - v // 5)
+                print(f"  {k}: {bar} {v}")
+
+    def _live_signals(self):
+        """查看最新交易信号"""
+        if self._live_engine is None:
+            return print("\n实时引擎未启动")
+
+        eng = self._live_engine["engine"]
+        status = eng.get_status()
+        sd = status.get("signal_details", {})
+
+        if not sd:
+            return print("\n暂无信号数据")
+
+        print(f"\n═══ 最新交易信号 ({status['latest_signals']} 条) ═══")
+        plan = eng._trading_plan
+        if plan and plan.signals:
+            table_data = []
+            for s in plan.signals:
+                table_data.append([
+                    s.code, s.name,
+                    STRATEGIES.get(s.strategy, s.strategy),
+                    s.signal_type.upper(), s.confidence,
+                    f"{s.price:.2f}", s.reason[:50]
+                ])
+            print(tabulate(table_data,
+                           headers=["代码", "名称", "策略", "方向", "置信度", "价格", "原因"],
+                           tablefmt="grid"))
+        else:
+            print("无最新交易信号")
+
+    def _live_log(self, n: int = 20):
+        """查看引擎日志"""
+        if self._live_engine is None:
+            return print("\n实时引擎未启动")
+
+        eng = self._live_engine["engine"]
+        logs = eng.get_recent_logs(n)
+
+        print(f"\n═══ 引擎日志 (最近 {len(logs)} 条) ═══")
+        for entry in logs:
+            phase = get_phase_label(entry.phase)
+            ts = entry.timestamp.strftime("%H:%M:%S")
+            print(f"  [{ts}] [{phase}] {entry.event}")
+
+    def _live_stop(self):
+        """停止实时引擎"""
+        if self._live_engine is None:
+            return print("\n实时引擎未启动")
+
+        eng = self._live_engine["engine"]
+        eng.stop()
+        self._live_engine = None
+        print("\n实时引擎已停止")
+
     # ─── 系统 ─────────────────────────────────────────
 
     def do_status(self, arg):
         from .version import get_version
+        from datetime import datetime
         print(f"\n═══ 系统状态 ═══")
         print(f"版本: v{get_version()} | 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         cls = self.current_strategy_cls
         inst = cls() if cls else None
         print(f"策略: {inst.description if inst else '未选择'}")
         print(f"引擎: AKQuant 高性能事件驱动回测")
-        print(f"股票池: {len(self.stock_pool)} 只 | 资金: {DEFAULT_CAPITAL:,.0f} | 数据源: akshare")
+
+        # 交易日历状态
+        phase = self.calendar.get_current_phase()
+        is_trade = self.calendar.is_trading_day()
+        print(f"交易日: {'是' if is_trade else '否'} ({get_phase_label(phase)})")
+
+        # 实时引擎状态
+        if self._live_engine is not None:
+            live_state = self._live_engine["engine"].state.value
+            print(f"实时引擎: {live_state}")
+
+        print(f"股票池: 基础{len(self.stock_pool)}只 | 资金: {DEFAULT_CAPITAL:,.0f} | 数据源: akshare")
 
     def do_clear(self, arg):
         print("\n" * 50)
 
     def do_quit(self, arg):
+        if self._live_engine is not None:
+            self._live_stop()
         print("\n感谢使用云侠量化交易系统！")
         return True
 
