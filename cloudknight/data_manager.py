@@ -108,7 +108,8 @@ class Database:
         with self._get_conn() as conn:
             for _, row in df_db[all_cols].iterrows():
                 placeholders = ",".join(["?"] * len(all_cols))
-                sql = f"INSERT OR REPLACE INTO stock_daily ({",".join(all_cols)}) VALUES ({placeholders})"
+                cols_str = ",".join(all_cols)
+                sql = f"INSERT OR REPLACE INTO stock_daily ({cols_str}) VALUES ({placeholders})"
                 conn.execute(sql, tuple(row[col] for col in all_cols))
             conn.commit()
 
@@ -135,7 +136,8 @@ class Database:
         with self._get_conn() as conn:
             for _, row in df_db[cols].iterrows():
                 placeholders = ",".join(["?"] * len(cols))
-                sql = f"INSERT OR REPLACE INTO stock_info ({",".join(cols)}) VALUES ({placeholders})"
+                cols_str = ",".join(cols)
+                sql = f"INSERT OR REPLACE INTO stock_info ({cols_str}) VALUES ({placeholders})"
                 conn.execute(sql, tuple(row[col] for col in cols))
             conn.commit()
 
@@ -287,6 +289,40 @@ class DataFetcher:
                 continue
             filtered.append(code)
         return filtered
+
+    def prepare_akquant_data(self, codes: List[str], start_date: str,
+                             end_date: str = None) -> Dict[str, pd.DataFrame]:
+        """准备 AKQuant 格式的多标的数据字典
+
+        返回: {symbol: DataFrame[date, open, high, low, close, volume, symbol]}
+        """
+        import pandas as _pd
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y%m%d")
+
+        col_map = {"日期": "date", "开盘": "open", "收盘": "close",
+                    "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount"}
+        required = ["date", "open", "high", "low", "close", "volume"]
+        data = {}
+
+        for code in codes:
+            try:
+                df = self.fetch_daily_kline(str(code), start_date=start_date, end_date=end_date)
+                if df is None or df.empty or len(df) < 20:
+                    continue
+                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                if not all(c in df.columns for c in required):
+                    continue
+                df = df[required + ["amount"] if "amount" in df.columns else required].copy()
+                df["date"] = _pd.to_datetime(df["date"], errors="coerce")
+                df = df.dropna(subset=["date"]).sort_values("date")
+                df["symbol"] = str(code)
+                if len(df) >= 20:
+                    data[str(code)] = df[required + ["symbol"]]
+            except Exception as e:
+                logger.debug(f"准备 {code} AKQ数据失败: {e}")
+                continue
+        return data
 
 
 data_fetcher = DataFetcher()
