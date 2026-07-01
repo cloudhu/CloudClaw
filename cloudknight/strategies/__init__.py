@@ -17,6 +17,7 @@ from .trend_accel import TrendAccelerationStrategy
 from .turtle import TurtleStrategy
 from .value_invest import ValueInvestStrategy
 from .volume_breakout import VolumeBreakoutStrategy
+from .high_growth import HighGrowthStrategy
 
 STRATEGY_CLASSES = {
     "dragon_head": DragonHeadStrategy,
@@ -30,6 +31,7 @@ STRATEGY_CLASSES = {
     "bollinger": BollingerBandStrategy,
     "volume_breakout": VolumeBreakoutStrategy,
     "trend_accel": TrendAccelerationStrategy,
+    "high_growth": HighGrowthStrategy,
 }
 
 # ─── 诊股策略注册表 ──────────────────────────────────────────
@@ -90,6 +92,12 @@ DIAGNOSE_STRATEGIES = {
         "emoji": "🚀",
         "auto_add_threshold": 65,
     },
+    "high_growth": {
+        "class": HighGrowthStrategy,
+        "label": "高增长",
+        "emoji": "📈",
+        "auto_add_threshold": 65,
+    },
 }
 
 
@@ -118,4 +126,5 @@ __all__ = [
     "TurtleStrategy",
     "ValueInvestStrategy",
     "VolumeBreakoutStrategy",
+    "HighGrowthStrategy",
 ]

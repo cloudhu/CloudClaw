@@ -487,6 +487,148 @@ class MarketAnalyzer:
 
         return result
 
+    def check_hindenburg_omen(self, sample_size: int = 80, days: int = 120) -> dict:
+        """兴登堡凶兆检测 - 市场分化/背离预警
+
+        参考：DemoStrategy_HindenburgOmen
+        原理：逐日计算每只股票收盘价与上证指数的30日滚动R²，
+              当全市场日均R²在3日内变动超过30%时，发出市场分化预警。
+
+        注意：此功能仅在有交易日数据时有效，非交易日返回正常信号。
+
+        Args:
+            sample_size: 采样股票数量
+            days: 回溯天数
+
+        Returns:
+            dict: {signal, r2_current, r2_3d_ago, change_pct, divergence_level, description}
+        """
+        result = {
+            "signal": "normal",
+            "r2_current": 0.0,
+            "r2_3d_ago": 0.0,
+            "change_pct": 0.0,
+            "divergence_level": "none",
+            "description": "",
+        }
+
+        try:
+            start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
+            fetcher = DataFetcher()
+            win = 30
+
+            # 获取上证指数日线
+            raw_sh = fetcher.fetch_index_daily("000001", start_date=start)
+            if raw_sh is None or raw_sh.empty or len(raw_sh) < win + 5:
+                return result
+
+            # 标准化指数列名
+            sh_rename = {}
+            for src, dst in [("日期", "date"), ("收盘", "close")]:
+                if src in raw_sh.columns:
+                    sh_rename[src] = dst
+            sh_df = raw_sh.rename(columns=sh_rename)
+            if "close" not in sh_df.columns:
+                return result
+            sh_df = sh_df.tail(days)
+            sh_close = sh_df["close"].values.astype(float)
+            n_days = len(sh_close)
+
+            if n_days < win:
+                return result
+
+            # 获取股票池样本
+            stock_list = fetcher.build_stock_pool(filter_st=True, filter_new=True)
+            sample_codes = stock_list[:sample_size]
+
+            # 存储每只股票的对齐后收盘价序列
+            stock_closes = {}
+            for code in sample_codes:
+                try:
+                    raw = fetcher.fetch_daily_kline(str(code), start_date=start)
+                    if raw is None or raw.empty or len(raw) < win:
+                        continue
+                    rename = {}
+                    for src, dst in [("日期", "date"), ("收盘", "close")]:
+                        if src in raw.columns:
+                            rename[src] = dst
+                    s_df = raw.rename(columns=rename)
+                    s_df = s_df.tail(days)
+                    if "close" not in s_df.columns or len(s_df) < win:
+                        continue
+                    stock_closes[code] = s_df["close"].values.astype(float)
+                except Exception:
+                    continue
+
+            if len(stock_closes) < 10:
+                return result
+
+            # 逐日计算平均R²时序
+            daily_avg_r2 = []
+            for t in range(win - 1, n_days):
+                idx_win = sh_close[t - win + 1 : t + 1]
+                r2_vals = []
+                for _code, s_arr in stock_closes.items():
+                    if len(s_arr) <= t:
+                        continue
+                    s_win = s_arr[t - win + 1 : t + 1]
+                    if len(s_win) < win:
+                        continue
+                    try:
+                        corr = np.corrcoef(s_win, idx_win)[0, 1]
+                        if not np.isnan(corr):
+                            r2_vals.append(corr**2)
+                    except Exception:
+                        continue
+                if r2_vals:
+                    daily_avg_r2.append(float(np.mean(r2_vals)))
+
+            if len(daily_avg_r2) < 5:
+                return result
+
+            # 当前平均R² vs 3日前平均R²
+            r2_current = daily_avg_r2[-1]
+            if len(daily_avg_r2) >= 4:
+                r2_3d_ago = daily_avg_r2[-4]  # 3天前
+            else:
+                r2_3d_ago = r2_current
+
+            if r2_3d_ago > 0:
+                change = (r2_current - r2_3d_ago) / r2_3d_ago * 100
+            else:
+                change = 0
+
+            result["r2_current"] = round(r2_current, 4)
+            result["r2_3d_ago"] = round(r2_3d_ago, 4)
+            result["change_pct"] = round(change, 1)
+
+            if abs(change) > 30 or r2_current < 0.2:
+                result["signal"] = "divergence"
+                result["divergence_level"] = "high" if r2_current < 0.15 else "medium"
+                result["description"] = (
+                    f"⚠️ 兴登堡凶兆预警：市场分化加剧，个股与指数联动性显著下降 "
+                    f"(R²={r2_current:.3f}, 变动{change:+.1f}%)。"
+                    f"建议减少仓位，警惕系统性风险。"
+                )
+            elif r2_current < 0.35:
+                result["signal"] = "caution"
+                result["divergence_level"] = "low"
+                result["description"] = (
+                    f"市场协同性偏低 (R²={r2_current:.3f})，不建议重仓操作。"
+                )
+            else:
+                result["description"] = (
+                    f"市场协同性正常 (R²={r2_current:.3f})，个股与指数走势一致。"
+                )
+
+            logger.info(f"兴登堡凶兆检测: R²={r2_current:.3f}, 3日前={r2_3d_ago:.3f}, "
+                        f"变动{change:+.1f}%, 信号={result['signal']}")
+
+        except Exception as e:
+            logger.warning(f"兴登堡凶兆检测异常: {e}")
+
+        return result
+
     def get_market_snapshot(self) -> MarketSnapshot:
         """获取市场全景快照
 

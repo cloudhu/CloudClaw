@@ -4,6 +4,24 @@
 
 ---
 
+## [2.5.0] - 2026-07-01
+
+### Added
+- **高增长策略 (high_growth)**：基于基本面成长因子的选股策略（策略总数 9→10）
+  - Scoring：3年EPS增长率 + 3年营收增长率 + PEG + ROE + 净利润增速 + 净资产增速
+  - 使用 `_get_growth_finance_extra()` 从 AKShare 财务数据自动提取多期增长指标
+  - 参考 DemoStrategy_HighGrowth 的 PEG<1 + 3年增长>中位数 筛选逻辑
+- **兴登堡凶兆预警 (Hindenburg Omen)**：市场分化/背离检测
+  - 新增 `MarketAnalyzer.check_hindenburg_omen()` 方法
+  - 逐日计算个股与上证指数的30日滚动R²，3日变动>30%发出预警
+  - 参考 DemoStrategy_HindenburgOmen 的 R² 时序变动检测逻辑
+
+### Changed
+- `_get_finance_extra()` 中的 docstring 更新为"基本面策略需要财务数据"
+- `screen()` 方法扩展支持 `high_growth` 策略自动获取财务增长数据
+
+---
+
 ## [2.4.0] - 2026-07-01
 
 ### Added

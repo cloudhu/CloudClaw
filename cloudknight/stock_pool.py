@@ -68,6 +68,7 @@ MAINTENANCE_INTERVALS = {
     "ma_cross": 3,  # 均线：每3天
     "volume_breakout": 2,  # 量价：每2天
     "trend_accel": 3,  # 趋势加速：每3天
+    "high_growth": 10,  # 高增长：每2周（财报驱动）
 }
 
 
@@ -949,6 +950,88 @@ class TrendAccelerationScorer(BaseScorer):
         )
 
 
+# ─── 高增长 Scorer ──────────────────────────────────────
+
+
+class HighGrowthScorer(BaseScorer):
+    """高增长评分器 - 基于基本面成长因子
+
+    评分维度 (总分 100):
+      - 3年EPS增长率 (20分)
+      - 3年营收增长率 (15分)
+      - PEG (25分)
+      - ROE (15分)
+      - 净利润增速 (15分)
+      - 净资产增速 (10分)
+    """
+
+    name = "growth"
+
+    def score(self, code, name, df, extra=None):
+        close = float(df["close"].iloc[-1])
+        rsi = calc_rsi(df) if "close" in df.columns else 50
+        volumes = df["volume"].values.astype(float) if "volume" in df.columns else np.array([])
+        avg_vol = np.mean(volumes[-21:-1]) if len(volumes) >= 21 else (volumes[-1] if len(volumes) > 0 else 0)
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
+
+        extra = extra or {}
+        eps_g3 = extra.get("eps_growth_3y", 0)
+        rev_g3 = extra.get("revenue_growth_3y", 0)
+        peg = extra.get("peg", 999)
+        roe = extra.get("roe", 0)
+        profit_g = extra.get("profit_growth_yoy", 0)
+        equity_g = extra.get("equity_growth_yoy", 0)
+
+        # 1. 3年EPS增长率 (20分): 5%~40% 线性
+        eps_score = self._linear_score(eps_g3, 5, 40, 0, 20)
+
+        # 2. 3年营收增长率 (15分): 5%~30% 线性
+        rev_score = self._linear_score(rev_g3, 5, 30, 0, 15)
+
+        # 3. PEG (25分): 0~0.5=满分, 0.5~1.5=递减, >2=0分
+        if peg >= 0 and peg <= 0.5:
+            peg_score = 25
+        elif peg > 0.5 and peg <= 1.5:
+            peg_score = 25 - (peg - 0.5) / 1.0 * 20
+        elif peg > 1.5 and peg <= 2.0:
+            peg_score = max(0, 5 - (peg - 1.5) / 0.5 * 5)
+        else:
+            peg_score = 0
+
+        # 4. ROE (15分): 8%~30% 线性
+        roe_score = self._linear_score(roe, 8, 30, 0, 15)
+
+        # 5. 净利润增速 (15分): 10%~50% 线性
+        profit_score = self._linear_score(profit_g, 10, 50, 0, 15)
+
+        # 6. 净资产增速 (10分): 5%~30% 线性
+        equity_score = self._linear_score(equity_g, 5, 30, 0, 10)
+
+        comp = {
+            "EPS增长率": round(eps_score, 1),
+            "营收增长率": round(rev_score, 1),
+            "PEG": round(peg_score, 1),
+            "ROE": round(roe_score, 1),
+            "净利润增速": round(profit_score, 1),
+            "净资产增速": round(equity_score, 1),
+        }
+        factors = {
+            "EPS增长3Y%": round(eps_g3, 1) if eps_g3 else 0,
+            "营收增长3Y%": round(rev_g3, 1) if rev_g3 else 0,
+            "PEG": round(peg, 2) if peg and peg < 999 else 0,
+            "ROE%": round(roe, 2) if roe else 0,
+            "利润增速%": round(profit_g, 2) if profit_g else 0,
+            "净资产增速%": round(equity_g, 2) if equity_g else 0,
+        }
+        total = sum(comp.values())
+        return StockPoolItem(
+            code=code, name=name, score=round(total, 1), components=comp,
+            factors=factors,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
+        )
+
+
 # ─── 策略股票池 ──────────────────────────────────────────
 
 
@@ -1010,10 +1093,12 @@ class StrategyStockPool:
                 df_std = self._normalize_df(df)
                 name = name_map.get(code, code)
 
-                # 价值投资需要财务数据
+                # 基本面策略需要财务数据
                 extra = {}
                 if self.strategy_key == "value_invest":
                     extra = self._get_finance_extra(fetcher, code)
+                elif self.strategy_key == "high_growth":
+                    extra = self._get_growth_finance_extra(fetcher, code)
 
                 item = self.scorer.score(code, name, df_std, extra)
                 if item.score > 0:
@@ -1091,7 +1176,85 @@ class StrategyStockPool:
             pass
         return {}
 
-    # ─── 池操作 ──────────────────────────────────────
+    def _get_growth_finance_extra(self, fetcher, code: str) -> dict:
+        """获取高增长策略需要的财务增长数据"""
+        try:
+            fin = fetcher.fetch_financial_data(code)
+            if fin is not None and not fin.empty:
+                # 尝试从多期财务数据中计算3年复合增长率
+                try:
+                    eps_vals = []
+                    rev_vals = []
+                    equity_vals = []
+                    for col_pat, vals in [
+                        ("基本每股收益", eps_vals),
+                        ("营业收入", rev_vals),
+                        ("净资产", equity_vals),
+                    ]:
+                        for c in fin.columns:
+                            if col_pat in str(c):
+                                try:
+                                    v = float(fin[c].dropna().iloc[-1])
+                                    vals.append(v)
+                                except Exception:
+                                    pass
+                                break  # 只取第一个匹配列
+
+                    eps_g3 = 0
+                    rev_g3 = 0
+                    equity_g3 = 0
+                    if len(eps_vals) >= 4:
+                        old_eps = eps_vals[0]
+                        new_eps = eps_vals[-1]
+                        if old_eps > 0:
+                            eps_g3 = ((new_eps / old_eps) ** (1 / 3) - 1) * 100
+                    if len(rev_vals) >= 4:
+                        old_rev = rev_vals[0] if rev_vals[0] > 0 else 1
+                        new_rev = rev_vals[-1]
+                        rev_g3 = ((new_rev / old_rev) ** (1 / 3) - 1) * 100
+                    if len(equity_vals) >= 4:
+                        old_eq = equity_vals[0] if equity_vals[0] > 0 else 1
+                        new_eq = equity_vals[-1]
+                        equity_g3 = ((new_eq / old_eq) ** (1 / 3) - 1) * 100
+                except Exception:
+                    eps_g3 = 0
+                    rev_g3 = 0
+                    equity_g3 = 0
+
+                latest_row = fin.iloc[-1]
+                return {
+                    "eps_growth_3y": round(eps_g3 or 0, 1),
+                    "revenue_growth_3y": round(rev_g3 or 0, 1),
+                    "peg": float(latest_row.get("PEG", latest_row.get("peg", 999)) or 999),
+                    "roe": float(latest_row.get("净资产收益率", latest_row.get("roe", 0)) or 0),
+                    "profit_growth_yoy": float(
+                        latest_row.get("净利润增长率", latest_row.get("profit_growth_yoy", 0)) or 0
+                    ),
+                    "equity_growth_yoy": float(
+                        latest_row.get("净资产同比增长率", latest_row.get("equity_growth_yoy", 0)) or 0
+                    ),
+                }
+        except Exception:
+            pass
+        # fallback: 从东方财富实时行情获取基础数据
+        try:
+            # 尝试通过东财直连接口获取增长相关数据
+            from .data_manager import DataFetcher
+            fetcher2 = DataFetcher()
+            df = fetcher2._fetch_financial_eastmoney_direct(code)
+            if df is not None and not df.empty:
+                r = df.iloc[0]
+                return {
+                    "eps_growth_3y": 0,
+                    "revenue_growth_3y": 0,
+                    "peg": 0,
+                    "roe": float(r.get("roe", 0) or 0),
+                    "profit_growth_yoy": float(r.get("净利润增长率", 0) or 0),
+                    "equity_growth_yoy": 0,
+                }
+        except Exception:
+            pass
+        return {}
 
     def ranked(self, min_score: float = 0) -> list[StockPoolItem]:
         """返回按评分降序的股票列表"""
@@ -1556,6 +1719,7 @@ SCORER_MAP: dict[str, BaseScorer] = {
     "ma_cross": MACrossoverScorer(),
     "volume_breakout": VolumeBreakoutScorer(),
     "trend_accel": TrendAccelerationScorer(),
+    "high_growth": HighGrowthScorer(),
 }
 
 POOL_LABEL_MAP = {
@@ -1568,6 +1732,7 @@ POOL_LABEL_MAP = {
     "ma_cross": "均线交叉",
     "volume_breakout": "量价突破",
     "trend_accel": "趋势加速",
+    "high_growth": "高增长",
 }
 
 

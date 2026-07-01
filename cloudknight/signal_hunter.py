@@ -38,6 +38,7 @@ from .strategies import (
     TurtleStrategy,
     ValueInvestStrategy,
     VolumeBreakoutStrategy,
+    HighGrowthStrategy,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ STRATEGY_HANDLERS = {
     "ma_cross": MACrossoverStrategy,
     "volume_breakout": VolumeBreakoutStrategy,
     "trend_accel": TrendAccelerationStrategy,
+    "high_growth": HighGrowthStrategy,
 }
 
 
@@ -519,6 +521,22 @@ class SignalHunter:
                     code=code, name=name, strategy=strategy, signal_type="sell",
                     confidence="low", price=close,
                     reason="趋势加速结束，跌破MA20",
+                )
+
+        elif strategy == "high_growth":
+            # 高增长：MA60上方 + RSI适中 + 量能正常 → 买入
+            if close > ma60 and 35 <= rsi_val <= 55 and vol_ratio >= 0.8:
+                return TradeSignal(
+                    code=code, name=name, strategy=strategy, signal_type="buy",
+                    confidence="medium", price=close,
+                    reason=f"高增长趋势确认 RSI={rsi_val:.0f}",
+                )
+            # 跌破MA60 + RSI弱势 → 卖出
+            if close < ma60 * 0.95 and rsi_val < 40:
+                return TradeSignal(
+                    code=code, name=name, strategy=strategy, signal_type="sell",
+                    confidence="medium", price=close,
+                    reason="高增长趋势破位",
                 )
 
         return None

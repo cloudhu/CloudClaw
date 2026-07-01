@@ -20,6 +20,7 @@ STRATEGIES = {
     "bollinger": "布林带回归",
     "volume_breakout": "量价突破",
     "trend_accel": "趋势加速",
+    "high_growth": "高增长",
 }
 
 DEFAULT_CAPITAL = 1000000.0
