@@ -477,11 +477,8 @@ body {
     <!-- 引擎状态 -->
     <div class="card-row" id="ops-engine-status"></div>
 
-    <!-- 策略权益曲线 + 回撤图（水下曲线） -->
-    <div class="grid-2">
-      <div class="chart-box"><div class="chart-title">📈 策略权益曲线（对数坐标）</div><div class="chart h300" id="chart-ops-equity"></div></div>
-      <div class="chart-box"><div class="chart-title">📉 策略回撤（水下曲线）<span style="color:var(--text-dim);font-size:10px;margin-left:8px;">越深越痛</span></div><div class="chart h300" id="chart-ops-drawdown"></div></div>
-    </div>
+    <!-- 策略权益曲线 -->
+    <div class="chart-box"><div class="chart-title">📈 策略权益曲线（对数坐标）</div><div class="chart h300" id="chart-ops-equity"></div></div>
 
     <!-- 交易分析 -->
     <div class="grid-2">
@@ -1322,7 +1319,6 @@ function renderOps() {
   renderOpsHealth(opsData.system);
   renderOpsEngine(opsData.engine);
   renderOpsEquityChart(opsData.equity_history);
-  renderOpsDrawdownChart(opsData.equity_history);
   renderOpsTradeAnalysis(opsData.trade_analysis);
   renderOpsStrategies(opsData.strategies);
   renderOpsOperations(opsData.operations);
@@ -1447,81 +1443,7 @@ function renderOpsEquityChart(history) {
   _opsCharts.push(chart);
 }
 
-// ── 策略回撤水下曲线（AKQuant §13.2.2） ──
-function renderOpsDrawdownChart(history) {
-  const dom = document.getElementById('chart-ops-drawdown');
-  if (!dom) return;
-  const chart = echarts.init(dom);
-  if (!history || !Object.keys(history).length) {
-    chart.setOption({ title:{text:'暂无数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
-    return;
-  }
 
-
-  const strategyColors = {
-    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
-    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
-    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4'
-  };
-  const strategyLabels = {
-    dragon_head:'龙头', sparrow:'麻雀', turtle:'海龟', value_invest:'价值',
-    grid:'网格', ma_cross:'均线', bollinger:'布林',
-    volume_breakout:'量价', trend_accel:'趋势', high_growth:'高增长'
-  };
-
-  // 计算每个策略的回撤序列
-  const calcDD = (series) => {
-    let peak = series[0].equity;
-    return series.map(s => {
-      if (s.equity > peak) peak = s.equity;
-      return { date: s.date, dd: peak > 0 ? ((s.equity - peak) / peak * 100) : 0 };
-    });
-  };
-
-  const entries = Object.entries(history)
-    .filter(([,s]) => Array.isArray(s) && s.length >= 2)
-    .map(([key, s]) => [key, calcDD(s)]);
-
-  if (!entries.length) {
-    chart.setOption({ title:{text:'暂无足够数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
-    return;
-  }
-
-  const series = entries.map(([key, dd]) => ({
-    name: strategyLabels[key] || key,
-    type: 'line',
-    data: dd.map(d => [d.date, d.dd]),
-    smooth: true,
-    symbol: 'none',
-    lineStyle: { width: 1.5, color: strategyColors[key] || '#6d8099' },
-    areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,
-      [{offset:0, color: _hexToRgba(strategyColors[key]||'#6d8099', 0.25)},
-       {offset:1, color:'rgba(0,0,0,0)'}]) },
-    emphasis: { focus: 'series' },
-  }));
-
-  // 找最深回撤
-  const allDDs = entries.flatMap(([, dd]) => dd.map(d => d.dd));
-  const minDD = Math.min(0, ...allDDs);
-
-  chart.setOption({
-    tooltip: { trigger:'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'},
-      formatter: ps => ps.map(p => `${p.marker} ${p.seriesName}: ${p.value[1].toFixed(2)}%`).join('<br>') },
-    legend: { bottom:0, textStyle:{color:'#6d8099',fontSize:10}, data:series.map(s=>s.name) },
-    grid: { left:55, right:20, top:10, bottom:35 },
-    xAxis: { type:'category', axisLine:{lineStyle:{color:'#2a3a4a'}}, axisLabel:{color:'#6d8099',fontSize:9} },
-    yAxis: {
-      type:'value', min: minDD - 2, max: 2,
-      axisLabel:{color:'#6d8099',fontSize:9,formatter:v=>v.toFixed(0)+'%'},
-      axisLine:{lineStyle:{color:'#2a3a4a'}},
-      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
-    },
-    series,
-  });
-
-  window.addEventListener('resize', () => chart.resize());
-  _opsCharts.push(chart);
-}
 
 // ── 交易盈亏分析（AKQuant §13.2.8 MAE/MFE 风格） ──
 function renderOpsTradeAnalysis(ta) {
