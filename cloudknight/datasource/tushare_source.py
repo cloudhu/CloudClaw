@@ -9,6 +9,7 @@ TuShare Pro 积分体系:
 """
 
 import logging
+import time as _time
 from datetime import datetime
 
 import pandas as pd
@@ -39,6 +40,19 @@ _TUSHARE_API_COST: dict[str, int] = {
     "fund_daily": 2,
 }
 
+# TuShare 各接口频率限制（秒），避免触发限流后浪费额度
+_TUSHARE_API_MIN_INTERVAL: dict[str, float] = {
+    "index_daily": 65,      # 1次/分钟，留5秒余量
+    "moneyflow": 65,        # 1次/分钟
+    "daily_basic": 5,       # 较宽松
+    "financial": 5,
+    "income": 5,
+    "balancesheet": 5,
+    "stock_basic": 5,
+    "fund_daily": 65,
+}
+_DEFAULT_MIN_INTERVAL = 5  # 默认最小间隔
+
 
 class TuShareAdapter(DataSourceAdapter):
     """TuShare Pro 数据源适配器
@@ -61,6 +75,24 @@ class TuShareAdapter(DataSourceAdapter):
         self._quota.daily_limit = 2000
         self._quota.monthly_limit = 60000
         self._pro = None
+        self._last_api_call: dict[str, float] = {}  # API名称 → 上次调用时间戳
+
+    def _check_rate_limit(self, api_name: str) -> bool:
+        """检查 API 是否处于冷却期，返回 True 表示可以调用"""
+        if api_name not in _TUSHARE_API_MIN_INTERVAL:
+            return True
+        interval = _TUSHARE_API_MIN_INTERVAL.get(api_name, _DEFAULT_MIN_INTERVAL)
+        last = self._last_api_call.get(api_name, 0)
+        elapsed = _time.time() - last
+        if elapsed < interval:
+            remaining = interval - elapsed
+            logger.debug(f"TuShare {api_name} 冷却中（剩余 {remaining:.0f}s）→ 跳过")
+            return False
+        return True
+
+    def _mark_api_call(self, api_name: str):
+        """记录 API 调用时间"""
+        self._last_api_call[api_name] = _time.time()
 
     def _validate_credentials(self) -> bool:
         if not self._pro:
@@ -277,6 +309,8 @@ class TuShareAdapter(DataSourceAdapter):
             return FetchResult(success=False, source_name=self.name, error="未连接")
         if not self.has_quota():
             return FetchResult(success=False, source_name=self.name, error="额度已用完")
+        if not self._check_rate_limit("index_daily"):
+            return FetchResult(success=False, source_name=self.name, error="频率限制，跳过")
 
         if not end_date:
             end_date = datetime.now().strftime("%Y%m%d")
@@ -290,6 +324,7 @@ class TuShareAdapter(DataSourceAdapter):
                 start_date=start_date,
                 end_date=end_date,
             )
+            self._mark_api_call("index_daily")
             self._consume_quota(_TUSHARE_API_COST.get("index_daily", 2))
 
             if df is None or df.empty:
@@ -382,6 +417,8 @@ class TuShareAdapter(DataSourceAdapter):
                     "股票代码": df["symbol"],
                     "股票简称": df["name"],
                     "行业": df["industry"],
+                    "地区": df.get("area", ""),
+                    "市场类型": df.get("market", ""),
                     "上市时间": df["list_date"],
                 }
             )

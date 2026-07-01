@@ -407,7 +407,7 @@ def _list_trade_files() -> list[str]:
 
 def _api_key_to_pool_key(api_key: str) -> str:
     """API 短键 → 池文件键映射"""
-    mapping = {"dragon": "dragon_head", "sparrow": "sparrow", "turtle": "turtle", "value": "value_invest"}
+    mapping = {"dragon": "dragon_head", "sparrow": "sparrow", "turtle": "turtle", "value": "value_invest", "grid": "grid"}
     return mapping.get(api_key, api_key)
 
 
@@ -418,6 +418,7 @@ def _read_pool(strategy_key: str) -> dict | None:
         "sparrow": "sparrow.json",
         "turtle": "turtle.json",
         "value": "value_invest.json",
+        "grid": "grid.json",
     }
     filename = pool_files.get(strategy_key, f"{strategy_key}.json")
     path = os.path.join(POOL_DIR, filename)
@@ -1488,56 +1489,7 @@ body {
   0%,100% { opacity:1; } 50% { opacity:0.4; }
 }
 
-/* Ops - 生命周期时间线 */
-.phase-timeline {
-  display:flex; align-items:flex-start; gap:6px; flex-wrap:wrap; padding:8px 0;
-}
-.phase-node {
-  display:flex; flex-direction:column; align-items:center; gap:4px; min-width:64px;
-  position:relative; font-size:10px;
-}
-.phase-node .dot {
-  width:14px; height:14px; border-radius:50%;
-  border:2px solid var(--border); background:var(--panel);
-  transition:all .3s; position:relative; z-index:1;
-}
-.phase-node .dot.active {
-  border-color:var(--accent); background:var(--accent);
-  box-shadow:0 0 8px rgba(52,152,219,0.5);
-}
-.phase-node .dot.done {
-  border-color:var(--green); background:var(--green);
-}
-.phase-node .dot.pending {
-  border-color:var(--border); background:var(--panel);
-}
-.phase-node .label { color:var(--text-dim); text-align:center; max-width:70px; }
-.phase-node .label.active { color:var(--accent); font-weight:600; }
-.phase-node .label.done { color:var(--green); }
-.phase-connector {
-  flex:0 0 12px; height:2px; background:var(--border);
-  align-self:center; margin-bottom:22px;
-}
-.phase-connector.done { background:var(--green); }
-.phase-connector.active { background:linear-gradient(to right, var(--green), var(--accent)); }
-
-/* Ops - 系统健康 sparkline 趋势 */
-.health-sparkline {
-  display:flex; align-items:flex-end; gap:2px; height:36px; margin-top:6px;
-}
-.health-sparkline .bar {
-  flex:1; border-radius:1px; min-width:2px;
-  transition:height .3s;
-}
-.health-sparkline .bar.cpu-low { background:rgba(39,174,96,0.5); }
-.health-sparkline .bar.cpu-mid { background:rgba(243,156,18,0.5); }
-.health-sparkline .bar.cpu-high { background:rgba(231,76,60,0.5); }
-.health-sparkline .bar.mem-low { background:rgba(52,152,219,0.5); }
-.health-sparkline .bar.mem-mid { background:rgba(243,156,18,0.5); }
-.health-sparkline .bar.mem-high { background:rgba(231,76,60,0.5); }
-
-/* Ops - 新 chart 高度 */
-.chart.h120 { height:120px; }
+/* Ops - chart 高度 */
 .chart.h200 { height:200px; }
 .chart.h220 { height:220px; }
 
@@ -1716,24 +1668,11 @@ body {
     <!-- 系统健康 + 趋势图 -->
     <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">🖥️ 系统健康 <span style="color:var(--text-dim);font-size:11px;margin-left:8px;" id="ops-health-time"></span></div>
       <div class="card-row" id="ops-health-cards"></div>
-      <div class="grid-2" style="margin-top:8px;">
-        <div style="background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px;">
-          <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;">📊 CPU 使用率趋势 %</div>
-          <div id="ops-cpu-sparkline" class="health-sparkline"></div>
-        </div>
-        <div style="background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px;">
-          <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;">📊 内存占用趋势 MB</div>
-          <div id="ops-mem-sparkline" class="health-sparkline"></div>
-        </div>
-      </div>
+
     </div>
 
-    <!-- 引擎状态 + 生命周期时间线 -->
+    <!-- 引擎状态 -->
     <div class="card-row" id="ops-engine-status"></div>
-    <div class="chart-box" style="margin-bottom:14px;">
-      <div class="chart-title">🔄 生命周期阶段流转 <span style="color:var(--text-dim);font-size:10px;margin-left:8px;" id="ops-phase-subtitle"></span></div>
-      <div id="ops-phase-timeline" class="phase-timeline" style="min-height:48px;"></div>
-    </div>
 
     <!-- 策略权益曲线 + 回撤图（水下曲线） -->
     <div class="grid-2">
@@ -1747,10 +1686,6 @@ body {
         <div class="chart-title">📊 交易盈亏分析</div>
         <div class="card-row" id="ops-trade-stats"></div>
         <div class="chart h200" id="chart-ops-pnl-dist"></div>
-      </div>
-      <div class="chart-box" style="margin-bottom:14px;">
-        <div class="chart-title">📝 引擎日志阶段分布</div>
-        <div class="chart h200" id="chart-ops-log-dist"></div>
       </div>
     </div>
 
@@ -2583,19 +2518,15 @@ async function loadOps() {
 function renderOps() {
   renderOpsHealth(opsData.system);
   renderOpsEngine(opsData.engine);
-  renderOpsPhaseTimeline(opsData.engine);
   renderOpsEquityChart(opsData.equity_history);
   renderOpsDrawdownChart(opsData.equity_history);
   renderOpsTradeAnalysis(opsData.trade_analysis);
-  renderOpsLogDistribution(opsData.logs);
   renderOpsStrategies(opsData.strategies);
   renderOpsOperations(opsData.operations);
   renderOpsLogs(opsData.logs);
 }
 
-// ── 系统健康（含趋势 sparkline） ──
-let _healthHistory = { cpu:[], mem:[] };
-const _HEALTH_MAX_HISTORY = 30;  // 保留最近30次采集（15分钟@30s间隔）
+// ── 系统健康 ──
 
 function renderOpsHealth(sys) {
   $('#ops-health-time').textContent = `采集时间: ${new Date().toLocaleTimeString()}`;
@@ -2614,28 +2545,6 @@ function renderOpsHealth(sys) {
       <div class="card-sub" style="color:var(--text-dim);font-size:11px;">${c.sub}</div>
     </div>
   `).join('');
-
-  // 维护趋势历史缓冲区
-  _healthHistory.cpu.push(sys.cpu_percent);
-  _healthHistory.mem.push(sys.memory_used_mb);
-  if (_healthHistory.cpu.length > _HEALTH_MAX_HISTORY) _healthHistory.cpu.shift();
-  if (_healthHistory.mem.length > _HEALTH_MAX_HISTORY) _healthHistory.mem.shift();
-
-  // 渲染 sparkline
-  const renderSparkline = (containerId, data, maxVal, clsFn) => {
-    const el = document.getElementById(containerId);
-    if (!el || !data.length) return;
-    el.innerHTML = data.map(v => {
-      const pct = maxVal > 0 ? Math.max(2, (v / maxVal) * 100) : 5;
-      return `<div class="bar ${clsFn(v)}" style="height:${pct}%;" title="${v.toFixed(1)}"></div>`;
-    }).join('');
-  };
-  const cpuMax = Math.max(..._healthHistory.cpu, 100);
-  const memMax = Math.max(..._healthHistory.mem, 1000);
-  renderSparkline('ops-cpu-sparkline', _healthHistory.cpu, cpuMax,
-    v => v >= 85 ? 'cpu-high' : v >= 60 ? 'cpu-mid' : 'cpu-low');
-  renderSparkline('ops-mem-sparkline', _healthHistory.mem, memMax,
-    v => v >= 2000 ? 'mem-high' : v >= 1000 ? 'mem-mid' : 'mem-low');
 }
 
 // ── 引擎状态 ──
@@ -2669,55 +2578,6 @@ function renderOpsEngine(eng) {
   `).join('');
 
   $('#ops-engine-status').innerHTML = html;
-}
-
-// ── 生命周期阶段流转时间线 ──
-function renderOpsPhaseTimeline(eng) {
-  // 定义全部生命周期阶段（按顺序）
-  const allPhases = [
-    { key:'screening', label:'选股', icon:'🔍' },
-    { key:'signal_scan', label:'信号', icon:'📡' },
-    { key:'stop_monitor', label:'止损', icon:'🛡' },
-    { key:'trade_exec', label:'交易', icon:'💹' },
-    { key:'trade_plan', label:'计划', icon:'📋' },
-    { key:'backtest', label:'回测', icon:'🔄' },
-    { key:'machine_learning', label:'ML', icon:'🧠' },
-    { key:'idle', label:'空闲', icon:'⏸' },
-  ];
-
-  const currentPhase = (eng.phase || '').toLowerCase();
-  let currentFound = false;
-  let subtitle = '';
-  const isRunning = eng.state === 'running';
-
-  const nodes = allPhases.map((p, i) => {
-    let cls = 'pending';
-    if (p.key === currentPhase) {
-      cls = 'active';
-      currentFound = true;
-      subtitle = `当前: ${p.icon} ${p.label}` + (isRunning ? '' : '（引擎未运行）');
-    } else if (!currentFound) {
-      cls = 'done';
-    }
-    return { ...p, cls };
-  });
-
-  $('#ops-phase-subtitle').textContent = subtitle;
-
-  const timelineHtml = nodes.map((p, i) => {
-    const connector = i < nodes.length - 1
-      ? `<div class="phase-connector ${p.cls === 'done' ? 'done' : (p.cls === 'active' && nodes[i+1].cls === 'pending') ? 'active' : ''}"></div>`
-      : '';
-    return `
-      <div class="phase-node">
-        <div class="dot ${p.cls}"></div>
-        <div class="label ${p.cls}">${p.icon}<br>${p.label}</div>
-      </div>${connector}`;
-  }).join('');
-
-  $('#ops-phase-timeline').innerHTML = nodes.length
-    ? `<div class="phase-timeline">${timelineHtml}</div>`
-    : '<div style="color:var(--text-dim);font-size:12px;">等待引擎启动...</div>';
 }
 
 // ── 策略权益曲线（对数坐标，AKQuant §13.2.1） ──
@@ -2908,55 +2768,6 @@ function renderOpsTradeAnalysis(ta) {
         return { value:d.count, itemStyle:{color:midVal>=0?'#27ae60':'#e74c3c'} };
       }),
       barWidth:'60%',
-    }],
-  });
-
-  window.addEventListener('resize', () => chart.resize());
-  _opsCharts.push(chart);
-}
-
-// ── 引擎日志阶段分布 ──
-function renderOpsLogDistribution(logs) {
-  const dom = document.getElementById('chart-ops-log-dist');
-  if (!dom) return;
-  const chart = echarts.init(dom);
-
-  if (!logs || !logs.length) {
-    chart.setOption({ title:{text:'暂无日志数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
-    return;
-  }
-
-  // 统计各阶段出现次数
-  const phaseCount = {};
-  const phaseLabels = {
-    closed:'非交易', pre_market:'盘前', auction:'竞价', auction_result:'竞价结果',
-    morning:'早盘', lunch:'午休', afternoon:'午盘', post_market:'收盘',
-    screening:'选股', signal_scan:'信号', stop_monitor:'止损', trade_exec:'交易',
-    trade_plan:'计划', backtest:'回测', machine_learning:'ML', idle:'空闲',
-  };
-  logs.forEach(l => {
-    const p = l.phase || 'other';
-    const label = phaseLabels[p] || p;
-    phaseCount[label] = (phaseCount[label] || 0) + 1;
-  });
-
-  const entries = Object.entries(phaseCount).sort((a,b) => b[1] - a[1]);
-  const colors = ['#3498db','#27ae60','#f39c12','#e74c3c','#9b59b6','#1abc9c','#e67e22','#2ecc71','#e91e63','#00bcd4','#f1c40f','#95a5a6'];
-
-  chart.setOption({
-    tooltip: { trigger:'item', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'},
-      formatter:'{b}: {c} 条 ({d}%)' },
-    series: [{
-      type:'pie',
-      radius:['45%','75%'],
-      center:['50%','50%'],
-      avoidLabelOverlap:false,
-      itemStyle:{borderRadius:4,borderColor:'#0f1923',borderWidth:2},
-      label:{show:true,position:'outside',color:'#6d8099',fontSize:10,formatter:'{b}'},
-      emphasis:{label:{fontSize:14,fontWeight:'bold'}},
-      data:entries.map(([name,val],i) => ({
-        name, value:val, itemStyle:{color:colors[i%colors.length]}
-      })),
     }],
   });
 

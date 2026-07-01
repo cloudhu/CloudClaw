@@ -196,7 +196,7 @@ class StockDiagnoser:
         strategy_diags = self._diagnose_strategies(df_kline, tech, fund, cap)
 
         # 自动入池：评分达标且未在池中的股票自动加入对应策略池
-        auto_add_results = self._auto_add_to_pools(code, tech.stock_name, tech.current_price, strategy_diags)
+        auto_add_results = self._auto_add_to_pools(code, tech.stock_name, tech.current_price, strategy_diags, df_kline)
 
         # 数据质量评估
         data_quality = self._assess_data_quality(tech, fund, cap, market)
@@ -246,7 +246,7 @@ class StockDiagnoser:
         strategy_diags = self._diagnose_strategies(df_kline, tech, fund, cap)
 
         # 自动入池
-        auto_add_results = self._auto_add_to_pools(code, tech.stock_name, tech.current_price, strategy_diags)
+        auto_add_results = self._auto_add_to_pools(code, tech.stock_name, tech.current_price, strategy_diags, df_kline)
 
         composite, rating, rec, risk, summary = self._compute_composite(tech, fund, cap, market, strategy_diags)
         name = tech.stock_name or self._resolve_name(code)
@@ -1175,8 +1175,49 @@ class StockDiagnoser:
         except Exception:
             return None
 
+    def _compute_pool_components(self, code: str, strategy_key: str, df: pd.DataFrame,
+                                  extra: dict | None = None) -> dict[str, float]:
+        """使用策略专属评分器计算各维度得分，返回 components dict。
+
+        Args:
+            code: 股票代码
+            strategy_key: 策略 key (dragon_head/sparrow/turtle/value_invest/grid/...)
+            df: K线 DataFrame
+            extra: 额外数据（如基本面数据）
+        """
+        try:
+            from .stock_pool import (
+                DragonHeadScorer, SparrowScorer, TurtleScorer,
+                ValueInvestScorer, GridScorer, BollingerBandScorer,
+                MACrossoverScorer,
+            )
+
+            scorer_map = {
+                "dragon_head": DragonHeadScorer,
+                "sparrow": SparrowScorer,
+                "turtle": TurtleScorer,
+                "value_invest": ValueInvestScorer,
+                "grid": GridScorer,
+                "bollinger": BollingerBandScorer,
+                "ma_cross": MACrossoverScorer,
+            }
+
+            scorer_cls = scorer_map.get(strategy_key)
+            if scorer_cls is None:
+                return {"综合评分": 100.0}
+
+            scorer = scorer_cls()
+            item = scorer.score(code, "", df, extra)
+            if item.components:
+                return item.components
+            return {"综合评分": item.score}
+        except Exception as e:
+            logger.warning(f"计算 {strategy_key} 评分维度失败: {e}")
+            return {}
+
     def _auto_add_to_pools(
-        self, code: str, name: str, price: float, strategy_diags: list[StrategyDiagnosis]
+        self, code: str, name: str, price: float, strategy_diags: list[StrategyDiagnosis],
+        df_kline: pd.DataFrame | None = None,
     ) -> dict[str, dict]:
         """诊股后自动将高评分股票加入对应策略池
 
@@ -1198,10 +1239,12 @@ class StockDiagnoser:
             result = {
                 "added": False,
                 "already_in": False,
+                "pool_full": False,
                 "score": diag.score,
                 "threshold": threshold,
                 "plan": None,
                 "error": None,
+                "eliminated": None,
             }
 
             # 评分未达自动入池阈值，跳过
@@ -1228,15 +1271,54 @@ class StockDiagnoser:
                 results[diag.key] = result
                 continue
 
-            # 执行自动入池
+            # 执行自动入池（含池满末位淘汰）
             try:
-                from .stock_pool import StockPoolItem
+                from .stock_pool import MAX_POOL_SIZE, StockPoolItem
+
+                # 确保名称不为空（优先缓存，其次 _resolve_name，最后回退）
+                resolved_name = name
+                if not resolved_name:
+                    resolved_name = cls._resolve_name(code)
+                    # 如果 _resolve_name 仍返回占位格式，尝试再查一次缓存
+                    if resolved_name.startswith("股票"):
+                        try:
+                            from .stock_info_cache import get_stock_info_cache
+                            cached = get_stock_info_cache().get_name(code)
+                            if cached:
+                                resolved_name = cached
+                        except Exception:
+                            pass
+
+                # 池满时的末位淘汰：找到活跃股票中评分最低的
+                if pool.size >= MAX_POOL_SIZE:
+                    active_items = [(c, it) for c, it in pool.items.items() if it.status == "active"]
+                    if active_items:
+                        weakest_code, weakest_item = min(active_items, key=lambda x: x[1].score)
+                        if float(diag.score) > weakest_item.score:
+                            # 新票评分更高：淘汰最低分，纳入新票
+                            weakest_item.status = "eliminated"
+                            result["eliminated"] = {"code": weakest_code, "name": weakest_item.name, "score": weakest_item.score}
+                            logger.info(
+                                f"末位淘汰 [{diag.key}]: {weakest_code} {weakest_item.name} "
+                                f"(评分{weakest_item.score:.0f}) → 让位 {code} (评分{diag.score})"
+                            )
+                        else:
+                            # 新票评分不敌池内最低分，拒绝入池
+                            result["pool_full"] = True
+                            result["required_min_score"] = weakest_item.score
+                            results[diag.key] = result
+                            continue
+
+                # 计算策略专属各维度评分
+                comps = self._compute_pool_components(code, diag.key, df_kline) if df_kline is not None and not df_kline.empty else {}
+                if not comps:
+                    comps = {"诊断推荐": float(diag.score)}
 
                 item = StockPoolItem(
                     code=code,
-                    name=name or f"股票{code}",
+                    name=resolved_name,
                     score=float(diag.score),
-                    components={"诊断推荐": float(diag.score)},
+                    components=comps,
                     screened_at=datetime.now().strftime("%Y%m%d"),
                     entry_price=round(price, 2),
                     max_price=round(price, 2),
@@ -1245,7 +1327,7 @@ class StockDiagnoser:
                 pool.save()
 
                 # 生成交易计划
-                plan_obj = pool.create_trade_plan(code, name or f"股票{code}", price, float(diag.score))
+                plan_obj = pool.create_trade_plan(code, resolved_name, price, float(diag.score))
 
                 result["added"] = True
                 result["plan"] = {
@@ -1330,15 +1412,41 @@ class StockDiagnoser:
                 "error": f"已在 {pool.strategy_label} 池中（{existing.tier or '待评估'}层，评分{existing.score:.0f}）",
             }
 
-        # 加入池
+        # 加入池（含池满末位淘汰）
         try:
-            from .stock_pool import StockPoolItem
+            from .stock_pool import MAX_POOL_SIZE, StockPoolItem
+
+            # 池满时的末位淘汰
+            eliminated = None
+            if pool.size >= MAX_POOL_SIZE:
+                active_items = [(c, it) for c, it in pool.items.items() if it.status == "active"]
+                if active_items:
+                    weakest_code, weakest_item = min(active_items, key=lambda x: x[1].score)
+                    if float(score) > weakest_item.score:
+                        weakest_item.status = "eliminated"
+                        eliminated = {"code": weakest_code, "name": weakest_item.name, "score": weakest_item.score}
+                        logger.info(
+                            f"末位淘汰 [{strategy_key}]: {weakest_code} {weakest_item.name} "
+                            f"(评分{weakest_item.score:.0f}) → 让位 {code} (评分{score})"
+                        )
+                    else:
+                        return {
+                            "success": False,
+                            "pool_full": True,
+                            "error": f"池已满({pool.size}/{MAX_POOL_SIZE})，评分{score}低于池内最低分{weakest_item.score:.0f}",
+                        }
+
+            # 获取 K 线数据用于计算策略专属各维度评分
+            df_kline = self._fetch_kline_safe(code)
+            comps = self._compute_pool_components(code, strategy_key, df_kline) if not df_kline.empty else {}
+            if not comps:
+                comps = {"诊断推荐": float(score)}
 
             item = StockPoolItem(
                 code=code,
                 name=name,
                 score=float(score),
-                components={"诊断推荐": float(score)},
+                components=comps,
                 screened_at=datetime.now().strftime("%Y%m%d"),
                 entry_price=round(price, 2),
                 max_price=round(price, 2),
@@ -1404,7 +1512,19 @@ class StockDiagnoser:
 
     @staticmethod
     def _resolve_name(code: str) -> str:
-        """解析股票名称"""
+        """解析股票名称（优先本地缓存，避免网络请求）"""
+        # 1. 优先从本地 stock_info 缓存查询（最快，网络无关）
+        try:
+            from .stock_info_cache import get_stock_info_cache
+
+            cache = get_stock_info_cache()
+            name = cache.get_name(code)
+            if name:
+                return name
+        except Exception:
+            pass
+
+        # 2. 回退：从数据源拉取（可能触发网络请求）
         try:
             from .data_manager import DataFetcher
 

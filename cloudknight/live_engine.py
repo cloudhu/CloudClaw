@@ -33,10 +33,9 @@ import contextlib
 import json
 import logging
 import os
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from enum import Enum
 from threading import Event, Lock, Thread
 
@@ -175,6 +174,9 @@ class LiveTradingEngine:
         self._screen_offset: int = 0
         self._screened_codes: set[str] = set()
         self._screening_done: bool = False  # 选股全部完成
+
+        # 交易计划触发标志（事件驱动，替代定时触发）
+        self._trade_plan_needed: bool = False
 
         # 回测阶段状态
         self._backtest_date: str | None = None  # 上次回测日期
@@ -480,6 +482,10 @@ class LiveTradingEngine:
         for _key, info in pool_summary.items():
             self._log(TradingPhase.POST_MARKET, f"  [{info['label']}] 关注 {info['count']} 只")
 
+        # 触发条件②：收盘总结发现优质股票 → 需要制定交易计划
+        if any(info["count"] > 0 for info in pool_summary.values()):
+            self._trade_plan_needed = True
+
     def _report_current_signals(self):
         """输出当前信号摘要"""
         if not self._latest_signals:
@@ -543,10 +549,9 @@ class LiveTradingEngine:
         # 确定当前应执行的生命周期阶段
         target_phase = self._lifecycle_determine_phase(now)
 
-        # IDLE/ML 阶段时同步策略阶段状态（供前端展示）
-        if target_phase in (LifecyclePhase.IDLE, LifecyclePhase.MACHINE_LEARNING):
-            self._update_all_strategy_phases(target_phase, now)
-            self._save_state()  # 持久化 IDLE/ML 状态变更，供 Web 仪表盘实时读取
+        # 始终同步策略阶段状态到前端（即使在冷却中也要显示引擎当前目标阶段）
+        self._update_all_strategy_phases(target_phase, now)
+        self._save_state()
 
         # 冷却检查
         if not self._lifecycle_can_run(target_phase, now):
@@ -554,7 +559,7 @@ class LiveTradingEngine:
 
         # 执行阶段动作
         self._lifecycle_execute(target_phase, now)
-        self._save_state()  # 持久化策略生命周期阶段，供 Web 仪表盘实时读取
+        self._save_state()  # 执行后再次持久化（含阶段完成标记等变更）
 
     def _lifecycle_determine_phase(self, now: datetime) -> LifecyclePhase:
         """根据当前交易时段确定应执行的生命周期阶段。
@@ -580,14 +585,9 @@ class LiveTradingEngine:
             ]
             return self._resolve_phase_with_idle_restart(phases_order, now)
 
-        # ── 盘后 (POST_MARKET) ──
+        # ── 盘后 (POST_MARKET) ── 连续轮转（不依赖 completed，防 IDLE 停滞）
         if tp == TradingPhase.POST_MARKET:
-            phases_order = [
-                LifecyclePhase.SCREENING,
-                LifecyclePhase.TRADE_PLAN,
-                LifecyclePhase.BACKTEST,
-            ]
-            return self._resolve_phase_with_idle_restart(phases_order, now)
+            return self._resolve_post_market_phase(now)
 
         # ── 盘前/竞价 → 交易计划 + 信号扫描 ──
         if tp in (TradingPhase.PRE_MARKET, TradingPhase.AUCTION, TradingPhase.AUCTION_RESULT):
@@ -662,6 +662,45 @@ class LiveTradingEngine:
 
         # 空闲期检查 ML 触发
         return self._maybe_trigger_ml()
+
+    def _resolve_post_market_phase(self, now: datetime) -> LifecyclePhase:
+        """盘后连续轮转：基于各阶段独立冷却时间持续调度，不复用 _lifecycle_completed。
+
+        调度规则：
+          - SCREENING: 若 _screening_done，跳过；否则每 30s 执行一批
+          - TRADE_PLAN: 事件驱动（信号/收盘总结/选股发现优质票时触发），首轮必执行（next_day_plan）
+          - BACKTEST:  每日仅一次（_backtest_date 防重复）
+          - 所有阶段在冷却期内 → 先检查 ML，再回退到 TRADE_PLAN 维持活动状态
+        """
+        today_str = now.strftime("%Y%m%d")
+        backtest_done = self._backtest_date == today_str
+
+        # TRADE_PLAN 跳过条件：
+        #   - 未触发（_trade_plan_needed=False）且 next_day_plan 已完成 → 跳过
+        #   - 已触发或 next_day_plan 未完成 → 候选
+        trade_plan_skip = (not self._trade_plan_needed) and ("next_day_plan" in self._daily_ops_done)
+
+        candidates = [
+            (LifecyclePhase.SCREENING, self._INTERVAL_SCREENING, self._screening_done),
+            (LifecyclePhase.TRADE_PLAN, self._INTERVAL_TRADE_PLAN, trade_plan_skip),
+            (LifecyclePhase.BACKTEST, self._INTERVAL_BACKTEST, backtest_done),
+        ]
+
+        for p, interval, is_permanently_done in candidates:
+            if is_permanently_done:
+                continue
+            last = self._lifecycle_last_run.get(p.value[0])
+            if last is None or (now - last).total_seconds() >= interval:
+                return p
+
+        # 所有阶段在冷却或已完成 → 先检查 ML 是否有机会触发
+        if self._screening_done and backtest_done:
+            ml_phase = self._maybe_trigger_ml()
+            if ml_phase == LifecyclePhase.MACHINE_LEARNING:
+                return ml_phase
+
+        # 返回 TRADE_PLAN 维持"活跃"状态（_lifecycle_can_run 会拦截，但前端不再显示 IDLE）
+        return LifecyclePhase.TRADE_PLAN
 
     def _resolve_trading_phase(self, now: datetime) -> LifecyclePhase:
         """交易时段三阶段时间轮转（信号 → 止损 → 交易）。
@@ -835,8 +874,19 @@ class LiveTradingEngine:
                 status_parts.append(f"{key}: [{bar}] {focus}/{self._FOCUS_TARGET} (共{total})")
             self._log(trading_phase, f"  精选进度: {' | '.join(status_parts)}")
 
+            # 触发条件③：选股发现优质股票（focus/watch 层有标的）→ 需要制定交易计划
+            if any(counts.get("focus", 0) > 0 or counts.get("watch", 0) > 0
+                   for counts in overview.values()):
+                self._trade_plan_needed = True
+
             # 检查是否本轮后已满额
-            return self._check_all_pools_focus_full()
+            # 两种完成条件：①所有策略池精选满 5 只  OR  ②全市场全部遍历
+            pools_full = self._check_all_pools_focus_full()
+            if pools_full:
+                self._screening_done = True
+                self._log(trading_phase, "✅ 选股完成：所有策略池精选层已满 5 只！")
+                return True
+            return False
 
         except Exception as e:
             logger.warning(f"选股异常: {e}")
@@ -926,7 +976,11 @@ class LiveTradingEngine:
             total_sell += sum(1 for s in result.signals if s.signal_type in ("sell", "reduce", "close"))
 
         self._log(trading_phase, f"  信号结果: 买入 {total_buy} | 卖出 {total_sell}")
-        
+
+        # 触发条件①：发现买卖信号 → 需要制定交易计划
+        if total_buy > 0 or total_sell > 0:
+            self._trade_plan_needed = True
+
         # 输出详细信号报告
         self._report_current_signals()
         
@@ -1017,6 +1071,9 @@ class LiveTradingEngine:
             self._log(trading_phase,
                 f"⚡ [{LifecyclePhase.STOP_MONITOR.label}] 触发 {len(triggered_signals)} 条信号: "
                 + ", ".join(f"{s['code']}({s['type']})" for s in triggered_signals[:5]))
+
+            # 触发条件①：发现止盈止损信号 → 需要更新交易计划
+            self._trade_plan_needed = True
 
         return True  # 每次检查即可完成
 
@@ -1157,7 +1214,10 @@ class LiveTradingEngine:
             self._daily_ops_done.add("next_day_plan")
             self._make_next_day_plan(now)
 
-        # 核心：为精选层股票生成交易计划
+        # 核心：为精选层股票生成交易计划（事件驱动，仅在触发时生成）
+        if not self._trade_plan_needed:
+            return True  # 无触发条件，跳过（市场级任务已完成）
+        
         plans_generated = 0
 
         for strategy_name in STRATEGIES:
@@ -1192,6 +1252,8 @@ class LiveTradingEngine:
         if plans_generated > 0:
             self._log(trading_phase,
                 f"📝 [{LifecyclePhase.TRADE_PLAN.label}] 为 {plans_generated} 只精选票生成交易计划")
+            # 交易计划已生成，清除触发标志（等下一次事件触发）
+            self._trade_plan_needed = False
 
         return True  # 每轮生成即完成
 
@@ -1464,6 +1526,7 @@ class LiveTradingEngine:
         self._screen_offset = 0
         self._screened_codes.clear()
         self._screening_done = False
+        self._trade_plan_needed = False
         self._backtest_date = None
         self._ml_last_train_date = None
         # 重置各策略生命周期阶段

@@ -111,3 +111,27 @@ LIVE_LOG_DIR = os.path.join(DATA_DIR, "live_logs")
 LIVE_TRADE_DIR = os.path.join(DATA_DIR, "live_trades")
 os.makedirs(LIVE_LOG_DIR, exist_ok=True)
 os.makedirs(LIVE_TRADE_DIR, exist_ok=True)
+
+# ═══════════════════════════════════════════
+# 机器学习配置
+# ═══════════════════════════════════════════
+ML_MODEL_DIR = os.path.join(DATA_DIR, "ml_models")  # 模型存储目录
+ML_MODEL_TYPE = "random_forest"                      # 默认模型: logistic/random_forest/gradient_boosting
+ML_LABEL_METHOD = "triple_barrier"                   # 标签方法: fixed_window/triple_barrier/meta_label
+ML_TRAIN_WINDOW = 252                                # 训练窗口（交易日，~1年）
+ML_RETRAIN_DAYS = 7                                  # 重训练间隔（日）
+
+# ═══════════════════════════════════════════
+# ML 决策门控配置（ML Decision Gate）
+# ═══════════════════════════════════════════
+# 核心逻辑：策略触发买入信号 → 查询 ML 次日方向预测 →
+#   预测上涨（bullish）→ 确认买入
+#   预测下跌（bearish）→ 驳回买入，继续观察
+# 次日收盘后验证预测准确性 → 动态调整 ML 决策权重
+ML_GATE_ENABLED = True                    # 是否启用 ML 决策门控
+ML_GATE_INITIAL_WEIGHT = 0.50             # 初始决策权重（50% = 中立）
+ML_GATE_MIN_WEIGHT = 0.25                 # 最低权重（ML 连续预测错误时底线）
+ML_GATE_MAX_WEIGHT = 0.85                 # 最高权重（ML 连续预测正确时上限）
+ML_GATE_WINDOW_SIZE = 20                  # 滚动窗口大小（最近 N 次决策用于计算准确率）
+ML_GATE_MIN_ACCURACY = 0.50               # 最低准确率阈值（低于此值时放行所有买入）
+ML_GATE_DIRECTION_THRESHOLD = 0.005       # 次日方向判定阈值（涨/跌幅 > 0.5% 才算有效方向）

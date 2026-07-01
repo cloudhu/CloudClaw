@@ -243,7 +243,21 @@ class Database:
                 max_drawdown REAL, sharpe_ratio REAL, win_rate REAL,
                 total_trades INTEGER, params TEXT,
                 created_at TEXT DEFAULT (datetime('now')))""")
+            # 迁移：为旧表添加 area/exchange/updated_at 列（如不存在）
+            self._migrate_stock_info(conn)
             conn.commit()
+
+    def _migrate_stock_info(self, conn):
+        """为 stock_info 表补全静态信息列（兼容旧数据库）"""
+        migrate_cols = {
+            "area": "TEXT",
+            "exchange": "TEXT",
+            "updated_at": "TEXT DEFAULT (datetime('now'))",
+        }
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(stock_info)")}
+        for col_name, col_def in migrate_cols.items():
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE stock_info ADD COLUMN {col_name} {col_def}")
 
     def save_daily(self, df: pd.DataFrame):
         if df.empty:
@@ -296,30 +310,98 @@ class Database:
             return pd.read_sql_query(sql, conn, params=params)
 
     def save_stock_info(self, df: pd.DataFrame):
+        """保存股票基本信息（逐行 INSERT OR REPLACE），兼容旧版调用。
+
+        输入 DataFrame 应有中文列名，自动映射为英文列名入库。
+        已知映射：股票代码/股票简称/行业/地区/市场类型/上市时间/总市值/流通市值/市盈率-动态/市净率/交易所
+        """
         col_map = {
             "股票代码": "code",
             "股票简称": "name",
             "行业": "industry",
+            "地区": "area",
             "市场类型": "market",
             "上市时间": "list_date",
             "总市值": "total_mv",
             "流通市值": "circ_mv",
             "市盈率-动态": "pe",
             "市净率": "pb",
+            "交易所": "exchange",
         }
         df_db = df.rename(columns=col_map)
-        cols = [
-            c
-            for c in ["code", "name", "industry", "market", "list_date", "total_mv", "circ_mv", "pe", "pb"]
-            if c in df_db.columns
+        static_cols = [
+            "code", "name", "industry", "area", "market", "list_date", "exchange",
+            "total_mv", "circ_mv", "pe", "pb",
         ]
+        cols = [c for c in static_cols if c in df_db.columns]
+        # 自动更新时间戳
+        if "updated_at" not in cols:
+            cols.append("updated_at")
         with self._get_conn() as conn:
-            for _, row in df_db[cols].iterrows():
+            for _, row in df_db.iterrows():
+                values = []
+                actual_cols = []
+                for col in cols:
+                    if col == "updated_at":
+                        values.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                        actual_cols.append("updated_at")
+                    elif col in df_db.columns:
+                        v = row[col]
+                        values.append(None if pd.isna(v) else v)
+                        actual_cols.append(col)
+                placeholders = ",".join(["?"] * len(actual_cols))
+                cols_str = ",".join(actual_cols)
+                sql = f"INSERT OR REPLACE INTO stock_info ({cols_str}) VALUES ({placeholders})"
+                conn.execute(sql, tuple(values))
+            conn.commit()
+
+    def save_stock_info_batch(self, records: list[dict]):
+        """批量保存股票基本信息（高效 batch upsert）。
+
+        每条记录为 dict，key 使用英文列名：
+        code(必填), name, industry, area, market, list_date, exchange
+        """
+        if not records:
+            return
+        static_cols = ["code", "name", "industry", "area", "market", "list_date", "exchange"]
+        # 收集所有出现的列
+        all_keys = set()
+        for r in records:
+            all_keys.update(r.keys())
+        cols = [c for c in static_cols if c in all_keys]
+        cols.append("updated_at")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_conn() as conn:
+            for r in records:
+                values = [r.get(c) for c in cols[:-1]] + [now]
                 placeholders = ",".join(["?"] * len(cols))
                 cols_str = ",".join(cols)
                 sql = f"INSERT OR REPLACE INTO stock_info ({cols_str}) VALUES ({placeholders})"
-                conn.execute(sql, tuple(row[col] for col in cols))
+                conn.execute(sql, tuple(values))
             conn.commit()
+        logger.info(f"stock_info 批量写入 {len(records)} 条记录")
+
+    def get_stock_info_by_code(self, code: str) -> dict | None:
+        """按代码查询单只股票基本信息"""
+        with self._get_conn() as conn:
+            cur = conn.execute("SELECT * FROM stock_info WHERE code = ?", [code])
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            return dict(zip(cols, row))
+
+    def get_stock_names_by_codes(self, codes: list[str]) -> dict[str, str]:
+        """批量查询代码→名称映射"""
+        if not codes:
+            return {}
+        with self._get_conn() as conn:
+            placeholders = ",".join(["?"] * len(codes))
+            cur = conn.execute(
+                f"SELECT code, name FROM stock_info WHERE code IN ({placeholders})",
+                codes,
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
 
     def get_stock_list(self, industry: str | None = None) -> pd.DataFrame:
         sql = "SELECT * FROM stock_info"
@@ -329,6 +411,30 @@ class Database:
             params.append(industry)
         with self._get_conn() as conn:
             return pd.read_sql_query(sql, conn, params=params)
+
+    def get_stocks_by_industry(self, industry: str) -> list[dict]:
+        """按行业获取股票列表（返回 dict 列表）"""
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT code, name, industry, area, market, list_date, exchange FROM stock_info WHERE industry = ? ORDER BY code",
+                [industry],
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_all_industries(self) -> list[str]:
+        """获取所有行业分类列表"""
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT industry FROM stock_info WHERE industry IS NOT NULL AND industry != '' ORDER BY industry"
+            )
+            return [row[0] for row in cur.fetchall()]
+
+    def get_stock_count(self) -> int:
+        """获取已缓存的股票总数"""
+        with self._get_conn() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM stock_info")
+            return cur.fetchone()[0]
 
 
 class DataFetcher:
@@ -1276,16 +1382,21 @@ class DataFetcher:
     # ═══ 公共方法：缓存 + 降级 ═══
 
     def fetch_stock_list(self, force_refresh: bool = False) -> pd.DataFrame:
-        """获取股票列表，优先级: 收费源 → 免费源: akshare → 东财直连HTTP → 腾讯直连HTTP"""
+        """获取股票列表，优先级: 收费源 → 免费源: akshare → 东财直连HTTP → 腾讯直连HTTP
+
+        副作用：当收费源返回含行业/地区等完整信息时，自动写入 stock_info 缓存表。
+        """
         if not force_refresh:
             cached = self.cache.get("stock_list", max_age_hours=24)
             if cached is not None:
                 return cached
 
         # ── 优先尝试收费数据源 ──
-        df_premium, _ = self._try_premium_datasource("fetch_stock_list")
+        df_premium, source_name = self._try_premium_datasource("fetch_stock_list")
         if df_premium is not None and not df_premium.empty:
             self.cache.set("stock_list", df_premium)
+            # 收费源返回的列表含行业/地区/上市时间，写入 stock_info 缓存
+            self._save_stock_list_to_cache(df_premium, source_name)
             return df_premium
 
         # 优先 akshare，失败则直连
@@ -1306,12 +1417,73 @@ class DataFetcher:
                     if label != sources[0][0]:
                         logger.info(f"  → 股票列表使用 {label} 数据源")
                     self.cache.set("stock_list", df)
+                    # 免费源只含 code+name，也写入 cache（补充名称）
+                    self._save_stock_list_to_cache(df, label)
                     return df
             except Exception as e:
                 self._mark_source_unavailable(label, type(e).__name__)
 
-        logger.error("获取股票列表失败（所有数据源均不可达）")
+        # 所有外部源均不可达，尝试从本地 SQLite 缓存加载
+        stock_count = self.db.get_stock_count()
+        if stock_count >= 3000:
+            logger.warning(f"所有数据源不可达，使用本地 stock_info 缓存 ({stock_count} 条)")
+            df_cache = self.db.get_stock_list()
+            if not df_cache.empty:
+                # 统一列名为外部接口格式
+                df_out = df_cache[["code", "name"]].rename(
+                    columns={"code": "股票代码", "name": "股票简称"}
+                )
+                self.cache.set("stock_list", df_out)
+                return df_out
+
+        logger.error("获取股票列表失败（所有数据源均不可达，且本地缓存不足）")
         return pd.DataFrame()
+
+    def _save_stock_list_to_cache(self, df: pd.DataFrame, source: str):
+        """将股票列表数据写入 stock_info 缓存表（仅写入长期不变的基本信息）。
+
+        Args:
+            df: 包含股票代码、股票简称等列
+            source: 数据来源标识（用于日志）
+        """
+        code_col = "股票代码" if "股票代码" in df.columns else "code"
+        name_col = "股票简称" if "股票简称" in df.columns else "name"
+        if code_col not in df.columns:
+            return
+
+        # 避免覆盖已有的行业/地区信息：只补充缺失的 stock_info 记录
+        existing_codes = set(self.db.get_stock_names_by_codes(
+            [str(c) for c in df[code_col].tolist()]
+        ).keys())
+
+        records = []
+        for _, row in df.iterrows():
+            code = str(row[code_col])
+            if code in existing_codes:
+                continue
+            record = {"code": code}
+            if name_col in df.columns:
+                record["name"] = str(row.get(name_col, ""))
+            if "行业" in df.columns:
+                record["industry"] = str(row.get("行业", ""))
+            if "地区" in df.columns:
+                record["area"] = str(row.get("地区", ""))
+            if "市场类型" in df.columns:
+                record["market"] = str(row.get("市场类型", ""))
+            if "上市时间" in df.columns:
+                record["list_date"] = str(row.get("上市时间", ""))
+            # 根据代码推断交易所
+            if code.startswith(("6", "9")):
+                record["exchange"] = "上交所"
+            elif code.startswith(("0", "2", "3")):
+                record["exchange"] = "深交所"
+            records.append(record)
+
+        if records:
+            self.db.save_stock_info_batch(records)
+            logger.info(
+                f"stock_info 缓存更新: 来自 {source}，新增 {len(records)} 条"
+            )
 
     def fetch_daily_kline(
         self, code: str, start_date: str = "20200101", end_date: str | None = None, adjust: str = "qfq"
