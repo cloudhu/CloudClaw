@@ -37,18 +37,21 @@ SCREEN_SAMPLE_SIZE = 200  # 一次筛选最多遍历 200 只
 TIER_FOCUS = "focus"  # 精选层：评分 ≥ 80，可直接候选开仓
 TIER_WATCH = "watch"  # 观察层：评分 60-80，持续跟踪等待信号
 TIER_BROAD = "broad"  # 备选层：评分 40-60，潜力储备
+TIER_BASIC = "basic"  # 基础层：评分 30-40，底层储备，待晋级
 TIER_ELIMINATED = "eliminated"  # 淘汰层：已剔除
 
 TIER_THRESHOLDS = {
     TIER_FOCUS: 80,
     TIER_WATCH: 60,
     TIER_BROAD: 40,
+    TIER_BASIC: 30,
 }  # 评分 ≥ threshold 才有资格进入该层
 
 TIER_LABELS = {
     TIER_FOCUS: "精选",
     TIER_WATCH: "观察",
     TIER_BROAD: "备选",
+    TIER_BASIC: "基础",
     TIER_ELIMINATED: "淘汰",
 }
 
@@ -117,8 +120,12 @@ class StockPoolItem:
     max_price: float = 0.0  # 入池后最高收盘价
     tier: str = ""  # 层级: focus/watch/broad/eliminated
     evaluated_at: str = ""  # 上次评估日期
+    ml_score: float = 0.0  # 机器学习评分 -10~10
+    ml_prediction: str = ""  # 机器学习预测方向: bullish/bearish
 
     def to_dict(self) -> dict:
+        # 若 tier 为空则根据评分自动计算
+        tier = self.tier or self.compute_tier(0)
         d = {
             "code": self.code,
             "name": self.name,
@@ -126,19 +133,21 @@ class StockPoolItem:
             "components": {k: round(v, 1) for k, v in self.components.items()},
             "screened_at": self.screened_at,
             "status": self.status,
+            "tier": tier,
         }
         if self.factors:
             d["factors"] = {
                 k: round(v, 2) if isinstance(v, float) else v
                 for k, v in self.factors.items()
             }
-        if self.tier:
-            d["tier"] = self.tier
         if self.evaluated_at:
             d["evaluated_at"] = self.evaluated_at
         if self.entry_price > 0:
             d["entry_price"] = round(self.entry_price, 2)
             d["max_price"] = round(max(self.max_price, self.entry_price), 2)
+        if self.ml_score != 0:
+            d["ml_score"] = self.ml_score
+            d["ml_prediction"] = self.ml_prediction
         return d
 
     @classmethod
@@ -155,6 +164,8 @@ class StockPoolItem:
             max_price=d.get("max_price", 0.0),
             tier=d.get("tier", ""),
             evaluated_at=d.get("evaluated_at", ""),
+            ml_score=d.get("ml_score", 0.0),
+            ml_prediction=d.get("ml_prediction", ""),
         )
 
     def compute_tier(self, cumulative_gain: float = 0) -> str:
@@ -169,13 +180,15 @@ class StockPoolItem:
         if cumulative_gain <= ELIMINATE_DRAWDOWN:
             return TIER_ELIMINATED
 
-        # 评分阈值判定
+        # 评分阈值判定（从高到低）
         if s >= TIER_THRESHOLDS[TIER_FOCUS]:
             return TIER_FOCUS
         elif s >= TIER_THRESHOLDS[TIER_WATCH]:
             return TIER_WATCH
         elif s >= TIER_THRESHOLDS[TIER_BROAD]:
             return TIER_BROAD
+        elif s >= TIER_THRESHOLDS[TIER_BASIC]:
+            return TIER_BASIC
         else:
             return TIER_ELIMINATED
 
@@ -1075,7 +1088,10 @@ class StrategyStockPool:
 
         name_map = {}
         if not stock_info.empty:
-            name_map = dict(zip(stock_info["股票代码"].astype(str), stock_info["股票简称"].astype(str), strict=False))
+            code_col = next((c for c in ["股票代码", "code", "symbol"] if c in stock_info.columns), None)
+            name_col = next((c for c in ["股票简称", "name", "名称"] if c in stock_info.columns), None)
+            if code_col and name_col:
+                name_map = dict(zip(stock_info[code_col].astype(str), stock_info[name_col].astype(str), strict=False))
 
         if verbose:
             logger.info(f"  [{self.strategy_label}] 开始筛选，候选 {len(sample)} 只...")
@@ -1091,7 +1107,10 @@ class StrategyStockPool:
                     continue
 
                 df_std = self._normalize_df(df)
-                name = name_map.get(code, code)
+                name = name_map.get(code)
+                if not name or name == code:
+                    # 优先从本地缓存获取名称
+                    name = self._get_cached_name(code) or code
 
                 # 基本面策略需要财务数据
                 extra = {}
@@ -1130,6 +1149,31 @@ class StrategyStockPool:
         # 自动保存
         self.save()
         return self.ranked()
+
+    @staticmethod
+    def _get_cached_name(code: str) -> str:
+        """从本地 stock_info 缓存获取股票名称（失败时回退 DataFetcher 直连）"""
+        try:
+            from .stock_info_cache import get_stock_info_cache
+            name = get_stock_info_cache().get_name(code)
+            if name:
+                return name
+        except Exception:
+            pass
+        # 缓存无数据时，从数据源直连拉取（含 TuShare/东方财富/akshare 多源回退）
+        try:
+            from .data_manager import DataFetcher
+            df = DataFetcher().fetch_stock_list()
+            if df is not None and not df.empty:
+                code_col = next((c for c in ["股票代码", "code", "symbol"] if c in df.columns), None)
+                name_col = next((c for c in ["股票简称", "name", "名称"] if c in df.columns), None)
+                if code_col and name_col:
+                    mask = df[code_col].astype(str).str.zfill(6) == str(code).zfill(6)
+                    if mask.any():
+                        return str(df.loc[mask, name_col].iloc[0])
+        except Exception:
+            pass
+        return ""
 
     def _normalize_df(self, df: pd.DataFrame) -> pd.DataFrame:
         col_map = {
@@ -1436,7 +1480,9 @@ class StrategyStockPool:
         gains = self.refresh_gains(verbose=False)
 
         today = datetime.now().strftime("%Y%m%d")
-        result: dict[str, list[str]] = {TIER_FOCUS: [], TIER_WATCH: [], TIER_BROAD: [], TIER_ELIMINATED: []}
+        result: dict[str, list[str]] = {
+            TIER_FOCUS: [], TIER_WATCH: [], TIER_BROAD: [], TIER_BASIC: [], TIER_ELIMINATED: []
+        }
 
         need_save = False
         elim_count = 0
@@ -1649,7 +1695,7 @@ class StrategyStockPool:
                             if df.empty or len(df) < 20:
                                 continue
                             df_std = self._normalize_df(df)
-                            name = str(code)
+                            name = self._get_cached_name(str(code)) or str(code)
                             extra = {}
                             if self.strategy_key == "value_invest":
                                 extra = self._get_finance_extra(fetcher, code)
@@ -1682,7 +1728,7 @@ class StrategyStockPool:
 
     def tier_summary(self) -> dict[str, int]:
         """返回各层级数量统计"""
-        counts = {TIER_FOCUS: 0, TIER_WATCH: 0, TIER_BROAD: 0, TIER_ELIMINATED: 0}
+        counts = {TIER_FOCUS: 0, TIER_WATCH: 0, TIER_BROAD: 0, TIER_BASIC: 0, TIER_ELIMINATED: 0}
         for item in self.items.values():
             if item.tier and item.status == "active":
                 counts[item.tier] = counts.get(item.tier, 0) + 1
@@ -1757,14 +1803,58 @@ class PoolManager:
     # ─── 统一操作 ──────────────────────────────────────
 
     def screen_all(self, stock_pool: list[str] | None = None, verbose: bool = False) -> dict[str, list[StockPoolItem]]:
-        """为所有策略执行筛选"""
-        results = {}
-        if stock_pool is None:
-            from .data_manager import DataFetcher
+        """为所有策略执行批量诊股选股（基于 StockInfoCache 本地缓存）
 
-            stock_pool = DataFetcher().build_stock_pool(filter_st=True, filter_new=True)
+        遍历 StockInfoCache 中缓存的股票代码，每次调用 diagnose() 对所有策略
+        同时评分并自动入池，避免各策略独立拉取 K 线的冗余开销。
+        
+        Args:
+            stock_pool: 可选的候选代码列表，None 则自动从缓存获取
+            verbose: 是否输出详细日志
+        
+        Returns:
+            {strategy_key: [ranked StockPoolItem, ...]}
+        """
+        from .stock_diagnose import StockDiagnoser
+        from .stock_info_cache import get_stock_info_cache
+        
+        # 获取候选代码列表
+        if stock_pool is None:
+            cache = get_stock_info_cache()
+            if cache.is_usable():
+                codes_df = cache.db.get_stock_list()
+                stock_pool = codes_df["code"].tolist()
+                if verbose:
+                    logger.info(f"从 StockInfoCache 获取 {len(stock_pool)} 只股票代码")
+            else:
+                from .data_manager import DataFetcher
+                stock_pool = DataFetcher().build_stock_pool(filter_st=True, filter_new=True)
+                if verbose:
+                    logger.info(f"从 build_stock_pool 获取 {len(stock_pool)} 只股票代码")
+        
+        sample = stock_pool[:SCREEN_SAMPLE_SIZE]
+        
+        if verbose:
+            logger.info(f"开始批量诊股选股，候选 {len(sample)} 只...")
+        
+        diagnoser = StockDiagnoser()
+        screened = 0
+        errors = 0
+        for code in sample:
+            try:
+                diagnoser.diagnose(str(code))
+                screened += 1
+            except Exception as e:
+                errors += 1
+                logger.debug(f"诊股 {code} 异常: {e}")
+        
+        if verbose:
+            logger.info(f"选股完成：诊股 {screened} 只，异常 {errors} 只")
+        
+        # 汇总各池结果
+        results = {}
         for key, pool in self.pools.items():
-            results[key] = pool.screen(stock_pool, verbose=verbose)
+            results[key] = pool.ranked()
         return results
 
     def screen_one(

@@ -219,6 +219,43 @@ def _list_summary_files() -> list[str]:
     return dates
 
 
+def _resolve_pool_names(items: list[dict]) -> list[dict]:
+    """修复占位符名称：对 name 为 "股票{code}" 的项尝试从缓存/数据源补全"""
+    placeholder_items = [it for it in items if it.get("name", "").startswith("股票")]
+    if not placeholder_items:
+        return items
+
+    codes = [it["code"] for it in placeholder_items]
+    try:
+        from .stock_info_cache import get_stock_info_cache
+        cache = get_stock_info_cache()
+        name_map = cache.get_names_batch(codes)
+        for it in placeholder_items:
+            resolved = name_map.get(it["code"], "")
+            if resolved:
+                it["name"] = resolved
+    except Exception:
+        pass
+
+    # 缓存未命中的，尝试从 DataFetcher 直连
+    still_missing = [it for it in placeholder_items if it.get("name", "").startswith("股票")]
+    if still_missing:
+        try:
+            from .data_manager import DataFetcher
+            df = DataFetcher().fetch_stock_list()
+            if df is not None and not df.empty:
+                code_col = next((c for c in ["股票代码", "code", "symbol"] if c in df.columns), None)
+                name_col = next((c for c in ["股票简称", "name", "名称"] if c in df.columns), None)
+                if code_col and name_col:
+                    for it in still_missing:
+                        mask = df[code_col].astype(str).str.zfill(6) == str(it["code"]).zfill(6)
+                        if mask.any():
+                            it["name"] = str(df.loc[mask, name_col].iloc[0])
+        except Exception:
+            pass
+    return items
+
+
 def _inject_pool_gains(items: list[dict]) -> list[dict]:
     """为股票池数据注入累计涨幅、当日涨幅、最大涨幅、层级
 
@@ -613,6 +650,8 @@ def create_app() -> FastAPI:
             label = STRATEGY_LABELS[key]
             data = _read_pool(key)
             items = data.get("items", []) if data else []
+            # 修复占位符名称：对 name 为 "股票{code}" 的项尝试从缓存补全
+            items = _resolve_pool_names(items)
             # 注入涨幅数据和层级
             items = _inject_pool_gains(items)
             # 层级统计（只统计 active 的）
