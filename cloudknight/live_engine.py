@@ -749,6 +749,7 @@ class LiveTradingEngine:
         # IDLE/ML 阶段时同步策略阶段状态（供前端展示）
         if target_phase in (LifecyclePhase.IDLE, LifecyclePhase.MACHINE_LEARNING):
             self._update_all_strategy_phases(target_phase, now)
+            self._save_state()  # 持久化 IDLE/ML 状态变更，供 Web 仪表盘实时读取
 
         # 冷却检查
         if not self._lifecycle_can_run(target_phase, now, trading_phase):
@@ -756,6 +757,7 @@ class LiveTradingEngine:
 
         # 执行阶段动作
         self._lifecycle_execute(target_phase, now, trading_phase)
+        self._save_state()  # 持久化策略生命周期阶段，供 Web 仪表盘实时读取
 
     def _lifecycle_determine_phase(self, now: datetime, trading_phase: TradingPhase) -> LifecyclePhase:
         """根据当前交易时段确定应执行的生命周期阶段。
