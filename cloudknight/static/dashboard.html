@@ -286,6 +286,27 @@ body {
 @keyframes pulse {
   0%,100% { opacity:1; } 50% { opacity:0.4; }
 }
+
+
+
+
+
+/* Ops - 新 chart 高度 */
+.chart.h120 { height:120px; }
+.chart.h200 { height:200px; }
+.chart.h220 { height:220px; }
+
+/* Ops - 交易统计卡片 */
+.trade-stat-card {
+  background:var(--panel); border:1px solid var(--border); border-radius:6px;
+  padding:10px 14px; text-align:center; flex:1; min-width:80px;
+}
+.trade-stat-card .stat-val {
+  font-size:18px; font-weight:700; color:#fff;
+}
+.trade-stat-card .stat-label {
+  font-size:10px; color:var(--text-dim); margin-top:2px;
+}
 </style>
 </head>
 <body>
@@ -447,16 +468,34 @@ body {
   </div>
   <!-- ═══ 运维监控 ═══ -->
   <div class="tab-panel" id="tab-ops">
-    <!-- 系统健康 -->
+    <!-- 系统健康 + 趋势图 -->
     <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">🖥️ 系统健康 <span style="color:var(--text-dim);font-size:11px;margin-left:8px;" id="ops-health-time"></span></div>
       <div class="card-row" id="ops-health-cards"></div>
+
     </div>
 
-    <!-- 引擎状态 + 关键指标 -->
+    <!-- 引擎状态 + 生命周期时间线 -->
     <div class="card-row" id="ops-engine-status"></div>
 
+
+    <!-- 策略权益曲线 + 回撤图（水下曲线） -->
+    <div class="grid-2">
+      <div class="chart-box"><div class="chart-title">📈 策略权益曲线（对数坐标）</div><div class="chart h300" id="chart-ops-equity"></div></div>
+      <div class="chart-box"><div class="chart-title">📉 策略回撤（水下曲线）<span style="color:var(--text-dim);font-size:10px;margin-left:8px;">越深越痛</span></div><div class="chart h300" id="chart-ops-drawdown"></div></div>
+    </div>
+
+    <!-- 交易分析 -->
+    <div class="grid-2">
+      <div class="chart-box" style="margin-bottom:14px;">
+        <div class="chart-title">📊 交易盈亏分析</div>
+        <div class="card-row" id="ops-trade-stats"></div>
+        <div class="chart h200" id="chart-ops-pnl-dist"></div>
+      </div>
+
+    </div>
+
     <!-- 策略运行监控 (4列) -->
-    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">📊 策略运行监控</div>
+    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">📊 策略运行监控 <span style="color:var(--text-dim);font-size:10px;margin-left:8px;">10策略全覆盖</span></div>
       <div class="ops-strategy-grid" id="ops-strategies"></div>
     </div>
 
@@ -557,6 +596,15 @@ const fmtPct = (n) => ((n||0)>=0?'+':'')+(n||0).toFixed(2)+'%';
 const fmtVol = (v) => v>=1e12 ? (v/1e12).toFixed(2)+'万亿' : v>=1e8 ? (v/1e8).toFixed(2)+'亿' : v>=1e4 ? (v/1e4).toFixed(2)+'万' : fmtNum(v);
 const pnlClass = (n) => (n||0)>0?'pnl-pos':(n||0)<0?'pnl-neg':'';
 const dateLabel = (d) => d ? d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8) : '';
+
+// Hex → RGBA 转换（用于 ECharts 半透明填充）
+const _hexToRgba = (hex, alpha) => {
+  const h = hex.replace('#','');
+  const r = parseInt(h.substring(0,2), 16);
+  const g = parseInt(h.substring(2,4), 16);
+  const b = parseInt(h.substring(4,6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+};
 
 // ═══ 时钟 ═══════════════════════════════════════════════════
 function updateClock() {
@@ -1249,7 +1297,15 @@ function renderZtTable(allStocks) {
 // ═══ 7. 运维监控 ═══════════════════════════════════════════
 let opsData = null;
 let opsRefreshTimer = null;
+let _opsCharts = [];  // 运维面板 ECharts 实例管理
+
+function _disposeOpsCharts() {
+  _opsCharts.forEach(c => { try { c.dispose(); } catch(e){} });
+  _opsCharts = [];
+}
+
 async function loadOps() {
+  _disposeOpsCharts();
   opsData = await API('/ops/overview');
   if (!opsData || !opsData.success) {
     $('#tab-ops').innerHTML = '<div class="loading">运维数据加载失败</div>'; return;
@@ -1267,6 +1323,9 @@ async function loadOps() {
 function renderOps() {
   renderOpsHealth(opsData.system);
   renderOpsEngine(opsData.engine);
+  renderOpsEquityChart(opsData.equity_history);
+  renderOpsDrawdownChart(opsData.equity_history);
+  renderOpsTradeAnalysis(opsData.trade_analysis);
   renderOpsStrategies(opsData.strategies);
   renderOpsOperations(opsData.operations);
   renderOpsLogs(opsData.logs);
@@ -1290,7 +1349,8 @@ function renderOpsHealth(sys) {
       <div class="card-sub" style="color:var(--text-dim);font-size:11px;">${c.sub}</div>
     </div>
   `).join('');
-}
+
+
 
 // ── 引擎状态 ──
 function renderOpsEngine(eng) {
@@ -1325,13 +1385,232 @@ function renderOpsEngine(eng) {
   $('#ops-engine-status').innerHTML = html;
 }
 
+
+
+// ── 策略权益曲线（对数坐标，AKQuant §13.2.1） ──
+function renderOpsEquityChart(history) {
+  const dom = document.getElementById('chart-ops-equity');
+  if (!dom) return;
+  const chart = echarts.init(dom);
+  if (!history || !Object.keys(history).length) {
+    chart.setOption({ title:{text:'暂无权益数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  const strategyColors = {
+    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
+    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
+    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4'
+  };
+  const strategyLabels = {
+    dragon_head:'龙头', sparrow:'麻雀', turtle:'海龟', value_invest:'价值',
+    grid:'网格', ma_cross:'均线', bollinger:'布林',
+    volume_breakout:'量价', trend_accel:'趋势', high_growth:'高增长'
+  };
+
+  // 只取有数据的策略（至少2个点）
+  const entries = Object.entries(history).filter(([,s]) => Array.isArray(s) && s.length >= 2);
+  if (!entries.length) {
+    chart.setOption({ title:{text:'暂无足够权益数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  const series = entries.map(([key, seriesData]) => ({
+    name: strategyLabels[key] || key,
+    type: 'line',
+    data: seriesData.map(s => [s.date, s.equity]),
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 2, color: strategyColors[key] || '#6d8099' },
+    emphasis: { focus: 'series' },
+  }));
+
+  const allEquities = entries.flatMap(([, s]) => s.map(d => d.equity));
+  const minEquity = Math.min(...allEquities);
+  const maxEquity = Math.max(...allEquities);
+
+  chart.setOption({
+    tooltip: { trigger: 'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'} },
+    legend: { bottom:0, textStyle:{color:'#6d8099',fontSize:10}, data:series.map(s=>s.name) },
+    grid: { left:60, right:20, top:10, bottom:35 },
+    xAxis: { type:'category', axisLine:{lineStyle:{color:'#2a3a4a'}}, axisLabel:{color:'#6d8099',fontSize:9} },
+    yAxis: {
+      type: 'log',  // 对数坐标 → 斜率直接反映复利增长率
+      min: Math.max(minEquity * 0.95, 100),
+      max: maxEquity * 1.05,
+      axisLine:{lineStyle:{color:'#2a3a4a'}},
+      axisLabel:{color:'#6d8099',fontSize:9,formatter:v => '¥'+(v/10000).toFixed(1)+'万'},
+      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
+    },
+    series,
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
+// ── 策略回撤水下曲线（AKQuant §13.2.2） ──
+function renderOpsDrawdownChart(history) {
+  const dom = document.getElementById('chart-ops-drawdown');
+  if (!dom) return;
+  const chart = echarts.init(dom);
+  if (!history || !Object.keys(history).length) {
+    chart.setOption({ title:{text:'暂无数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+
+  const strategyColors = {
+    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
+    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
+    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4'
+  };
+  const strategyLabels = {
+    dragon_head:'龙头', sparrow:'麻雀', turtle:'海龟', value_invest:'价值',
+    grid:'网格', ma_cross:'均线', bollinger:'布林',
+    volume_breakout:'量价', trend_accel:'趋势', high_growth:'高增长'
+  };
+
+  // 计算每个策略的回撤序列
+  const calcDD = (series) => {
+    let peak = series[0].equity;
+    return series.map(s => {
+      if (s.equity > peak) peak = s.equity;
+      return { date: s.date, dd: peak > 0 ? ((s.equity - peak) / peak * 100) : 0 };
+    });
+  };
+
+  const entries = Object.entries(history)
+    .filter(([,s]) => Array.isArray(s) && s.length >= 2)
+    .map(([key, s]) => [key, calcDD(s)]);
+
+  if (!entries.length) {
+    chart.setOption({ title:{text:'暂无足够数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  const series = entries.map(([key, dd]) => ({
+    name: strategyLabels[key] || key,
+    type: 'line',
+    data: dd.map(d => [d.date, d.dd]),
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 1.5, color: strategyColors[key] || '#6d8099' },
+    areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,
+      [{offset:0, color: _hexToRgba(strategyColors[key]||'#6d8099', 0.25)},
+       {offset:1, color:'rgba(0,0,0,0)'}]) },
+    emphasis: { focus: 'series' },
+  }));
+
+  // 找最深回撤
+  const allDDs = entries.flatMap(([, dd]) => dd.map(d => d.dd));
+  const minDD = Math.min(0, ...allDDs);
+
+  chart.setOption({
+    tooltip: { trigger:'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'},
+      formatter: ps => ps.map(p => `${p.marker} ${p.seriesName}: ${p.value[1].toFixed(2)}%`).join('<br>') },
+    legend: { bottom:0, textStyle:{color:'#6d8099',fontSize:10}, data:series.map(s=>s.name) },
+    grid: { left:55, right:20, top:10, bottom:35 },
+    xAxis: { type:'category', axisLine:{lineStyle:{color:'#2a3a4a'}}, axisLabel:{color:'#6d8099',fontSize:9} },
+    yAxis: {
+      type:'value', min: minDD - 2, max: 2,
+      axisLabel:{color:'#6d8099',fontSize:9,formatter:v=>v.toFixed(0)+'%'},
+      axisLine:{lineStyle:{color:'#2a3a4a'}},
+      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
+    },
+    series,
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
+// ── 交易盈亏分析（AKQuant §13.2.8 MAE/MFE 风格） ──
+function renderOpsTradeAnalysis(ta) {
+  if (!ta) return;
+  const stats = [
+    { label:'总交易', val:ta.total_trades||0 },
+    { label:'胜率', val:(ta.win_rate||0)+'%', color:(ta.win_rate||0)>=50?'var(--green)':'var(--orange)' },
+    { label:'总盈亏', val:'¥'+(ta.total_pnl||0).toFixed(0), color:(ta.total_pnl||0)>=0?'var(--green)':'var(--red)' },
+    { label:'平均盈利', val:'¥'+(ta.avg_win||0).toFixed(0), color:'var(--green)' },
+    { label:'平均亏损', val:'¥'+(ta.avg_loss||0).toFixed(0), color:'var(--red)' },
+    { label:'盈亏比', val:(ta.profit_factor||0).toFixed(2), color:(ta.profit_factor||0)>=1.5?'var(--green)':(ta.profit_factor||0)>=1?'var(--orange)':'var(--red)' },
+    { label:'最大连胜', val:ta.max_consecutive_wins||0 },
+    { label:'最大连亏', val:ta.max_consecutive_losses||0, color:(ta.max_consecutive_losses||0)>3?'var(--red)':'' },
+  ];
+  $('#ops-trade-stats').innerHTML = stats.map(s => `
+    <div class="trade-stat-card">
+      <div class="stat-val" style="color:${s.color||'#fff'}">${s.val}</div>
+      <div class="stat-label">${s.label}</div>
+    </div>
+  `).join('');
+
+  // 盈亏分布柱状图
+  const distDom = document.getElementById('chart-ops-pnl-dist');
+  if (!distDom) return;
+  const chart = echarts.init(distDom);
+  const dist = ta.pnl_distribution || [];
+  if (!dist.length) {
+    chart.setOption({ title:{text:'暂无交易数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  chart.setOption({
+    tooltip: { trigger:'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'} },
+    grid: { left:45, right:15, top:10, bottom:30 },
+    xAxis: {
+      type:'category', data:dist.map(d=>d.range),
+      axisLabel:{color:'#6d8099',fontSize:9,rotate:30},
+      axisLine:{lineStyle:{color:'#2a3a4a'}},
+    },
+    yAxis: {
+      type:'value', name:'笔数',
+      axisLabel:{color:'#6d8099',fontSize:9},
+      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
+    },
+    series: [{
+      type:'bar', data:dist.map((d,i) => {
+        const range = d.range;
+        const midVal = parseFloat(range.split('~')[0]) || 0;
+        return { value:d.count, itemStyle:{color:midVal>=0?'#27ae60':'#e74c3c'} };
+      }),
+      barWidth:'60%',
+    }],
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
+
+
 // ── 策略监控 ──
 function renderOpsStrategies(strategies) {
   if (!strategies || !strategies.length) {
     $('#ops-strategies').innerHTML = '<div class="empty">暂无策略运行数据</div>'; return;
   }
-  const icons = { dragon_head:'🐉', sparrow:'🐦', turtle:'🐢', value_invest:'📈' };
-  const colors = { dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db' };
+  const icons = {
+    dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💎',
+    grid:'🔲', ma_cross:'📈', bollinger:'📊',
+    volume_breakout:'💥', trend_accel:'🚀', high_growth:'🌱',
+  };
+  const colors = {
+    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
+    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
+    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4',
+  };
+
+  // 生命周期阶段 Badge 配置
+  const phaseBadge = {
+    idle:          { icon:'⏸', label:'空闲', color:'#636e72', bg:'rgba(99,110,114,0.15)' },
+    screening:     { icon:'🔍', label:'选股', color:'#0984e3', bg:'rgba(9,132,227,0.15)' },
+    signal_scan:   { icon:'📡', label:'信号扫描', color:'#00b894', bg:'rgba(0,184,148,0.15)' },
+    stop_monitor:  { icon:'🛡', label:'止损监控', color:'#e17055', bg:'rgba(225,112,85,0.15)' },
+    trade_exec:    { icon:'💹', label:'交易执行', color:'#fdcb6e', bg:'rgba(253,203,110,0.15)' },
+    trade_plan:    { icon:'📋', label:'制定计划', color:'#a29bfe', bg:'rgba(162,155,254,0.15)' },
+    backtest:      { icon:'🔄', label:'回测', color:'#74b9ff', bg:'rgba(116,185,255,0.15)' },
+    machine_learning: { icon:'🧠', label:'ML', color:'#fd79a8', bg:'rgba(253,121,168,0.15)' },
+  };
 
   $('#ops-strategies').innerHTML = strategies.map(s => {
     const icon = icons[s.key]||'📊';
@@ -1342,6 +1621,10 @@ function renderOpsStrategies(strategies) {
     const sigHtml = sigActive
       ? `<div style="color:var(--green);font-size:11px;">🟢 信号活跃</div>`
       : `<div style="color:var(--text-dim);font-size:11px;">⏸ 暂无信号</div>`;
+
+    // 生命周期阶段 Badge
+    const ph = phaseBadge[s.lifecycle_phase] || phaseBadge['idle'];
+    const phaseBadgeHtml = `<span style="display:inline-flex;align-items:center;gap:3px;background:${ph.bg};color:${ph.color};padding:1px 8px;border-radius:10px;font-size:10px;border:1px solid ${ph.color}40;">${ph.icon} ${ph.label}</span>`;
 
     // 信号标签
     let signalsHtml = '';
@@ -1365,6 +1648,7 @@ function renderOpsStrategies(strategies) {
         <span class="name">${s.label}</span>
         <span class="badge" style="background:rgba(255,255,255,0.08);color:var(--text-dim);">${s.maintenance_interval_days}天/维护</span>
       </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">${phaseBadgeHtml}</div>
       <div class="metric-row"><span>买/卖信号</span><span class="val"><span style="color:var(--green)">${s.buy_count}</span>/<span style="color:var(--red)">${s.sell_count}</span></span></div>
       <div class="metric-row"><span>扫描耗时</span><span class="val">${s.last_scan_duration||0}秒</span></div>
       <div class="metric-row"><span>池内标的</span><span class="val">🎯${tiers.focus||0} 👀${tiers.watch||0} 📋${tiers.broad||0}</span></div>
