@@ -109,6 +109,7 @@ class StockPoolItem:
     name: str
     score: float  # 综合评分 0-100
     components: dict[str, float] = field(default_factory=dict)  # 各维度得分
+    factors: dict[str, float] = field(default_factory=dict)  # 各维度原始因子数据
     screened_at: str = ""  # 入池日期
     status: str = "active"  # active | traded | removed
     entry_price: float = 0.0  # 入池时的收盘价
@@ -125,6 +126,11 @@ class StockPoolItem:
             "screened_at": self.screened_at,
             "status": self.status,
         }
+        if self.factors:
+            d["factors"] = {
+                k: round(v, 2) if isinstance(v, float) else v
+                for k, v in self.factors.items()
+            }
         if self.tier:
             d["tier"] = self.tier
         if self.evaluated_at:
@@ -141,6 +147,7 @@ class StockPoolItem:
             name=d.get("name", ""),
             score=d.get("score", 0),
             components=d.get("components", {}),
+            factors=d.get("factors", {}),
             screened_at=d.get("screened_at", ""),
             status=d.get("status", "active"),
             entry_price=d.get("entry_price", 0.0),
@@ -274,12 +281,20 @@ class DragonHeadScorer(BaseScorer):
             "封板强度": round(amp_score, 1),
             "趋势加速": round(accel_score, 1),
         }
+        factors = {
+            "连板天数": limit_days,
+            "量比": round(vol_ratio, 2),
+            "换手率%": round(turnover, 2) if turnover else 0,
+            "振幅%": round(amplitude, 2),
+            "趋势强化": 1 if (limit_days >= 2 and vol_ratio < 1.0) else (0.5 if (limit_days >= 2 and vol_ratio < 1.5) else 0),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code,
             name=name,
             score=round(total, 1),
             components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2),
             max_price=round(close, 2),
@@ -364,12 +379,21 @@ class SparrowScorer(BaseScorer):
             "RSI": round(rsi_score, 1),
             "量价配合": round(vol_price_score, 1),
         }
+        factors = {
+            "均线价差%": round((ma5 - ma20) / ma20 * 100, 2) if ma20 > 0 else 0,
+            "K": round(k, 1),
+            "D": round(d, 1),
+            "回调%": round((close - ma20) / ma20 * 100, 2) if ma20 > 0 else 0,
+            "RSI": round(rsi, 1),
+            "量价配合": round(vol_price_score, 1),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code,
             name=name,
             score=round(total, 1),
             components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2),
             max_price=round(close, 2),
@@ -472,12 +496,27 @@ class TurtleScorer(BaseScorer):
             "流动性": round(liq_score, 1),
             "加仓空间": round(room_score, 1),
         }
+        # 计算原始取值
+        pct_close = close
+        breakthrough_pct = (pct_close - entry_upper) / entry_upper * 100 if entry_upper > 0 else 0
+        trend_pct = (pct_close - ma200) / ma200 * 100 if (pd.notna(ma200) and ma200 > 0) else 0
+        atr_pct = current_atr / pct_close * 100 if current_atr > 0 and pct_close > 0 else 0
+        room = (pct_close - entry_upper) / current_atr if (current_atr > 0 and pct_close > entry_upper) else 0
+        amount_val = latest.get("amount", latest.get("成交额", 0))
+        factors = {
+            "突破%": round(breakthrough_pct, 2),
+            "趋势%": round(trend_pct, 2),
+            "ATR%": round(atr_pct, 2),
+            "成交额万": round(amount_val / 1e4, 0) if amount_val else 0,
+            "AT倍数": round(room, 1),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code,
             name=name,
             score=round(total, 1),
             components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2),
             max_price=round(close, 2),
@@ -560,12 +599,22 @@ class ValueInvestScorer(BaseScorer):
             "市值规模": round(mc_score, 1),
             "负债率": round(dr_score, 1),
         }
+        factors = {
+            "价格分位%": round(percentile, 1) if len(df) >= 250 else 0,
+            "PE": round(pe, 2) if (pe and pe < 999) else 0,
+            "PB": round(pb, 2) if (pb and pb < 999) else 0,
+            "ROE%": round(roe, 2) if (roe and roe > 0) else 0,
+            "股息率%": round(div_yield, 2) if (div_yield and div_yield > 0) else 0,
+            "市值亿": round(market_cap / 1e8, 1) if (market_cap and market_cap > 0) else 0,
+            "负债率%": round(debt_ratio, 1) if debt_ratio is not None else 0,
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code,
             name=name,
             score=round(total, 1),
             components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2),
             max_price=round(close, 2),
@@ -623,9 +672,16 @@ class BollingerBandScorer(BaseScorer):
             "RSI超卖": round(rsi_score, 1),
             "量能": round(vol_score, 1),
         }
+        factors = {
+            "%B": round(percent_b, 2),
+            "带宽%": round(bandwidth, 1),
+            "RSI": round(rsi, 1),
+            "量比": round(vol_ratio, 2),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code, name=name, score=round(total, 1), components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2), max_price=round(close, 2),
         )
@@ -682,9 +738,16 @@ class GridScorer(BaseScorer):
             "RSI低位": round(rsi_score, 1),
             "量能稳定": round(stable_score, 1),
         }
+        factors = {
+            "偏离%": round(dist_ma60, 1),
+            "ATR%": round(atr_pct, 2) if close > 0 and atr > 0 else 0,
+            "RSI": round(rsi, 1),
+            "量比": round(vol_stable, 2),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code, name=name, score=round(total, 1), components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2), max_price=round(close, 2),
         )
@@ -745,9 +808,16 @@ class MACrossoverScorer(BaseScorer):
             "RSI": round(rsi_score, 1),
             "量能确认": round(vol_score, 1),
         }
+        factors = {
+            "金叉": 1 if golden else 0,
+            "MA60上方": 1 if (ma60 > 0 and close > ma60) else 0,
+            "RSI": round(rsi, 1),
+            "量比": round(vol_ratio, 2),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code, name=name, score=round(total, 1), components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2), max_price=round(close, 2),
         )
@@ -800,9 +870,16 @@ class VolumeBreakoutScorer(BaseScorer):
             "RSI动量": round(rsi_score, 1),
             "均线站位": round(ma_score, 1),
         }
+        factors = {
+            "突破%": round(breakout_pct, 2),
+            "量比": round(vol_ratio, 2),
+            "RSI": round(rsi, 1),
+            "MA20上方": 1 if (close > ma20 and ma20 > 0) else 0,
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code, name=name, score=round(total, 1), components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2), max_price=round(close, 2),
         )
@@ -857,9 +934,16 @@ class TrendAccelerationScorer(BaseScorer):
             "回调深度": round(pb_score, 1),
             "RSI": round(rsi_score, 1),
         }
+        factors = {
+            "排列数": aligned,
+            "趋势%": round((close - ma120) / ma120 * 100, 2) if ma120 > 0 else 0,
+            "回调%": round(abs(close / ma20 - 1) * 100, 2) if ma20 > 0 else 0,
+            "RSI": round(rsi, 1),
+        }
         total = sum(comp.values())
         return StockPoolItem(
             code=code, name=name, score=round(total, 1), components=comp,
+            factors=factors,
             screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2), max_price=round(close, 2),
         )
@@ -954,6 +1038,10 @@ class StrategyStockPool:
         if verbose:
             logger.info(f"  [{self.strategy_label}] 筛选完成: {screened} 只达标, 保留 Top {len(self.items)}")
 
+        # 自动分配初始层级
+        for item in kept:
+            item.tier = item.compute_tier(0)
+            item.evaluated_at = self.last_screened
         # 自动保存
         self.save()
         return self.ranked()

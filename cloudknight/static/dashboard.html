@@ -154,6 +154,9 @@ body {
 .tag-focus { background: rgba(231,76,60,0.18); color: #e74c3c; font-weight:700; }
 .tag-watch { background: rgba(241,196,15,0.18); color: #f1c40f; }
 .tag-broad { background: rgba(52,152,219,0.15); color: var(--accent); }
+/* 因子列样式 */
+.factor-col { color: var(--text-dim); font-size: 0.85em; font-weight:400; }
+#pool-table-wrap { overflow-x: auto; }
 .tag-eliminated { background: rgba(108,128,153,0.12); color: var(--text-dim); text-decoration:line-through; }
 
 /* Layout grid */
@@ -366,7 +369,9 @@ body {
         <button class="tier-filter-btn" data-tier="watch" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">👀 观察</button>
         <button class="tier-filter-btn" data-tier="broad" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">📋 备选</button>
       </div>
-      <div class="table-wrap"><table id="table-pool"><thead id="table-pool-head"></thead><tbody></tbody></table></div>
+      <div class="table-wrap" id="pool-table-wrap">
+      <table id="table-pool"><thead id="table-pool-head"></thead><tbody></tbody></table>
+    </div>
     </div>
   </div>
 
@@ -887,15 +892,18 @@ function renderPool() {
     $('#table-pool-head').innerHTML = ''; $('#table-pool tbody').innerHTML = '<tr><td class="empty">该层级暂无标的</td></tr>';
     return;
   }
-  // 动态表头：层级 + 基本列 + 涨幅列 + 评分维度
+  // 动态表头：层级 + 基本列 + 涨幅列 + 评分维度 + 因子数据
   const sample = items[0];
   const cols = ['tier','code','name','score','screened_at'];
   const gainCols = ['cumulative_gain_pct','daily_gain_pct','max_gain_pct'];
-  const extraCols = sample.components ? Object.keys(sample.components) : [];
-  const allCols = [...cols, ...gainCols, ...extraCols];
+  const compCols = sample.components ? Object.keys(sample.components) : [];
+  const factorCols = sample.factors ? Object.keys(sample.factors) : [];
+  const allCols = [...cols, ...gainCols, ...compCols, ...factorCols];
   const labels = { tier:'层级', code:'代码', name:'名称', score:'评分', screened_at:'入池日期',
     cumulative_gain_pct:'累计涨幅', daily_gain_pct:'当日涨幅', max_gain_pct:'最大涨幅' };
-  $('#table-pool-head').innerHTML = '<tr>'+allCols.map(c => `<th>${labels[c]||c}</th>`).join('')+'</tr>';
+  const factorLabels = {};
+  factorCols.forEach(c => { factorLabels[c] = c + '(值)'; });
+  $('#table-pool-head').innerHTML = '<tr>' + allCols.map(c => `<th ${factorCols.includes(c) ? 'class="factor-col"' : ''}>${labels[c] || factorLabels[c] || c}</th>`).join('') + '</tr>';
 
   const fmtGain = (val) => val == null ? '<span style="color:var(--text-dim)">--</span>' : `<span class="${val>=0?'pnl-pos':'pnl-neg'}" style="font-weight:600">${fmtPct(val)}</span>`;
   const tierBadge = (t) => {
@@ -914,7 +922,8 @@ function renderPool() {
       <td>${fmtGain(item.cumulative_gain_pct)}</td>
       <td>${fmtGain(item.daily_gain_pct)}</td>
       <td>${fmtGain(item.max_gain_pct)}</td>
-      ${extraCols.map(c => `<td>${item.components?.[c]?.toFixed?.(1) ?? item.components?.[c] ?? ''}</td>`).join('')}
+      ${compCols.map(c => `<td>${item.components?.[c]?.toFixed?.(1) ?? item.components?.[c] ?? ''}</td>`).join('')}
+      ${factorCols.map(c => `<td style="color:var(--text-dim);font-size:0.9em">${item.factors?.[c]?.toFixed?.(2) ?? item.factors?.[c] ?? ''}</td>`).join('')}
     </tr>
   `).join('');
 }
