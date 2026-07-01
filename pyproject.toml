@@ -4,7 +4,7 @@ version = "2.8.0"
 description = "CloudKnight - 云侠量化交易系统 | AKQuant高性能事件驱动回测引擎"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "CloudKnight" }]
 dependencies = [
     "akshare>=1.12.0",
@@ -28,6 +28,10 @@ dev = [
     "bandit>=1.7.0",
     "coverage>=7.0.0",
 ]
+
+# ==================== Build (setuptools) ====================
+[tool.setuptools.packages.find]
+include = ["cloudknight*"]
 
 # ==================== Ruff (Linter + Formatter) ====================
 [tool.ruff]
