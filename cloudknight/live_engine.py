@@ -165,6 +165,7 @@ class LiveTradingEngine:
         self._lifecycle_completed: set[str] = set()       # 当日已完成的阶段
         self._lifecycle_last_run: dict[str, datetime] = {}  # 各阶段上次执行时间
         self._lifecycle_pause_until: datetime | None = None  # 异常暂停
+        self._idle_since: datetime | None = None          # 进入 IDLE 的时间（用于循环重启）
 
         # ── 各策略独立生命周期阶段跟踪 ──
         self._strategy_phase: dict[str, str] = {k: LifecyclePhase.IDLE.value[0] for k in STRATEGIES}
@@ -717,6 +718,7 @@ class LiveTradingEngine:
     _SCREEN_BATCH_SIZE = 200            # 每轮选股代码数
     _FOCUS_TARGET = 5                   # 每策略精选层目标
     _PAUSE_ON_ERROR = 120               # 异常暂停秒数
+    _IDLE_CYCLE_RESTART = 300           # IDLE 后重新启动循环的间隔（5分钟）
 
     # ── 各阶段间隔（秒） ──
     _INTERVAL_SCREENING = 30     # 选股每轮间隔
@@ -743,6 +745,10 @@ class LiveTradingEngine:
 
         # 确定当前应执行的生命周期阶段
         target_phase = self._lifecycle_determine_phase(now, trading_phase)
+
+        # IDLE/ML 阶段时同步策略阶段状态（供前端展示）
+        if target_phase in (LifecyclePhase.IDLE, LifecyclePhase.MACHINE_LEARNING):
+            self._update_all_strategy_phases(target_phase, now)
 
         # 冷却检查
         if not self._lifecycle_can_run(target_phase, now, trading_phase):
@@ -772,11 +778,7 @@ class LiveTradingEngine:
                 LifecyclePhase.TRADE_PLAN,
                 LifecyclePhase.BACKTEST,
             ]
-            target = self._next_pending_phase(phases_order)
-            # 顺序阶段全部完成后，空闲时检查 ML 触发条件
-            if target == LifecyclePhase.IDLE:
-                return self._maybe_trigger_ml()
-            return target
+            return self._resolve_phase_with_idle_restart(phases_order, now)
 
         # ── 盘后 (POST_MARKET) ──
         if trading_phase == TradingPhase.POST_MARKET:
@@ -785,10 +787,7 @@ class LiveTradingEngine:
                 LifecyclePhase.TRADE_PLAN,
                 LifecyclePhase.BACKTEST,
             ]
-            target = self._next_pending_phase(phases_order)
-            if target == LifecyclePhase.IDLE:
-                return self._maybe_trigger_ml()
-            return target
+            return self._resolve_phase_with_idle_restart(phases_order, now)
 
         # ── 盘前/竞价 → 信号扫描 + 交易计划 ──
         if trading_phase in (TradingPhase.PRE_MARKET, TradingPhase.AUCTION, TradingPhase.AUCTION_RESULT):
@@ -796,23 +795,9 @@ class LiveTradingEngine:
                 return LifecyclePhase.TRADE_PLAN
             return LifecyclePhase.SIGNAL_SCAN
 
-        # ── 交易时段（早盘/午盘） → 信号 + 止损 + 执行交易 ──
+        # ── 交易时段（早盘/午盘） → 信号 + 止损 + 执行交易（时间轮转） ──
         if trading_phase in (TradingPhase.MORNING, TradingPhase.AFTERNOON):
-            # 轮转：信号 → 止损 → 交易
-            signal_key = f"signal_scan_{now.strftime('%H%M')}"
-            stop_key = f"stop_monitor_{now.strftime('%H%M')}"
-            trade_key = f"trade_exec_{now.strftime('%H%M')}"
-
-            # 信号扫描优先（有新信号才有交易）
-            if signal_key not in self._lifecycle_completed:
-                return LifecyclePhase.SIGNAL_SCAN
-            # 止损检查
-            if stop_key not in self._lifecycle_completed:
-                return LifecyclePhase.STOP_MONITOR
-            # 执行交易
-            if trade_key not in self._lifecycle_completed:
-                return LifecyclePhase.TRADE_EXEC
-            return LifecyclePhase.IDLE
+            return self._resolve_trading_phase(now)
 
         # ── 午间 → 交易计划 ──
         if trading_phase == TradingPhase.LUNCH:
@@ -848,6 +833,65 @@ class LiveTradingEngine:
             if p.value[0] not in self._lifecycle_completed:
                 return p
         return LifecyclePhase.IDLE
+
+    def _resolve_phase_with_idle_restart(self, phases_order: list[LifecyclePhase], now: datetime) -> LifecyclePhase:
+        """顺序推进 + IDLE 时自动重启循环（防止系统永远停在 IDLE）。
+
+        当所有顺序阶段完成后：
+          - 检查是否已空闲足够长（_IDLE_CYCLE_RESTART）
+          - 若是，清除 _lifecycle_completed 并从头开始循环
+          - 同时检查 ML 触发条件
+        """
+        target = self._next_pending_phase(phases_order)
+        if target != LifecyclePhase.IDLE:
+            self._idle_since = None
+            return target
+
+        # 首次进入 IDLE 时记录时间
+        if self._idle_since is None:
+            self._idle_since = datetime.now()
+            self._lifecycle_last_run["idle"] = datetime.now()
+
+        # IDLE 冷却后重启循环
+        if (datetime.now() - self._idle_since).total_seconds() >= self._IDLE_CYCLE_RESTART:
+            self._lifecycle_completed.clear()
+            self._idle_since = None
+            target = self._next_pending_phase(phases_order)
+            if target != LifecyclePhase.IDLE:
+                return target
+
+        # 空闲期检查 ML 触发
+        return self._maybe_trigger_ml()
+
+    def _resolve_trading_phase(self, now: datetime) -> LifecyclePhase:
+        """交易时段三阶段时间轮转（信号 → 止损 → 交易）。
+
+        基于各阶段最后执行时间选最久未执行的，自然形成轮转。
+        """
+        key_signal = LifecyclePhase.SIGNAL_SCAN.value[0]
+        key_stop = LifecyclePhase.STOP_MONITOR.value[0]
+        key_trade = LifecyclePhase.TRADE_EXEC.value[0]
+
+        last_signal = self._lifecycle_last_run.get(key_signal)
+        last_stop = self._lifecycle_last_run.get(key_stop)
+        last_trade = self._lifecycle_last_run.get(key_trade)
+
+        # 无执行记录 → 从信号开始
+        if last_signal is None:
+            return LifecyclePhase.SIGNAL_SCAN
+
+        # 选择最久未执行的阶段（按优先级：signal > stop > trade）
+        signal_is_oldest = True
+        if last_stop is not None and last_signal > last_stop:
+            signal_is_oldest = False
+        if last_trade is not None and last_signal > last_trade:
+            signal_is_oldest = False
+        if signal_is_oldest:
+            return LifecyclePhase.SIGNAL_SCAN
+
+        if last_stop is None or (last_trade is not None and last_stop > last_trade):
+            return LifecyclePhase.TRADE_EXEC
+        return LifecyclePhase.STOP_MONITOR
 
     def _lifecycle_can_run(self, phase: LifecyclePhase, now: datetime, trading_phase: TradingPhase) -> bool:
         """检查阶段是否可以执行（冷却间隔控制）"""
@@ -1544,6 +1588,7 @@ class LiveTradingEngine:
         self._lifecycle_completed.clear()
         self._lifecycle_last_run.clear()
         self._lifecycle_pause_until = None
+        self._idle_since = None
         self._screen_offset = 0
         self._screened_codes.clear()
         self._screening_done = False
