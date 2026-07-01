@@ -155,8 +155,9 @@ body {
 .tag-watch { background: rgba(241,196,15,0.18); color: #f1c40f; }
 .tag-broad { background: rgba(52,152,219,0.15); color: var(--accent); }
 .tag-eliminated { background: rgba(108,128,153,0.12); color: var(--text-dim); text-decoration:line-through; }
-.factor-col { color: var(--text-dim); font-size: 0.85em; font-weight:400; }
+.comp-col { color: var(--text-dim); font-size: 0.85em; font-weight: 400; }
 #pool-table-wrap { overflow-x: auto; }
+
 
 /* Layout grid */
 .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
@@ -425,7 +426,7 @@ body {
     <div style="display:flex;gap:8px;margin-bottom:14px;" id="pool-tab-buttons"></div>
     <div class="card-row" id="pool-stats"></div>
     <div class="card-row" id="pool-tier-cards"></div>
-    <div class="chart-box"><div class="chart-title">股票池列表 <span id="pool-name" style="color:var(--text-dim)"></span></div>
+    <div class="chart-box"><div class="chart-title">股票池列表 <span id="pool-name" style="color:var(--text-dim)"></span> <button id="pool-rescreen-btn" onclick="rescreenPool()" style="margin-left:12px;background:var(--panel);color:var(--accent);border:1px solid var(--accent);padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;display:none;">🔄 重新筛选</button></div>
       <div style="margin-bottom:10px;display:flex;gap:6px;align-items:center;" id="pool-tier-filter">
         <span style="color:var(--text-dim);font-size:12px;">层级:</span>
         <button class="tier-filter-btn active" data-tier="" style="background:var(--accent);color:#fff;border:1px solid var(--border);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;">全部</button>
@@ -996,20 +997,24 @@ function renderPool() {
     $('#table-pool-head').innerHTML = ''; $('#table-pool tbody').innerHTML = '<tr><td class="empty">该层级暂无标的</td></tr>';
     return;
   }
-  // 动态表头：层级 + 基本列 + 涨幅列 + 评分维度 + 原始因子
+  // 动态表头：层级 + 基本列 + 涨幅列 + 筛选指标(原始) + 各维度得分
   const sample = items[0];
   const cols = ['tier','code','name','score','screened_at'];
   const gainCols = ['cumulative_gain_pct','daily_gain_pct','max_gain_pct'];
-  const compCols = sample.components ? Object.keys(sample.components) : [];
   const factorCols = sample.factors ? Object.keys(sample.factors) : [];
-  const allCols = [...cols, ...gainCols, ...compCols, ...factorCols];
+  const compCols = sample.components ? Object.keys(sample.components) : [];
+  const allCols = [...cols, ...gainCols, ...factorCols, ...compCols];
   const labels = { tier:'层级', code:'代码', name:'名称', score:'评分', screened_at:'入池日期',
     cumulative_gain_pct:'累计涨幅', daily_gain_pct:'当日涨幅', max_gain_pct:'最大涨幅' };
-  const factorLabels = {};
-  factorCols.forEach(c => { factorLabels[c] = c + '(值)'; });
-  $('#table-pool-head').innerHTML = '<tr>' + allCols.map(c => `<th ${factorCols.includes(c) ? 'class="factor-col"' : ''}>${labels[c] || factorLabels[c] || c}</th>`).join('') + '</tr>';
+  const compHeaders = {};
+  compCols.forEach(c => { compHeaders[c] = c + '(得分)'; });
+  $('#table-pool-head').innerHTML = '<tr>' + allCols.map(c => {
+    if (compCols.includes(c)) return `<th class="comp-col">${compHeaders[c]}</th>`;
+    return `<th>${labels[c]||c}</th>`;
+  }).join('') + '</tr>';
 
   const fmtGain = (val) => val == null ? '<span style="color:var(--text-dim)">--</span>' : `<span class="${val>=0?'pnl-pos':'pnl-neg'}" style="font-weight:600">${fmtPct(val)}</span>`;
+  const fmtFactor = (val) => val == null || val === '' ? '<span style="color:var(--text-dim)">--</span>' : (typeof val === 'number' ? (Number.isInteger(val) ? val : val.toFixed(2)) : val);
   const tierBadge = (t) => {
     if (t === 'focus') return '<span class="tag tag-focus">🎯 精选</span>';
     if (t === 'watch') return '<span class="tag tag-watch">👀 观察</span>';
@@ -1026,10 +1031,34 @@ function renderPool() {
       <td>${fmtGain(item.cumulative_gain_pct)}</td>
       <td>${fmtGain(item.daily_gain_pct)}</td>
       <td>${fmtGain(item.max_gain_pct)}</td>
-      ${compCols.map(c => `<td>${item.components?.[c]?.toFixed?.(1) ?? item.components?.[c] ?? ''}</td>`).join('')}
-      ${factorCols.map(c => `<td class="factor-col">${item.factors?.[c]?.toFixed?.(2) ?? item.factors?.[c] ?? ''}</td>`).join('')}
+      ${factorCols.map(c => `<td>${fmtFactor(item.factors?.[c])}</td>`).join('')}
+      ${compCols.map(c => `<td class="comp-col">${item.components?.[c]?.toFixed?.(1) ?? item.components?.[c] ?? ''}</td>`).join('')}
     </tr>
   `).join('');
+
+  // 无筛选指标数据时显示"重新筛选"按钮
+  const hasFactors = items.some(it => it.factors && Object.keys(it.factors).length > 0);
+  $('#pool-rescreen-btn').style.display = hasFactors ? 'none' : 'inline-block';
+}
+
+async function rescreenPool() {
+  const btn = $('#pool-rescreen-btn');
+  btn.textContent = '⏳ 筛选中...';
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/pool/${currentPool}/maintenance`, { method:'POST' });
+    const data = await res.json();
+    if (data.success) {
+      btn.textContent = '✅ 完成，刷新中...';
+      setTimeout(() => loadPools(), 1000);
+    } else {
+      btn.textContent = '❌ 失败';
+      setTimeout(() => { btn.textContent = '🔄 重新筛选'; btn.disabled = false; }, 2000);
+    }
+  } catch (e) {
+    btn.textContent = '❌ 网络错误';
+    setTimeout(() => { btn.textContent = '🔄 重新筛选'; btn.disabled = false; }, 2000);
+  }
 }
 
 // ═══ 5. 交割单 ═══════════════════════════════════════════
