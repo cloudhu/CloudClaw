@@ -474,9 +474,8 @@ body {
 
     </div>
 
-    <!-- 引擎状态 + 生命周期时间线 -->
+    <!-- 引擎状态 -->
     <div class="card-row" id="ops-engine-status"></div>
-
 
     <!-- 策略权益曲线 + 回撤图（水下曲线） -->
     <div class="grid-2">
@@ -491,7 +490,6 @@ body {
         <div class="card-row" id="ops-trade-stats"></div>
         <div class="chart h200" id="chart-ops-pnl-dist"></div>
       </div>
-
     </div>
 
     <!-- 策略运行监控 (4列) -->
@@ -1350,7 +1348,7 @@ function renderOpsHealth(sys) {
     </div>
   `).join('');
 
-
+}
 
 // ── 引擎状态 ──
 function renderOpsEngine(eng) {
