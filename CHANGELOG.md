@@ -4,6 +4,30 @@
 
 ---
 
+## [2.3.0] - 2026-07-01
+
+### Added
+- **数据源扩展**：新增北向资金、龙虎榜、融资融券等多个数据源
+- **多层回退机制**：AKShare → efinance → Tushare → 本地缓存，自动切换数据源
+- **数据源健康检查**：`DataFetcher.get_data_source_health()` 实时监测各数据源状态
+- **个股深度诊断模块** (`stock_diagnose.py`)：技术面/基本面/资金面/市场面四维诊断
+- **诊股 Web 页面** (`diagnose.html`)：ECharts 可视化诊断结果
+- **运维监控模块** (`ops_monitor.py`)：系统性能、策略运行、交易操作监控
+- **运维面板 API**：`/api/ops/health`、`/api/ops/system` 等端点
+- **启动脚本**：`start_all.bat`、`start_live.bat`、`start_web.bat`、`stop_web.bat`
+
+### Changed
+- 仪表盘集成 ECharts (`echarts.min.js`) 增强可视化
+- Web Server API 端点扩展至 20+
+- 代码全面类型现代化：清除所有 actionable lint 警告
+
+### Fixed
+- 修复基于 Pyright 的全部可修复类型错误
+- 修复 `Dict`/`List`/`Optional` 等废弃类型注解
+- 修复隐式字符串拼接 lint 警告
+
+---
+
 ## [2.2.0] - 2026-06-30
 
 ### Added

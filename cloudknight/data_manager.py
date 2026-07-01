@@ -4,7 +4,6 @@
 """
 
 import os
-import json
 import pickle
 import sqlite3
 import hashlib
@@ -12,11 +11,10 @@ import time
 import random
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Callable
+from typing import Callable
 from functools import wraps
 
 import pandas as pd
-import numpy as np
 
 from .config import DATA_DIR, DB_PATH
 
@@ -71,8 +69,8 @@ def retry_on_network_error(
                     if attempt < max_retries:
                         delay = base_delay * (backoff ** attempt) + random.uniform(0, jitter)
                         logger.warning(
-                            f"请求失败(第{attempt + 1}/{max_retries}次重试)，"
-                            f"{delay:.1f}秒后重试: {e}"
+                            "请求失败(第%d/%d次重试)，%.1f秒后重试: %s",
+                            attempt + 1, max_retries, delay, e
                         )
                         time.sleep(delay)
                     else:
@@ -129,17 +127,17 @@ def _rate_limit():
 
 def _ensure_akshare():
     """获取 akshare 模块，同时配置健壮的 HTTP 会话"""
-    global AK_AVAILABLE
     if not AK_AVAILABLE:
         try:
-            import akshare as ak
-            _configure_akshare_session(ak)
-            AK_AVAILABLE = True
-            return ak
+            import akshare as _ak
+            _configure_akshare_session(_ak)
+            # 首轮导入成功，设置全局可用标记
+            globals()["AK_AVAILABLE"] = True
+            return _ak
         except ImportError:
             raise ImportError("请安装 akshare: pip install akshare")
-    import akshare as ak
-    return ak
+    import akshare as _ak
+    return _ak
 
 
 def _configure_akshare_session(ak):
@@ -184,7 +182,7 @@ def _configure_akshare_session(ak):
 
 
 class CacheManager:
-    def __init__(self, cache_dir: str = None):
+    def __init__(self, cache_dir: str | None = None):
         self.cache_dir = cache_dir or os.path.join(DATA_DIR, "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -192,7 +190,7 @@ class CacheManager:
         raw = f"{prefix}_{sorted(kwargs.items())}"
         return hashlib.md5(raw.encode()).hexdigest() + ".pkl"
 
-    def get(self, prefix: str, max_age_hours: int = 24, **kwargs) -> Optional[pd.DataFrame]:
+    def get(self, prefix: str, max_age_hours: int = 24, **kwargs) -> pd.DataFrame | None:
         key = self._cache_key(prefix, **kwargs)
         path = os.path.join(self.cache_dir, key)
         if os.path.exists(path):
@@ -213,7 +211,7 @@ class CacheManager:
 
 
 class Database:
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str | None = None):
         self.db_path = db_path or DB_PATH
         self._init_db()
 
@@ -273,7 +271,7 @@ class Database:
                 conn.execute(sql, values)
             conn.commit()
 
-    def load_daily(self, code: str, start: str = None, end: str = None) -> pd.DataFrame:
+    def load_daily(self, code: str, start: str | None = None, end: str | None = None) -> pd.DataFrame:
         sql = "SELECT * FROM stock_daily WHERE code = ?"
         params = [code]
         if start:
@@ -301,7 +299,7 @@ class Database:
                 conn.execute(sql, tuple(row[col] for col in cols))
             conn.commit()
 
-    def get_stock_list(self, industry: str = None) -> pd.DataFrame:
+    def get_stock_list(self, industry: str | None = None) -> pd.DataFrame:
         sql = "SELECT * FROM stock_info"
         params = []
         if industry:
@@ -315,7 +313,7 @@ class DataFetcher:
     def __init__(self):
         self.cache = CacheManager()
         self.db = Database()
-        self._unavailable_sources: set = set()  # 已知不可用的数据源，跳过重试浪费时间
+        self._unavailable_sources: set[str] = set()  # 已知不可用的数据源，跳过重试浪费时间
 
     # ═══ 私有网络请求方法（异常传播到 retry 装饰器） ═══
 
@@ -492,11 +490,170 @@ class DataFetcher:
             df = df.rename(columns={"code": "股票代码", "name": "股票简称"})
         return df
 
+    @retry_on_network_error(max_retries=3, base_delay=2.0)
+    def _fetch_stock_list_tencent_direct(self):
+        """腾讯财经股票列表（直连 HTTP，第三级回退）"""
+        import re
+        _rate_limit()
+        session = _get_http_session()
+        url = (
+            "http://smartbox.gtimg.cn/s3/"
+            "?q=stock&t=all&c=0&o=1&p=1&ps=6000"
+        )
+        r = session.get(url, timeout=15)
+        text = r.text
+        # 格式: v_hint="...^股票代码~股票名称^..."
+        rows = []
+        try:
+            # 提取 v_hint 中的股票列表
+            hint_match = re.search(r'v_hint="([^"]*)"', text)
+            if hint_match:
+                items = hint_match.group(1).split("^")
+                for item in items:
+                    parts = item.strip().split("~")
+                    if len(parts) >= 2:
+                        code = parts[0].strip()
+                        name = parts[1].strip()
+                        if code.isdigit() and len(code) == 6:
+                            rows.append({"code": code, "name": name})
+        except Exception:
+            pass
+        
+        if not rows:
+            # 备选：尝试另一种腾讯接口格式
+            try:
+                url2 = (
+                    "http://smartbox.gtimg.cn/s3/"
+                    "?q=stock&t=all&c=0&o=1&p=1&ps=6000&v=2"
+                )
+                r2 = session.get(url2, timeout=15)
+                text2 = r2.text
+                hint_match2 = re.search(r'"(s[hz]\d{6}~[^~]+)"', text2)
+                if hint_match2:
+                    # 格式: sh600519~贵州茅台
+                    for m in re.finditer(r'(s[hz]\d{6})~([^\^]+)', text2):
+                        code = m.group(1)[2:]  # 去掉 sh/sz 前缀
+                        name = m.group(2).strip()
+                        if code.isdigit() and len(code) == 6:
+                            rows.append({"code": code, "name": name})
+            except Exception:
+                pass
+        
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.rename(columns={"code": "股票代码", "name": "股票简称"})
+        return df
+
     @retry_on_network_error(max_retries=2, base_delay=3.0)
     def _fetch_financial_raw(self, code: str):
         ak = _ensure_akshare()
         _rate_limit()
         return ak.stock_financial_analysis_indicator(symbol=code)
+
+    @retry_on_network_error(max_retries=2, base_delay=2.0)
+    def _fetch_financial_abstract_raw(self, code: str):
+        """AKShare 备选财务接口 - stock_financial_abstract"""
+        ak = _ensure_akshare()
+        _rate_limit()
+        return ak.stock_financial_abstract_ths(symbol=code)
+
+    @retry_on_network_error(max_retries=3, base_delay=2.0)
+    def _fetch_financial_eastmoney_direct(self, code: str):
+        """东方财富 HTTP 直连获取财务指标（PE/PB/ROE/市值等）
+        
+        使用东方财富个股基本面数据接口，不依赖 akshare。
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        prefix = "SH" if code.startswith(("6", "9")) else "SZ"
+        secid = f"1.{code}" if prefix == "SZ" else f"1.{code}"
+        market_type = 0 if prefix == "SZ" else 1
+        
+        # 东方财富个股基本面接口
+        url = (
+            f"https://emweb.securities.eastmoney.com/PC_HSF10/FinanceSummary/FinanceSummary"
+            f"?code={prefix}{code}"
+            f"&type=web"
+        )
+        try:
+            r = session.get(url, timeout=10)
+        except Exception:
+            # 备选 URL 格式
+            url = (
+                f"http://emweb.securities.eastmoney.com/ProfitForecast/Index"
+                f"?type=web&code={prefix}{code}"
+            )
+            r = session.get(url, timeout=10)
+        
+        # 解析 HTML 中内嵌的 JSON 数据
+        text = r.text
+        result = {}
+        
+        # 尝试从页面中提取核心财务数据
+        try:
+            import re
+            # 匹配 __NUXT__ 或 window.__INITIAL_STATE__ 等常见数据注入模式
+            match = re.search(r'window\.__NUXT__\s*=\s*({.*?});\s*</script>', text, re.DOTALL)
+            if not match:
+                match = re.search(r'__NUXT__\s*=\s*({.*?});\s*</script>', text, re.DOTALL)
+            if not match:
+                match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>', text, re.DOTALL)
+            if match:
+                data = _json.loads(match.group(1))
+                # 递归查找财务数据
+                def _find_fin_data(d, depth=0):
+                    if depth > 8:
+                        return
+                    if isinstance(d, dict):
+                        for key in ['finance', 'financial', 'f10', 'quotation', 'quote', 'stock']:
+                            if key in d:
+                                _find_fin_data(d[key], depth + 1)
+                        if any(k in d for k in ['pe', 'PB', 'ROE', '总市值']):
+                            result.update(d)
+                    elif isinstance(d, list) and d:
+                        _find_fin_data(d[0], depth + 1)
+                _find_fin_data(data)
+        except Exception:
+            pass
+        
+        # 如果 HTML 解析失败，使用备选 API 接口
+        if not result:
+            try:
+                url2 = (
+                    f"http://push2.eastmoney.com/api/qt/stock/get"
+                    f"?secid={secid}"
+                    f"&fields=f9,f20,f21,f22,f23,f24,f25,f37,f38,f39,f40,f41,f42,f43,f44,f45,f46,f48,f49,f50,f55,f57,f58,f59,f60,f115,f116,f117,f124,f128,f129,f130,f131,f132,f133,f148,f149,f152,f162,f168,f170,f171,f183,f184,f185,f186,f187,f188,f189,f190,f191,f192,f193"
+                )
+                r2 = session.get(url2, timeout=8)
+                qt_data = _json.loads(r2.text).get("data", {})
+                if qt_data:
+                    result = {
+                        "市盈率": qt_data.get("f9"),       # PE(TTM)
+                        "市净率": qt_data.get("f23"),      # PB
+                        "总市值": qt_data.get("f20"),      # 总市值
+                        "流通市值": qt_data.get("f21"),    # 流通市值
+                        "营业收入": qt_data.get("f44"),    # 总营收
+                        "净利润": qt_data.get("f45"),      # 净利润
+                        "roe": qt_data.get("f37"),         # ROE(%)
+                        "毛利率": qt_data.get("f49"),      # 毛利率
+                        "净利率": qt_data.get("f50"),      # 净利率
+                        "资产负债率": qt_data.get("f46"),  # 负债率
+                        "净利润增长率": qt_data.get("f43"),# 净利润同比
+                        "营业收入增长率": qt_data.get("f41"),# 营收同比
+                        "股息率": qt_data.get("f57"),      # 股息率
+                    }
+            except Exception:
+                pass
+        
+        if not result:
+            return pd.DataFrame()
+        
+        # 构造 DataFrame（与 AKShare 格式兼容）
+        row = {k: v for k, v in result.items() if v is not None and v != "-" and v != ""}
+        if not row:
+            return pd.DataFrame()
+        return pd.DataFrame([row])
 
     @retry_on_network_error(max_retries=2, base_delay=2.0)
     def _fetch_industry_stocks_raw(self, industry: str):
@@ -528,14 +685,447 @@ class DataFetcher:
         _rate_limit()
         return ak.stock_individual_fund_flow(stock=code, market=market)
 
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_money_flow_direct(self, code: str):
+        """东方财富 HTTP 直连获取资金流向数据
+        
+        使用东方财富个股资金流向接口，返回主力净流入等数据。
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        prefix = "SH" if code.startswith(("6", "9")) else "SZ"
+        secid = f"0.{code}" if prefix == "SZ" else f"1.{code}"
+        market = 0 if prefix == "SZ" else 1
+        
+        # 东方财富资金流向接口
+        url = (
+            f"http://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+            f"?secid={secid}"
+            f"&fields1=f1,f2,f3,f7"
+            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+            f"&lmt=30"
+            f"&klt=101"  # 日线
+        )
+        r = session.get(url, timeout=8)
+        data = _json.loads(r.text)
+        
+        klines = data.get("data", {}).get("klines", [])
+        if not klines:
+            return pd.DataFrame()
+        
+        rows = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) >= 12:
+                rows.append({
+                    "日期": parts[0],
+                    "主力净流入": float(parts[1]) if parts[1] != "-" else 0,
+                    "小单净流入": float(parts[2]) if parts[2] != "-" else 0,
+                    "中单净流入": float(parts[3]) if parts[3] != "-" else 0,
+                    "大单净流入": float(parts[4]) if parts[4] != "-" else 0,
+                    "超大单净流入": float(parts[5]) if parts[5] != "-" else 0,
+                })
+        
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    @retry_on_network_error(max_retries=2, base_delay=1.0)
+    def _fetch_money_flow_sina_direct(self, code: str):
+        """新浪财经 HTTP 直连获取资金流向（备选）"""
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        prefix = "sh" if code.startswith(("6", "9")) else "sz"
+        symbol = f"{prefix}{code}"
+        
+        url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zijinliuliang?daima={symbol}"
+        try:
+            r = session.get(url, timeout=8)
+            raw = _json.loads(r.text)
+            if not raw or not isinstance(raw, list) or len(raw) < 2:
+                return pd.DataFrame()
+            
+            # 取最近5天的数据
+            rows = []
+            for item in raw[-10:]:
+                try:
+                    date_str = item.get("opendate", item.get("date", ""))
+                    rows.append({
+                        "日期": date_str.replace("-", ""),
+                        "主力净流入": float(item.get("superlarge_order", 0) or 0) + float(item.get("large_order", 0) or 0),
+                        "小单净流入": float(item.get("small_order", 0) or 0),
+                        "中单净流入": float(item.get("medium_order", 0) or 0),
+                        "大单净流入": float(item.get("large_order", 0) or 0),
+                        "超大单净流入": float(item.get("superlarge_order", 0) or 0),
+                    })
+                except (ValueError, TypeError):
+                    continue
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=1.0)
+    def _fetch_realtime_quote_sina(self, codes: list[str]):
+        """新浪财经实时行情 API（批量获取）
+        
+        Args:
+            codes: 股票代码列表, 如 ['sh600519', 'sz000001']
+        
+        Returns:
+            DataFrame with columns: 代码, 名称, 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, ...
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        # 新浪批量行情接口
+        codes_str = ",".join(codes)
+        url = f"https://hq.sinajs.cn/list={codes_str}"
+        session.headers["Referer"] = "https://finance.sina.com.cn"
+        
+        r = session.get(url, timeout=8)
+        text = r.text
+        
+        rows = []
+        for line in text.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                # 格式: var hq_str_sh600519="贵州茅台,1850.00,1845.00,..."
+                parts = line.split('"')
+                if len(parts) < 2:
+                    continue
+                hq_str = parts[0].split("_str_")[-1] if "_str_" in parts[0] else parts[0].split("=")[0].strip()
+                code = hq_str.replace("var hq_str_", "").strip()
+                
+                data_str = parts[1]
+                fields = data_str.split(",")
+                if len(fields) < 32:
+                    continue
+                
+                rows.append({
+                    "代码": code[2:],  # 去掉 sh/sz 前缀
+                    "名称": fields[0],
+                    "今开": float(fields[1]) if fields[1] else 0,
+                    "昨收": float(fields[2]) if fields[2] else 0,
+                    "最新价": float(fields[3]) if fields[3] else 0,
+                    "最高": float(fields[4]) if fields[4] else 0,
+                    "最低": float(fields[5]) if fields[5] else 0,
+                    "成交量": float(fields[8]) if fields[8] else 0,
+                    "成交额": float(fields[9]) if fields[9] else 0,
+                    "涨跌额": float(fields[3]) - float(fields[2]) if fields[3] and fields[2] else 0,
+                    "涨跌幅": round((float(fields[3]) - float(fields[2])) / float(fields[2]) * 100, 2) if fields[3] and fields[2] and float(fields[2]) != 0 else 0,
+                })
+            except (IndexError, ValueError, ZeroDivisionError):
+                continue
+        
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=1.0)
+    def _fetch_realtime_quote_tencent(self, codes: list[str]):
+        """腾讯财经实时行情 API（批量获取）
+        
+        Args:
+            codes: 股票代码列表, 如 ['sh600519', 'sz000001']
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        codes_str = ",".join(codes)
+        url = f"http://qt.gtimg.cn/q={codes_str}"
+        session.headers["Referer"] = "https://gu.qq.com"
+        
+        r = session.get(url, timeout=8)
+        text = r.text
+        
+        rows = []
+        for line in text.strip().split("\n"):
+            if not line.strip() or "=" not in line:
+                continue
+            try:
+                # 格式: v_sh600519="1~贵州茅台~600519~1850.00~..."
+                parts = line.split('"')
+                if len(parts) < 2:
+                    continue
+                data_str = parts[1]
+                fields = data_str.split("~")
+                if len(fields) < 45:
+                    continue
+                
+                rows.append({
+                    "代码": fields[2] if len(fields) > 2 else "",
+                    "名称": fields[1] if len(fields) > 1 else "",
+                    "最新价": float(fields[3]) if fields[3] else 0,
+                    "昨收": float(fields[4]) if fields[4] else 0,
+                    "今开": float(fields[5]) if fields[5] else 0,
+                    "成交量": float(fields[6]) if fields[6] else 0,  # 手
+                    "成交额": float(fields[37]) if len(fields) > 37 and fields[37] else 0,  # 万
+                    "最高": float(fields[33]) if len(fields) > 33 and fields[33] else 0,
+                    "最低": float(fields[34]) if len(fields) > 34 and fields[34] else 0,
+                    "涨跌额": float(fields[31]) if len(fields) > 31 and fields[31] else 0,
+                    "涨跌幅": float(fields[32]) if len(fields) > 32 and fields[32] else 0,
+                    "换手率": float(fields[38]) if len(fields) > 38 and fields[38] else 0,
+                    "市盈率": float(fields[39]) if len(fields) > 39 and fields[39] else 0,
+                    "总市值": float(fields[45]) if len(fields) > 45 and fields[45] else 0,  # 亿
+                    "量比": float(fields[49]) if len(fields) > 49 and fields[49] else 0,
+                })
+            except (IndexError, ValueError):
+                continue
+        
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_market_breadth_direct(self):
+        """东方财富 HTTP 直连获取全市场涨跌家数等数据（备选）"""
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        url = (
+            "http://push2.eastmoney.com/api/qt/clist/get"
+            "?pn=1&pz=1&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f3"
+            "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            "&fields=f2,f3,f4,f5,f6,f7,f8,f9,f12,f14,f15,f16,f17,f18,f20,f21"
+        )
+        r = session.get(url, timeout=10)
+        total = _json.loads(r.text).get("data", {}).get("total", 0)
+        
+        if total > 0:
+            # 获取全量数据用于统计涨跌
+            url2 = (
+                f"http://push2.eastmoney.com/api/qt/clist/get"
+                f"?pn=1&pz={min(total, 100)}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                f"&fltt=2&invt=2&fid=f12"
+                f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+                f"&fields=f2,f3,f12"
+            )
+            r2 = session.get(url2, timeout=10)
+            items = _json.loads(r2.text).get("data", {}).get("diff", [])
+            
+            up_count = sum(1 for i in items if float(i.get("f3", 0) or 0) > 0)
+            down_count = sum(1 for i in items if float(i.get("f3", 0) or 0) < 0)
+            flat_count = len(items) - up_count - down_count
+            
+            return {
+                "上涨": up_count,
+                "下跌": down_count,
+                "平盘": flat_count,
+                "总数": len(items),
+            }
+        return {}
+
     @retry_on_network_error(max_retries=2, base_delay=2.0)
     def _fetch_limit_down_raw(self, date: str):
         ak = _ensure_akshare()
         _rate_limit()
         return ak.stock_zt_pool_dtgc_em(date=date)
 
-    @retry_on_network_error(max_retries=2, base_delay=1.5)
-    def _fetch_market_activity_raw(self):
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_limit_up_direct(self, date: str):
+        """东方财富 HTTP 直连获取涨停池数据（备选回退）"""
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        # 东方财富涨停板接口
+        url = (
+            "http://push2ex.eastmoney.com/getTopicZTPool"
+            f"?ut=7eea3edcaed734bea9cbfce244eeed1e"
+            f"&date={date}"
+            f"&sort=fundsrate&sorttype=desc"
+            f"&pagesize=200&pageindex=1"
+        )
+        try:
+            r = session.get(url, timeout=10)
+            data = _json.loads(r.text)
+            items = data.get("data", {}).get("pool", [])
+            if not items:
+                return pd.DataFrame()
+            
+            rows = []
+            for item in items:
+                rows.append({
+                    "代码": str(item.get("c", "")),
+                    "名称": str(item.get("n", "")),
+                    "最新价": float(item.get("p", 0) or 0),
+                    "涨跌幅": float(item.get("zdf", 0) or 0),
+                    "涨停价": float(item.get("zt", 0) or 0),
+                    "成交额": float(item.get("amount", 0) or 0),
+                    "流通市值": float(item.get("ltsz", 0) or 0),
+                    "总市值": float(item.get("zsz", 0) or 0),
+                    "换手率": float(item.get("lbl", 0) or 0),
+                    "连板数": int(item.get("days", 0) or 0),
+                    "封单资金": float(item.get("fba", 0) or 0),
+                    "首次封板时间": str(item.get("ft", "")),
+                    "最后封板时间": str(item.get("lt", "")),
+                    "涨停统计": str(item.get("reason", item.get("hybk", ""))),
+                    "所属行业": str(item.get("hybk", "")),
+                })
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            # 备选 URL 格式（push2.eastmoney.com）
+            try:
+                url2 = (
+                    f"http://push2.eastmoney.com/api/qt/clist/get"
+                    f"?pn=1&pz=200&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                    f"&fltt=2&invt=2&fid=f3"
+                    f"&fs=b:KDJ%2Bb:BK0518"
+                    f"&fields=f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21"
+                )
+                r2 = session.get(url2, timeout=10)
+                data2 = _json.loads(r2.text)
+                items2 = data2.get("data", {}).get("diff", [])
+                if items2:
+                    rows2 = []
+                    for item in items2:
+                        rows2.append({
+                            "代码": str(item.get("f12", "")),
+                            "名称": str(item.get("f14", "")),
+                            "最新价": float(item.get("f2", 0) or 0),
+                            "涨跌幅": float(item.get("f3", 0) or 0),
+                            "涨跌额": float(item.get("f4", 0) or 0),
+                            "成交量": float(item.get("f5", 0) or 0),
+                            "成交额": float(item.get("f6", 0) or 0),
+                            "换手率": float(item.get("f8", 0) or 0),
+                            "市盈率-动态": float(item.get("f9", 0) or 0),
+                            "总市值": float(item.get("f20", 0) or 0),
+                            "流通市值": float(item.get("f21", 0) or 0),
+                            "连板数": 0,
+                            "涨停统计": "",
+                            "所属行业": "",
+                        })
+                    return pd.DataFrame(rows2)
+            except Exception:
+                pass
+        return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_limit_down_direct(self, date: str):
+        """东方财富 HTTP 直连获取跌停池数据（备选回退）"""
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        # 使用东方财富跌幅榜数据近似跌停池
+        url = (
+            "http://push2.eastmoney.com/api/qt/clist/get"
+            f"?pn=1&pz=200&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            f"&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            f"&fields=f2,f3,f4,f5,f6,f8,f12,f14,f20,f21"
+        )
+        try:
+            r = session.get(url, timeout=10)
+            data = _json.loads(r.text)
+            items = data.get("data", {}).get("diff", [])
+            if not items:
+                return pd.DataFrame()
+            
+            # 筛选接近跌停的股票（跌幅 < -9.5%）
+            rows = []
+            for item in items:
+                zdf = float(item.get("f3", 0) or 0)
+                if zdf <= -9.5:
+                    rows.append({
+                        "代码": str(item.get("f12", "")),
+                        "名称": str(item.get("f14", "")),
+                        "最新价": float(item.get("f2", 0) or 0),
+                        "涨跌幅": zdf,
+                        "成交额": float(item.get("f6", 0) or 0),
+                        "换手率": float(item.get("f8", 0) or 0),
+                        "总市值": float(item.get("f20", 0) or 0),
+                        "流通市值": float(item.get("f21", 0) or 0),
+                    })
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_continuous_limit_direct(self, date: str):
+        """东方财富 HTTP 直连获取连板池数据（备选回退）"""
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        # 使用涨停池数据，筛选连板 >= 2 的股票
+        url = (
+            "http://push2ex.eastmoney.com/getTopicZTPool"
+            f"?ut=7eea3edcaed734bea9cbfce244eeed1e"
+            f"&date={date}"
+            f"&sort=days&sorttype=desc"
+            f"&pagesize=100&pageindex=1"
+        )
+        try:
+            r = session.get(url, timeout=10)
+            data = _json.loads(r.text)
+            items = data.get("data", {}).get("pool", [])
+            if not items:
+                return pd.DataFrame()
+            
+            rows = []
+            for item in items:
+                days = int(item.get("days", 0) or 0)
+                if days >= 2:  # 只取连板股
+                    rows.append({
+                        "代码": str(item.get("c", "")),
+                        "名称": str(item.get("n", "")),
+                        "最新价": float(item.get("p", 0) or 0),
+                        "涨跌幅": float(item.get("zdf", 0) or 0),
+                        "涨停价": float(item.get("zt", 0) or 0),
+                        "成交额": float(item.get("amount", 0) or 0),
+                        "换手率": float(item.get("lbl", 0) or 0),
+                        "流通市值": float(item.get("ltsz", 0) or 0),
+                        "总市值": float(item.get("zsz", 0) or 0),
+                        "连板数": days,
+                        "封单资金": float(item.get("fba", 0) or 0),
+                        "首次封板时间": str(item.get("ft", "")),
+                        "最后封板时间": str(item.get("lt", "")),
+                        "所属行业": str(item.get("hybk", "")),
+                    })
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_market_breadth_full(self):
+        """东方财富 HTTP 直连获取全市场涨跌家数（带板块细分）"""
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        # 使用全市场统计接口
+        url = (
+            "http://push2.eastmoney.com/api/qt/clist/get"
+            "?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f3"
+            "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            "&fields=f2,f3,f4,f5,f6,f8,f12,f14,f20,f21"
+        )
+        try:
+            r = session.get(url, timeout=12)
+            data = _json.loads(r.text)
+            items = data.get("data", {}).get("diff", [])
+            if not items:
+                return {}
+            
+            up_count = sum(1 for i in items if float(i.get("f3", 0) or 0) > 0)
+            down_count = sum(1 for i in items if float(i.get("f3", 0) or 0) < 0)
+            flat_count = len(items) - up_count - down_count
+            
+            # 统计涨停/跌停（涨跌幅 >= 9.5% 或 <= -9.5%）
+            limit_up = sum(1 for i in items if float(i.get("f3", 0) or 0) >= 9.5)
+            limit_down = sum(1 for i in items if float(i.get("f3", 0) or 0) <= -9.5)
+            
+            return {
+                "上涨": up_count,
+                "下跌": down_count,
+                "平盘": flat_count,
+                "涨停": limit_up,
+                "跌停": limit_down,
+                "总数": len(items),
+            }
+        except Exception:
+            return {}
         ak = _ensure_akshare()
         _rate_limit()
         return ak.stock_market_activity_legu()
@@ -555,16 +1145,17 @@ class DataFetcher:
     # ═══ 公共方法：缓存 + 降级 ═══
 
     def fetch_stock_list(self, force_refresh: bool = False) -> pd.DataFrame:
-        """获取股票列表，回退链: akshare → 东财直连HTTP"""
+        """获取股票列表，回退链: akshare → 东财直连HTTP → 腾讯直连HTTP"""
         if not force_refresh:
             cached = self.cache.get("stock_list", max_age_hours=24)
             if cached is not None:
                 return cached
 
-        # 优先 akshare，失败则直连东财
+        # 优先 akshare，失败则直连
         sources = [
             ("akshare", lambda: self._fetch_stock_list_raw()),
             ("东财直连", lambda: self._fetch_stock_list_direct()),
+            ("腾讯直连", lambda: self._fetch_stock_list_tencent_direct()),
         ]
 
         for label, fetcher in sources:
@@ -583,8 +1174,11 @@ class DataFetcher:
                 logger.warning(f"  股票列表 [{label}] 不可用({type(e).__name__})，标记跳过")
                 self._unavailable_sources.add(label)
 
+        logger.error("获取股票列表失败（所有数据源均不可达）")
+        return pd.DataFrame()
+
     def fetch_daily_kline(self, code: str, start_date: str = "20200101",
-                          end_date: str = None, adjust: str = "qfq") -> pd.DataFrame:
+                          end_date: str | None = None, adjust: str = "qfq") -> pd.DataFrame:
         """获取日K线，5级回退链:
         东方财富(akshare) → 新浪(akshare) → 腾讯(akshare) → 腾讯(直连) → 新浪(直连) → 本地DB
         """
@@ -628,7 +1222,7 @@ class DataFetcher:
         return pd.DataFrame()
 
     def fetch_index_daily(self, index_code: str = "000001",
-                          start_date: str = "20200101", end_date: str = None) -> pd.DataFrame:
+                          start_date: str = "20200101", end_date: str | None = None) -> pd.DataFrame:
         """获取指数日线，3级回退链: 东方财富 → 腾讯(akshare) → 腾讯(直连)"""
         if end_date is None:
             end_date = datetime.now().strftime("%Y%m%d")
@@ -668,17 +1262,35 @@ class DataFetcher:
         return pd.DataFrame()
 
     def fetch_financial_data(self, code: str) -> pd.DataFrame:
+        """获取财务数据，三级回退链:
+        AKShare(财务分析指标) → AKShare(财务摘要) → 东方财富HTTP直连
+        """
         cached = self.cache.get(f"finance_{code}", max_age_hours=168)
         if cached is not None:
             return cached
-        try:
-            df = self._fetch_financial_raw(code)
-            if df is not None and not df.empty:
-                self.cache.set(f"finance_{code}", df)
-            return df
-        except Exception as e:
-            logger.error(f"获取 {code} 财务数据失败: {e}")
-            return pd.DataFrame()
+
+        sources = [
+            ("AKShare财务指标", lambda: self._fetch_financial_raw(code)),
+            ("AKShare财务摘要", lambda: self._fetch_financial_abstract_raw(code)),
+            ("东方财富直连", lambda: self._fetch_financial_eastmoney_direct(code)),
+        ]
+
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → '{code}' 财务数据使用 {label} 数据源")
+                    self.cache.set(f"finance_{code}", df)
+                    return df
+            except Exception as e:
+                logger.warning(f"  财务数据 [{label}] 不可用({type(e).__name__})，标记跳过")
+                self._unavailable_sources.add(label)
+
+        logger.error(f"获取 {code} 财务数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
 
     def fetch_industry_stocks(self, industry: str, board_code: str = "") -> pd.DataFrame:
         from . import sector_fallback as _sf
@@ -688,66 +1300,548 @@ class DataFetcher:
         from . import sector_fallback as _sf
         return _sf.fetch_list(self.cache, force=force_refresh)
 
-    def fetch_limit_up_pool(self, date: str = None) -> pd.DataFrame:
+    def fetch_limit_up_pool(self, date: str | None = None) -> pd.DataFrame:
+        """获取涨停板股票池，两级回退: AKShare → 东财HTTP直连"""
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        try:
-            return self._fetch_limit_up_raw(date)
-        except Exception as e:
-            logger.error(f"获取涨停板数据失败: {e}")
-            return pd.DataFrame()
+        
+        sources = [
+            ("AKShare涨停池", lambda: self._fetch_limit_up_raw(date)),
+            ("东方财富涨停池直连", lambda: self._fetch_limit_up_direct(date)),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 涨停池使用 {label} 数据源")
+                    return df
+            except Exception as e:
+                logger.warning(f"  涨停池 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        logger.error("获取涨停板数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
 
-    def fetch_continuous_limit_up(self, date: str = None) -> pd.DataFrame:
+    def fetch_continuous_limit_up(self, date: str | None = None) -> pd.DataFrame:
+        """获取连板股票池，两级回退: AKShare → 东财HTTP直连"""
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        try:
-            return self._fetch_continuous_limit_raw(date)
-        except Exception as e:
-            logger.error(f"获取连板数据失败: {e}")
-            return pd.DataFrame()
+        
+        sources = [
+            ("AKShare连板池", lambda: self._fetch_continuous_limit_raw(date)),
+            ("东方财富连板池直连", lambda: self._fetch_continuous_limit_direct(date)),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 连板池使用 {label} 数据源")
+                    return df
+            except Exception as e:
+                logger.warning(f"  连板池 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        logger.error("获取连板数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
 
     def fetch_money_flow(self, code: str) -> pd.DataFrame:
-        try:
-            market = "sh" if code.startswith("6") else "sz"
-            return self._fetch_money_flow_raw(code, market)
-        except Exception as e:
-            logger.error(f"获取 {code} 资金流向失败: {e}")
-            return pd.DataFrame()
+        """获取资金流向，三级回退链:
+        AKShare(个股资金流向) → 东方财富HTTP直连 → 新浪HTTP直连
+        """
+        sources = [
+            ("AKShare资金流向", lambda: self._fetch_money_flow_raw(code, "sh" if code.startswith("6") else "sz")),
+            ("东方财富资金流向直连", lambda: self._fetch_money_flow_direct(code)),
+            ("新浪资金流向直连", lambda: self._fetch_money_flow_sina_direct(code)),
+        ]
 
-    def fetch_limit_down_pool(self, date: str = None) -> pd.DataFrame:
-        """获取跌停板股票池"""
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → '{code}' 资金流向使用 {label} 数据源")
+                    return df
+            except Exception as e:
+                logger.warning(f"  资金流向 [{label}] 不可用({type(e).__name__})，标记跳过")
+                self._unavailable_sources.add(label)
+
+        logger.error(f"获取 {code} 资金流向失败（所有数据源均不可达）")
+        return pd.DataFrame()
+
+    def fetch_limit_down_pool(self, date: str | None = None) -> pd.DataFrame:
+        """获取跌停板股票池，两级回退: AKShare → 东财HTTP直连"""
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        try:
-            return self._fetch_limit_down_raw(date)
-        except Exception as e:
-            logger.error(f"获取跌停板数据失败: {e}")
-            return pd.DataFrame()
+        
+        sources = [
+            ("AKShare跌停池", lambda: self._fetch_limit_down_raw(date)),
+            ("东方财富跌停池直连", lambda: self._fetch_limit_down_direct(date)),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 跌停池使用 {label} 数据源")
+                    return df
+            except Exception as e:
+                logger.warning(f"  跌停池 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        logger.error("获取跌停板数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
 
-    def fetch_market_activity(self) -> Dict[str, float]:
-        """获取全市场活跃度概览（涨跌停数、涨跌家数、成交量等）
+    @retry_on_network_error(max_retries=2, base_delay=1.5)
+    def _fetch_market_activity_raw(self):
+        """AKShare 乐股市场活跃度数据（主数据源）"""
+        ak = _ensure_akshare()
+        _rate_limit()
+        return ak.stock_market_activity_legu()
 
+    def fetch_market_activity(self) -> dict[str, float]:
+        """获取全市场活跃度概览（涨跌停数、涨跌家数、成交量等），三级回退
+        
         Returns:
             dict: {上涨, 下跌, 平盘, 涨停, 真实涨停, 跌停, 真实跌停, 总市值, 成交量, ...}
         """
+        # 一级: AKShare 乐股数据（最详细）
+        if "AKShare乐股" not in self._unavailable_sources:
+            try:
+                df = self._fetch_market_activity_raw()
+                if df is not None and not df.empty:
+                    result = {}
+                    for _, row in df.iterrows():
+                        key = str(row["item"])
+                        val = row["value"]
+                        try:
+                            result[key] = float(val)
+                        except (ValueError, TypeError):
+                            result[key] = val
+                    self._unavailable_sources.discard("AKShare乐股")
+                    return result
+            except Exception as e:
+                logger.warning(f"AKShare市场活跃度获取失败: {e}，标记跳过")
+                self._unavailable_sources.add("AKShare乐股")
+
+        # 二级: 东方财富 HTTP 直连获取涨跌家数（采样100只）
         try:
-            df = self._fetch_market_activity_raw()
-            if df is None or df.empty:
-                return {}
-            result = {}
-            for _, row in df.iterrows():
-                key = str(row["item"])
-                val = row["value"]
-                try:
-                    result[key] = float(val)
-                except (ValueError, TypeError):
-                    result[key] = val
-            return result
+            bread = self._fetch_market_breadth_direct()
+            if bread:
+                logger.info("  → 市场活跃度使用东方财富直连(采样)数据源")
+                return {
+                    "上涨": bread.get("上涨", 0),
+                    "下跌": bread.get("下跌", 0),
+                    "平盘": bread.get("平盘", 0),
+                    "涨停": 0,
+                    "跌停": 0,
+                }
+        except Exception as e:
+            logger.warning(f"东方财富涨跌家数(采样)获取失败: {e}")
+
+        # 三级: 东方财富全量统计（带涨停/跌停检测）
+        try:
+            bread_full = self._fetch_market_breadth_full()
+            if bread_full:
+                logger.info("  → 市场活跃度使用东方财富直连(全量)数据源")
+                return bread_full
         except Exception as e:
             logger.error(f"获取市场活跃度失败: {e}")
-            return {}
 
-    def fetch_market_total_volume(self) -> Dict[str, Any]:
+        return {}
+
+    # ═══ 北向资金 ═══
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_northbound_flow_direct(self, days: int = 30):
+        """东方财富 HTTP 直连获取北向资金（沪深港通）日流向
+        
+        使用东方财富北向资金 K 线接口，返回每日净流入数据。
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        # 北向资金总计（沪股通+深股通）日线
+        url = (
+            "http://push2his.eastmoney.com/api/qt/kamt.kline/get"
+            "?fields1=f1,f2,f3,f4"
+            "&fields2=f51,f52,f53,f54,f55,f56"
+            "&klt=101"  # 日线
+            f"&lmt={min(days, 60)}"
+            "&ut=b2884a393a59ad64002292a3e90d46a5"
+        )
+        try:
+            r = session.get(url, timeout=10)
+            data = _json.loads(r.text)
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                return pd.DataFrame()
+            
+            rows = []
+            for line in klines:
+                parts = line.split(",")
+                if len(parts) >= 4:
+                    rows.append({
+                        "日期": parts[0].replace("-", ""),
+                        "当日净流入": round(float(parts[1]) / 1e8, 2) if parts[1] != "-" else 0,  # 亿
+                        "沪股通净流入": round(float(parts[2]) / 1e8, 2) if parts[2] != "-" else 0,
+                        "深股通净流入": round(float(parts[3]) / 1e8, 2) if parts[3] != "-" else 0,
+                        "当日余额": round(float(parts[4]) / 1e8, 2) if len(parts) > 4 and parts[4] != "-" else 0,
+                    })
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=3, base_delay=2.0)
+    def _fetch_northbound_flow_akshare(self):
+        """AKShare 北向资金数据（备选）"""
+        ak = _ensure_akshare()
+        _rate_limit()
+        # stock_hsgt_hist_em 获取北向资金历史数据
+        return ak.stock_hsgt_hist_em(symbol="北向资金")
+
+    def fetch_northbound_flow(self, days: int = 30) -> pd.DataFrame:
+        """获取北向资金（沪深港通）流向，两级回退: 东财直连 → AKShare
+        
+        Args:
+            days: 获取最近多少天的数据
+        
+        Returns:
+            DataFrame with columns: 日期, 当日净流入, 沪股通净流入, 深股通净流入, ...
+        """
+        cached = self.cache.get("northbound_flow", max_age_hours=6)
+        if cached is not None:
+            return cached
+        
+        sources = [
+            ("东方财富北向资金直连", lambda: self._fetch_northbound_flow_direct(days)),
+            ("AKShare北向资金", lambda: self._fetch_northbound_flow_akshare()),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 北向资金使用 {label} 数据源")
+                    self.cache.set("northbound_flow", df)
+                    return df
+            except Exception as e:
+                logger.warning(f"  北向资金 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        logger.error("获取北向资金数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
+
+    # ═══ 龙虎榜 ═══
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_lhb_direct(self, date: str | None = None):
+        """东方财富 HTTP 直连获取龙虎榜数据
+        
+        使用 push2.eastmoney.com 个股龙虎榜接口。
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        if date is None:
+            date = datetime.now().strftime("%Y%m%d")
+        
+        # 使用东方财富龙虎榜个股接口
+        date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        url = (
+            "http://push2.eastmoney.com/api/qt/clist/get"
+            f"?pn=1&pz=200&po=1&np=1"
+            "&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f3"
+            "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            "&fields=f2,f3,f4,f5,f6,f7,f8,f12,f14,f15,f16,f17,f18,f20,f21,f184,f66,f69,f72"
+        )
+        try:
+            r = session.get(url, timeout=10)
+            data = _json.loads(r.text)
+            items = data.get("data", {}).get("diff", [])
+            if not items:
+                return pd.DataFrame()
+            
+            # 筛选有龙虎榜数据的股票（f184 字段 = 龙虎榜标记）
+            rows = []
+            for item in items:
+                # f184 可能是龙虎榜相关字段
+                lhb_flag = item.get("f184", "")
+                if lhb_flag:
+                    rows.append({
+                        "股票代码": str(item.get("f12", "")),
+                        "股票名称": str(item.get("f14", "")),
+                        "最新价": float(item.get("f2", 0) or 0),
+                        "涨跌幅": float(item.get("f3", 0) or 0),
+                        "成交额": round(float(item.get("f6", 0) or 0) / 1e8, 2),
+                        "总市值": round(float(item.get("f20", 0) or 0) / 1e8, 2) if item.get("f20") else 0,
+                        "流通市值": round(float(item.get("f21", 0) or 0) / 1e8, 2) if item.get("f21") else 0,
+                        "上榜原因": str(item.get("f184", "")),
+                    })
+            # 如果 push2 方式拿不到，返回空（让 akshare 回退处理）
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=2, base_delay=2.0)
+    def _fetch_lhb_akshare(self, date: str | None = None):
+        """AKShare 龙虎榜数据（备选）- 多接口尝试"""
+        import datetime as _dt
+        ak = _ensure_akshare()
+        _rate_limit()
+        if date is None:
+            date = _dt.datetime.now().strftime("%Y%m%d")
+        # 尝试多种接口格式
+        for fn_name, fn_args in [
+            ("stock_lhb_detail_em", {"date": date}),
+            ("stock_lhb_detail_daily_sina", {"date": date}),
+            ("stock_lhb_stock_list_em", {"date": date}),
+        ]:
+            try:
+                fn = getattr(ak, fn_name, None)
+                if fn:
+                    return fn(**fn_args)
+            except Exception:
+                continue
+        raise AttributeError("AKShare 龙虎榜接口均不可用")
+
+    def fetch_lhb_detail(self, date: str | None = None) -> pd.DataFrame:
+        """获取龙虎榜详情，两级回退: 东财直连 → AKShare
+        
+        Returns:
+            DataFrame with columns: 股票代码, 股票名称, 涨跌幅, 龙虎榜净买额, 上榜原因, ...
+        """
+        if date is None:
+            date = datetime.now().strftime("%Y%m%d")
+        
+        cached = self.cache.get(f"lhb_{date}", max_age_hours=24)
+        if cached is not None:
+            return cached
+        
+        sources = [
+            ("东方财富龙虎榜直连", lambda: self._fetch_lhb_direct(date)),
+            ("AKShare龙虎榜", lambda: self._fetch_lhb_akshare(date)),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 龙虎榜使用 {label} 数据源")
+                    self.cache.set(f"lhb_{date}", df)
+                    return df
+            except Exception as e:
+                logger.warning(f"  龙虎榜 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        logger.error("获取龙虎榜数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
+
+    # ═══ 融资融券 ═══
+
+    @retry_on_network_error(max_retries=3, base_delay=1.5)
+    def _fetch_margin_trading_direct(self):
+        """东方财富 HTTP 直连获取融资融券余额（全市场汇总）
+        
+        使用 push2.eastmoney.com 融资融券数据接口。
+        """
+        import json as _json
+        _rate_limit()
+        session = _get_http_session()
+        
+        # 沪深两市融资融券汇总数据
+        url = (
+            "http://push2.eastmoney.com/api/qt/clist/get"
+            "?pn=1&pz=30&po=1&np=1"
+            "&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f62"
+            "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            "&fields=f2,f3,f4,f12,f14,f62,f184,f66,f69"
+        )
+        try:
+            r = session.get(url, timeout=12)
+            data = _json.loads(r.text)
+            items = data.get("data", {}).get("diff", [])
+            if not items:
+                return pd.DataFrame()
+            
+            # 汇总个股融资余额
+            total_margin = 0.0
+            total_sc = 0.0
+            for item in items:
+                margin_val = float(item.get("f62", 0) or 0)  # 融资余额近似
+                sc_val = float(item.get("f66", 0) or 0)      # 融券余额近似
+                total_margin += margin_val
+                total_sc += sc_val
+            
+            rows = [{
+                "日期": datetime.now().strftime("%Y%m%d"),
+                "融资余额": round(total_margin / 1e8, 2),
+                "融券余额": round(total_sc / 1e8, 2),
+                "融资融券余额": round((total_margin + total_sc) / 1e8, 2),
+            }]
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    @retry_on_network_error(max_retries=2, base_delay=2.0)
+    def _fetch_margin_trading_akshare(self):
+        """AKShare 融资融券数据（备选）- 多接口尝试"""
+        ak = _ensure_akshare()
+        _rate_limit()
+        import datetime as _dt
+        today = _dt.datetime.now()
+        # 尝试多种接口
+        for fn_name, fn_args in [
+            ("stock_margin_detail_szse", {"date": today.strftime("%Y-%m-%d")}),
+            ("stock_margin_detail_szse", {"date": today.strftime("%Y%m%d")}),
+            ("stock_margin_sse", {"start_date": (today - _dt.timedelta(days=30)).strftime("%Y%m%d"),
+                                  "end_date": today.strftime("%Y%m%d")}),
+            ("stock_margin_sse", {}),
+        ]:
+            try:
+                fn = getattr(ak, fn_name, None)
+                if fn:
+                    return fn(**fn_args)
+            except Exception:
+                continue
+        raise AttributeError("AKShare 融资融券接口均不可用")
+
+    def fetch_margin_trading(self) -> pd.DataFrame:
+        """获取融资融券余额数据，两级回退: 东财直连 → AKShare
+        
+        Returns:
+            DataFrame with columns: 日期, 融资余额, 融资买入额, 融券余额, 融资融券余额, ...
+        """
+        cached = self.cache.get("margin_trading", max_age_hours=6)
+        if cached is not None:
+            return cached
+        
+        sources = [
+            ("东方财富融资融券直连", lambda: self._fetch_margin_trading_direct()),
+            ("AKShare融资融券", lambda: self._fetch_margin_trading_akshare()),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 融资融券使用 {label} 数据源")
+                    self.cache.set("margin_trading", df)
+                    return df
+            except Exception as e:
+                logger.warning(f"  融资融券 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        logger.error("获取融资融券数据失败（所有数据源均不可达）")
+        return pd.DataFrame()
+
+    def fetch_realtime_quote(self, codes: list[str]) -> pd.DataFrame:
+        """获取实时行情（批量），两级回退: 新浪 → 腾讯
+        
+        Args:
+            codes: 股票代码列表, 如 ['600519', '000001']（不含市场前缀）
+        
+        Returns:
+            DataFrame with columns: 代码, 名称, 最新价, 涨跌幅, 成交量, 成交额, 换手率, 量比, 市盈率
+        """
+        if not codes:
+            return pd.DataFrame()
+        
+        # 构造带市场前缀的代码
+        sina_codes = [f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}" for code in codes]
+        
+        sources = [
+            ("新浪实时行情", lambda: self._fetch_realtime_quote_sina(sina_codes)),
+            ("腾讯实时行情", lambda: self._fetch_realtime_quote_tencent(sina_codes)),
+        ]
+        
+        for label, fetcher in sources:
+            if label in self._unavailable_sources:
+                continue
+            try:
+                df = fetcher()
+                if df is not None and not df.empty:
+                    if label != sources[0][0]:
+                        logger.info(f"  → 实时行情使用 {label} 数据源")
+                    return df
+            except Exception as e:
+                logger.warning(f"  实时行情 [{label}] 不可用({type(e).__name__})")
+                self._unavailable_sources.add(label)
+        
+        return pd.DataFrame()
+
+    def reset_unavailable_sources(self):
+        """重置不可用数据源标记（用于定期恢复尝试）"""
+        count = len(self._unavailable_sources)
+        if count > 0:
+            self._unavailable_sources.clear()
+            logger.info(f"已重置 {count} 个不可用数据源标记")
+        
+        # 同时重置 sector_fallback 模块的不可用标记
+        try:
+            from . import sector_fallback as _sf
+            _sf.reset()
+        except Exception:
+            pass
+    
+    def get_data_source_health(self) -> dict[str, object]:
+        """获取数据源健康状态"""
+        all_sources = {
+            "股票列表": ["akshare", "东财直连", "腾讯直连"],
+            "K线": ["东方财富", "新浪", "腾讯", "腾讯直连", "新浪直连"],
+            "指数": ["东方财富", "腾讯", "腾讯直连"],
+            "财务": ["AKShare财务指标", "AKShare财务摘要", "东方财富直连"],
+            "资金流向": ["AKShare资金流向", "东方财富资金流向直连", "新浪资金流向直连"],
+            "实时行情": ["新浪实时行情", "腾讯实时行情"],
+            "市场活跃度": ["AKShare乐股", "东方财富涨跌家数(采样)", "东方财富涨跌家数(全量)"],
+            "涨停池": ["AKShare涨停池", "东方财富涨停池直连"],
+            "连板池": ["AKShare连板池", "东方财富连板池直连"],
+            "跌停池": ["AKShare跌停池", "东方财富跌停池直连"],
+            "板块": ["AKShare行业", "AKShare概念", "东方财富HTTP行业", "东方财富HTTP概念"],
+            "北向资金": ["东方财富北向资金直连", "AKShare北向资金"],
+            "龙虎榜": ["东方财富龙虎榜直连", "AKShare龙虎榜"],
+            "融资融券": ["东方财富融资融券直连", "AKShare融资融券"],
+        }
+        
+        health = {}
+        for category, sources in all_sources.items():
+            available = [s for s in sources if s not in self._unavailable_sources]
+            unavailable = [s for s in sources if s in self._unavailable_sources]
+            health[category] = {
+                "available": available,
+                "unavailable": unavailable,
+                "total": len(sources),
+                "healthy": len(available) == len(sources),
+            }
+        
+        return health
+
+    def fetch_market_total_volume(self) -> dict[str, object]:
         """获取沪深两市总成交额与总市值
 
         Returns:
@@ -782,7 +1876,7 @@ class DataFetcher:
 
         return result
 
-    def fetch_batch_5day_gains(self, codes: List[str], max_workers: int = 3) -> Dict[str, float]:
+    def fetch_batch_5day_gains(self, codes: list[str], max_workers: int = 3) -> dict[str, float]:
         """批量获取多只股票近5个交易日涨幅（快速模式）。
 
         两级降级策略：
@@ -801,7 +1895,7 @@ class DataFetcher:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import json as _json
 
-        result: Dict[str, float] = {}
+        result: dict[str, float] = {}
         if not codes:
             return result
 
@@ -889,7 +1983,7 @@ class DataFetcher:
         return result
 
     def build_stock_pool(self, market: str = "全部", filter_st: bool = True,
-                         filter_new: bool = True, min_days: int = 60) -> List[str]:
+                         filter_new: bool = True, min_days: int = 60) -> list[str]:
         stock_list = self.fetch_stock_list()
         if stock_list.empty:
             return []
@@ -902,8 +1996,8 @@ class DataFetcher:
             filtered.append(code)
         return filtered
 
-    def prepare_akquant_data(self, codes: List[str], start_date: str,
-                             end_date: str = None) -> Dict[str, pd.DataFrame]:
+    def prepare_akquant_data(self, codes: list[str], start_date: str,
+                             end_date: str | None = None) -> dict[str, pd.DataFrame]:
         """准备 AKQuant 格式的多标的数据字典
 
         返回: {symbol: DataFrame[date, open, high, low, close, volume, symbol]}

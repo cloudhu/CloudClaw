@@ -9,15 +9,21 @@ import json
 import os
 import glob
 import logging
+import time as _time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Web API 超时配置
+_WEB_KLINE_FETCH_TIMEOUT = 8  # 单只股票K线数据获取超时（秒）
+_WEB_POOL_INJECT_MAX_TIME = 30  # 整个池涨幅注入的最大总时间（秒）
+
 try:
     from fastapi import FastAPI, Query, HTTPException
     from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
     import uvicorn
     HAS_FASTAPI = True
 except ImportError:
@@ -29,6 +35,8 @@ from .config import (
     DEFAULT_CAPITAL, STRATEGIES,
 )
 from .stock_pool import POOL_DIR, TIER_FOCUS, TIER_WATCH, TIER_BROAD, TIER_LABELS, TIER_THRESHOLDS
+from .ops_monitor import ops_collector, SystemMonitor, EngineStateReader, HAS_PSUTIL
+from .stock_diagnose import get_diagnoser, StockDiagnosis
 
 # ─── 常量和路径 ─────────────────────────────────────────────
 
@@ -57,6 +65,116 @@ def _read_json(path: str, default=None):
         return default
 
 
+def _diagnosis_to_dict(d: StockDiagnosis) -> dict:
+    """将 StockDiagnosis 序列化为 JSON 兼容字典"""
+    def _json_safe(val):
+        """转换 numpy 类型为 Python 原生类型"""
+        try:
+            import numpy as np
+            if isinstance(val, (np.integer,)):
+                return int(val)
+            if isinstance(val, (np.floating,)):
+                return float(val)
+            if isinstance(val, (np.bool_,)):
+                return bool(val)
+            if isinstance(val, np.ndarray):
+                return val.tolist()
+        except ImportError:
+            pass
+        return val
+
+    def _dict_safe(d):
+        """递归转换 dict 中的 numpy 值"""
+        if not isinstance(d, dict):
+            return d
+        return {str(k): _dict_safe(v) if isinstance(v, dict) else _json_safe(v) for k, v in d.items()}
+
+    def ir_to_dict(ir):
+        if ir is None:
+            return None
+        return {"trend": ir.trend, "signal": ir.signal,
+                "strength": _json_safe(ir.strength), "details": _dict_safe(ir.details)}
+
+    return {
+        "code": d.code,
+        "name": d.name,
+        "timestamp": d.timestamp,
+        "technical": {
+            "score": d.technical.score,
+            "rating": d.technical.rating,
+            "current_price": d.technical.current_price,
+            "pct_change_5d": d.technical.pct_change_5d,
+            "pct_change_20d": d.technical.pct_change_20d,
+            "amplitude_5d": d.technical.amplitude_5d,
+            "ma_alignment": d.technical.ma_alignment,
+            "ma_positions": d.technical.ma_positions,
+            "macd": ir_to_dict(d.technical.macd),
+            "kdj": ir_to_dict(d.technical.kdj),
+            "rsi": ir_to_dict(d.technical.rsi),
+            "bollinger": ir_to_dict(d.technical.bollinger),
+            "volume_price": ir_to_dict(d.technical.volume_price),
+            "atr": d.technical.atr,
+            "support": d.technical.support,
+            "resistance": d.technical.resistance,
+        },
+        "fundamental": {
+            "score": d.fundamental.score,
+            "rating": d.fundamental.rating,
+            "pe": d.fundamental.pe,
+            "pb": d.fundamental.pb,
+            "roe": d.fundamental.roe,
+            "revenue_growth": d.fundamental.revenue_growth,
+            "profit_growth": d.fundamental.profit_growth,
+            "market_cap": d.fundamental.market_cap,
+            "dividend_yield": d.fundamental.dividend_yield,
+            "debt_ratio": d.fundamental.debt_ratio,
+            "gross_margin": d.fundamental.gross_margin,
+            "net_margin": d.fundamental.net_margin,
+            "data_available": d.fundamental.data_available,
+        },
+        "capital": {
+            "score": d.capital.score,
+            "rating": d.capital.rating,
+            "main_force_direction": d.capital.main_force_direction,
+            "main_force_5d_net": d.capital.main_force_5d_net,
+            "turnover_rate": d.capital.turnover_rate,
+            "volume_ratio": d.capital.volume_ratio,
+            "data_available": d.capital.data_available,
+        },
+        "market": {
+            "score": d.market.score,
+            "rating": d.market.rating,
+            "sector_name": d.market.sector_name,
+            "sector_rank": d.market.sector_rank,
+            "sector_pct": d.market.sector_pct,
+            "market_trend": d.market.market_trend,
+            "market_sentiment": d.market.market_sentiment,
+            "limit_status": d.market.limit_status,
+        },
+        "composite_score": d.composite_score,
+        "composite_rating": d.composite_rating,
+        "recommendation": d.recommendation,
+        "risk_level": d.risk_level,
+        "summary": d.summary,
+        "detail_scores": d.detail_scores,
+        "data_quality": d.data_quality,
+        "strategy_diagnoses": [
+            {
+                "name": s.name,
+                "key": s.key,
+                "score": s.score,
+                "signal": s.signal,
+                "rating": s.rating,
+                "match_count": s.match_count,
+                "total_conditions": s.total_conditions,
+                "reasons": s.reasons,
+                "warnings": s.warnings,
+            }
+            for s in (d.strategy_diagnoses or [])
+        ],
+    }
+
+
 def _list_summary_files() -> List[str]:
     """列出所有收盘总结文件，按日期排序"""
     pattern = os.path.join(LIVE_LOG_DIR, "summary_*.json")
@@ -70,7 +188,14 @@ def _list_summary_files() -> List[str]:
 
 
 def _inject_pool_gains(items: List[dict]) -> List[dict]:
-    """为股票池数据注入累计涨幅、当日涨幅、最大涨幅、层级"""
+    """为股票池数据注入累计涨幅、当日涨幅、最大涨幅、层级
+    
+    VPN 兼容：每只股票的 K 线获取有超时保护（{_WEB_KLINE_FETCH_TIMEOUT}s），
+    单只超时则跳过继续处理下一只，确保整体 API 在 {_WEB_POOL_INJECT_MAX_TIME}s 内返回。
+    """.format(
+        _WEB_KLINE_FETCH_TIMEOUT=_WEB_KLINE_FETCH_TIMEOUT,
+        _WEB_POOL_INJECT_MAX_TIME=_WEB_POOL_INJECT_MAX_TIME,
+    )
     from .data_manager import DataFetcher
     if not items:
         return items
@@ -79,7 +204,15 @@ def _inject_pool_gains(items: List[dict]) -> List[dict]:
     col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
                "最低": "low", "成交量": "volume", "涨跌幅": "pct_change"}
 
+    deadline = _time.time() + _WEB_POOL_INJECT_MAX_TIME
+
     for item in items:
+        # 总时间超限则立即返回（剩余股票保留原始数据）
+        if _time.time() > deadline:
+            logger.warning(f"股票池涨幅注入超总时限({_WEB_POOL_INJECT_MAX_TIME}s)，"
+                           f"已处理{items.index(item)}/{len(items)}只，剩余跳过")
+            break
+
         code = item.get("code", "")
         entry_price = item.get("entry_price", 0) or 0
 
@@ -88,8 +221,20 @@ def _inject_pool_gains(items: List[dict]) -> List[dict]:
         score = item.get("score", 0) or 0
 
         try:
-            df = fetcher.fetch_daily_kline(str(code), start_date="20240101")
-            if df.empty or len(df) < 1:
+            # 带超时的 K 线获取（线程隔离，VPN 下不会无限挂起）
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    fetcher.fetch_daily_kline, str(code), start_date="20240101"
+                )
+                try:
+                    df = future.result(timeout=_WEB_KLINE_FETCH_TIMEOUT)
+                except FutureTimeoutError:
+                    logger.warning(f"获取 {code} K线数据超时({_WEB_KLINE_FETCH_TIMEOUT}s)，跳过")
+                    _set_default_gains(item)
+                    item["tier"] = tier or _score_to_tier(score)
+                    continue
+
+            if df is None or df.empty or len(df) < 1:
                 _set_default_gains(item)
                 item["tier"] = tier or _score_to_tier(score)
                 continue
@@ -533,10 +678,160 @@ def create_app() -> FastAPI:
             "limit_stats": data.get("limit_stats", {}),
         }
 
+    # ── API: 运维监控 ─────────────────────────────
+
+    @app.get("/api/ops/overview")
+    async def get_ops_overview():
+        """获取运维面板完整数据（系统+引擎+策略+交易+日志+池总览）"""
+        try:
+            data = ops_collector.collect_all(include_pool_signals=True)
+            return {"success": True, **data}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/ops/health")
+    async def get_ops_health():
+        """获取系统健康数据（CPU/内存/磁盘/进程）"""
+        try:
+            monitor = SystemMonitor()
+            return {"success": True, "system": monitor.collect().to_dict(),
+                    "has_psutil": HAS_PSUTIL}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/ops/engine")
+    async def get_ops_engine():
+        """获取实时引擎状态"""
+        try:
+            snapshot = EngineStateReader.read(LIVE_LOG_DIR)
+            return {"success": True, "engine": snapshot.to_dict()}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/ops/strategies")
+    async def get_ops_strategies():
+        """获取各策略运行监控数据"""
+        try:
+            strategies = ops_collector._collect_strategy_monitoring(DATA_DIR, LIVE_LOG_DIR, DEFAULT_CAPITAL, True)
+            return {"success": True, "strategies": strategies}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/ops/operations")
+    async def get_ops_operations(limit: int = Query(50, ge=1, le=200)):
+        """获取最近的交易操作记录"""
+        try:
+            ops = ops_collector._collect_trade_operations(DATA_DIR)
+            return {"success": True, "operations": ops[:limit], "total": len(ops)}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/ops/logs")
+    async def get_ops_logs(limit: int = Query(50, ge=1, le=500)):
+        """获取引擎日志"""
+        try:
+            logs = ops_collector._collect_logs(LIVE_LOG_DIR)
+            return {"success": True, "logs": logs[-limit:], "total": len(logs)}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    # ── API: 诊股模块 ─────────────────────────────
+
+    @app.get("/api/diagnose/{code}")
+    async def diagnose_stock(code: str, quick: bool = Query(False)):
+        """个股多维度综合诊断
+
+        返回技术面/基本面/资金面/市场面四维分析 + 综合评分
+        - code: 6位股票代码
+        - quick=true: 快速诊断，只做技术面+市场面
+        """
+        try:
+            if not code or len(code) < 6:
+                raise HTTPException(400, "请输入6位股票代码")
+
+            diagnoser = get_diagnoser()
+            if quick:
+                result = diagnoser.quick_diagnose(code)
+            else:
+                result = diagnoser.diagnose(code)
+
+            return {"success": True, "data": _diagnosis_to_dict(result)}
+
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/diagnose/quick/{code}")
+    async def diagnose_stock_quick(code: str):
+        """快速诊股 — 仅技术面+市场面，响应更快"""
+        return await diagnose_stock(code, quick=True)
+
+    # 诊股页面 → 重定向到仪表盘
+    @app.get("/diagnose")
+    async def diagnose_page():
+        """诊股页面已整合至仪表盘"""
+        return RedirectResponse("/")
+
+    @app.get("/api/datasource/health")
+    async def get_datasource_health():
+        """获取数据源健康状态（各数据渠道可用性）"""
+        try:
+            from .data_manager import DataFetcher
+            fetcher = DataFetcher()
+            health = fetcher.get_data_source_health()
+            return {"success": True, "data": health}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.post("/api/datasource/reset")
+    async def reset_datasource():
+        """重置不可用数据源标记，强制下次请求重新尝试所有数据源"""
+        try:
+            from .data_manager import DataFetcher
+            fetcher = DataFetcher()
+            fetcher.reset_unavailable_sources()
+            return {"success": True, "message": "不可用数据源标记已重置，下次请求将重新尝试"}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
     return app
 
 
 # ─── 启动入口 ────────────────────────────────────────────────
+
+def _ensure_echarts_local():
+    """下载 ECharts 到本地 static 目录，确保不依赖外网 CDN"""
+    dest = os.path.join(STATIC_DIR, "echarts.min.js")
+    if os.path.exists(dest) and os.path.getsize(dest) > 100_000:
+        return  # 已存在且大小合理
+
+    print("[setup] 正在下载 ECharts 到本地（首次启动需要，后续直接使用本地副本）...")
+    try:
+        import urllib.request
+        # 国内 CDN 镜像（比 jsdelivr 在国内更稳定）+ 国际 CDN 回落
+        urls = [
+            "https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js",
+            "https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js",
+        ]
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                    if len(data) > 100_000:
+                        with open(dest, "wb") as f:
+                            f.write(data)
+                        print(f"[setup] ECharts 已下载到本地: {dest} ({len(data):,} bytes)")
+                        return
+            except Exception as e:
+                print(f"[setup] 尝试 {url[:50]}... 失败: {e}")
+                continue
+        print("[setup] ⚠ ECharts 下载失败，将回退到 CDN 加载")
+    except Exception as e:
+        print(f"[setup] ⚠ ECharts 下载异常: {e}，将回退到 CDN 加载")
+
+
 
 def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = False):
     """启动仪表盘 Web 服务"""
@@ -547,6 +842,7 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = Fals
 
     # 确保 static 文件和 dashboard.html 存在
     os.makedirs(STATIC_DIR, exist_ok=True)
+    _ensure_echarts_local()
     _ensure_dashboard_html()
 
     print(f"""
@@ -555,9 +851,10 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = Fals
 ║    数据驱动仪表盘                              ║
 ╚══════════════════════════════════════════════╝
 
-  仪表盘地址: http://{host}:{port}
-  API 文档:   http://{host}:{port}/docs
+  仪表盘地址: http://0.0.0.0:{port}
+  API 文档:   http://0.0.0.0:{port}/docs
 
+  提示: 也可使用 http://localhost:{port} 。VPN 环境下若 localhost 不可用，请用 0.0.0.0
   按 Ctrl+C 停止服务
 """)
 
@@ -580,7 +877,11 @@ def _build_dashboard_html() -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CloudKnight 仪表盘</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script src="/static/echarts.min.js" onerror="
+  var s=document.createElement('script');
+  s.src='https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js';
+  document.head.appendChild(s);
+"></script>
 <style>
 :root {
   --bg: #0f1923;
@@ -756,6 +1057,108 @@ body {
 
 .loading { text-align:center; padding:40px; color:var(--text-dim); }
 .empty { text-align:center; padding:30px; color:var(--text-dim); font-size:13px; }
+
+/* ═══ 个股诊断 ═══ */
+.score-color-strong{color:#4caf50}.score-color-good{color:#8bc34a}.score-color-neutral{color:#ffc107}.score-color-warn{color:#ff9800}.score-color-danger{color:#f44336}
+.score-gauge{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:24px;margin-bottom:24px;display:grid;grid-template-columns:1fr 3fr;gap:24px;align-items:center}
+.score-circle{text-align:center}
+.score-big{font-size:72px;font-weight:700;line-height:1}
+.score-label{font-size:16px;color:var(--text-dim);margin-top:8px}
+.score-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px}
+.score-item{text-align:center;padding:12px;background:#152535;border-radius:8px}
+.score-item .dim-label{font-size:13px;color:var(--text-dim);margin-bottom:4px}
+.score-item .val{font-size:22px;font-weight:600}
+.diag-panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:20px;overflow:hidden}
+.diag-panel-header{background:#152535;padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.diag-panel-header h3{font-size:16px;color:var(--text)}
+.diag-panel-header .badge{font-size:12px;padding:3px 10px;border-radius:10px;font-weight:500}
+.badge-bullish{background:rgba(76,175,80,.15);color:#4caf50}.badge-bearish{background:rgba(244,67,54,.15);color:#f44336}.badge-neutral{background:rgba(255,193,7,.15);color:#ffc107}
+.diag-panel-body{padding:20px}
+.diag-table{width:100%;border-collapse:collapse}
+.diag-table td{padding:8px 12px;border-bottom:1px solid #1a2e40;font-size:14px}
+.diag-table td:first-child{color:var(--text-dim);width:130px}
+.diag-table td:last-child{color:var(--text)}
+.recommendation-box{background:linear-gradient(135deg,#1a3a2a 0%,var(--panel) 100%);border:1px solid #2a5a3a;border-radius:10px;padding:20px 24px;margin-bottom:20px}
+.recommendation-box h3{font-size:16px;color:#4caf50;margin-bottom:8px}
+.recommendation-box p{font-size:14px;color:#a0c8a0;line-height:1.8}
+.risk-tag{padding:3px 12px;border-radius:10px;font-size:12px;font-weight:500;margin-left:6px}
+.risk-low{background:rgba(76,175,80,.15);color:#4caf50}.risk-mid{background:rgba(255,193,7,.15);color:#ffc107}.risk-high{background:rgba(255,152,0,.15);color:#ff9800}.risk-extreme{background:rgba(244,67,54,.15);color:#f44336}
+.diag-loading{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,25,35,.7);z-index:999;align-items:center;justify-content:center}
+.diag-loading.active{display:flex}
+.diag-spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:diag-spin .8s linear infinite}
+@keyframes diag-spin{to{transform:rotate(360deg)}}
+.diag-error{background:rgba(244,67,54,.1);border:1px solid rgba(244,67,54,.3);border-radius:8px;padding:16px;color:#ef9a9a;font-size:14px;text-align:center;display:none;margin-bottom:16px}
+.diag-error.show{display:block}
+.diag-state{text-align:center;padding:40px 0;color:var(--text-dim)}
+.diag-state .icon{font-size:64px;margin-bottom:16px;opacity:.6}
+.diag-state .text{font-size:16px;color:var(--text-dim)}
+.diag-search{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.diag-search input{width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel);color:var(--text);font-size:14px;outline:none}
+.diag-search input:focus{border-color:var(--accent)}
+.diag-search .btn{padding:8px 18px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;transition:all .2s}
+.diag-search .btn-primary{background:var(--accent);color:#fff}
+.diag-search .btn-primary:hover{background:#2980b9}
+.diag-search .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text-dim)}
+.diag-search .btn-outline:hover{border-color:var(--accent);color:var(--accent)}
+@media(max-width:768px){.score-gauge{grid-template-columns:1fr;text-align:center}.score-details{grid-template-columns:repeat(2,1fr)}}
+.strategy-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:20px}
+.strategy-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px}
+.strategy-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.strategy-card-header h4{font-size:15px;color:var(--text);display:flex;align-items:center;gap:6px}
+.strategy-score-badge{font-size:22px;font-weight:700;padding:4px 10px;border-radius:6px;min-width:48px;text-align:center}
+.stg-sig-buy{background:rgba(76,175,80,.12);color:#4caf50;border:1px solid rgba(76,175,80,.25)}
+.stg-sig-hold{background:rgba(255,193,7,.1);color:#ffc107;border:1px solid rgba(255,193,7,.2)}
+.stg-sig-sell{background:rgba(244,67,54,.1);color:#f44336;border:1px solid rgba(244,67,54,.2)}
+.strategy-card .stg-rating{font-size:13px;color:var(--text-dim);margin-bottom:10px}
+.strategy-card .stg-reasons{list-style:none;padding:0;margin:0}
+.strategy-card .stg-reasons li{font-size:13px;padding:3px 0;color:#9acd9a;display:flex;align-items:center;gap:5px}
+.strategy-card .stg-warnings{list-style:none;padding:0;margin:8px 0 0 0}
+.strategy-card .stg-warnings li{font-size:12px;padding:2px 0;color:#d4a76a;display:flex;align-items:center;gap:5px}
+.strategy-card .stg-match-bar{height:4px;background:#1a2e40;border-radius:2px;margin-top:10px;overflow:hidden}
+.strategy-card .stg-match-fill{height:100%;border-radius:2px;transition:width .5s}
+.stg-match-strong{background:#4caf50}.stg-match-good{background:#8bc34a}.stg-match-neutral{background:#ffc107}.stg-match-low{background:#f44336}
+.data-quality-tag{font-size:12px;padding:2px 10px;border-radius:10px;margin-left:8px}
+.dq-complete{background:rgba(76,175,80,.15);color:#4caf50}
+.dq-partial{background:rgba(255,193,7,.15);color:#ffc107}
+.dq-sparse{background:rgba(244,67,54,.15);color:#f44336}
+
+/* Ops Dashboard */
+.ops-strategy-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+@media (max-width:1200px) { .ops-strategy-grid { grid-template-columns:repeat(2,1fr); } }
+@media (max-width:700px) { .ops-strategy-grid { grid-template-columns:1fr; } }
+.ops-strategy-card {
+  background:var(--panel); border:1px solid var(--border); border-radius:8px;
+  padding:14px; min-width:0;
+}
+.ops-strategy-card .card-header {
+  display:flex; align-items:center; gap:8px; margin-bottom:10px;
+  padding-bottom:8px; border-bottom:1px solid var(--border);
+}
+.ops-strategy-card .card-header .icon { font-size:20px; }
+.ops-strategy-card .card-header .name { font-weight:700; font-size:14px; color:#fff; }
+.ops-strategy-card .card-header .badge { font-size:10px; padding:1px 8px; border-radius:10px; }
+.ops-strategy-card .metric-row {
+  display:flex; justify-content:space-between; padding:3px 0;
+  font-size:12px; color:var(--text-dim);
+}
+.ops-strategy-card .metric-row .val { font-weight:600; color:var(--text); }
+.ops-strategy-card .signal-item {
+  font-size:11px; padding:2px 0; display:flex; align-items:center; gap:6px;
+  border-top:1px solid rgba(255,255,255,0.03);
+}
+.ops-signal-dot {
+  width:6px; height:6px; border-radius:50%; flex-shrink:0;
+}
+.ops-engine-indicator {
+  display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px;
+  animation:pulse 2s infinite;
+}
+.ops-engine-indicator.running { background:#27ae60; }
+.ops-engine-indicator.stopped { background:#e74c3c; }
+.ops-engine-indicator.paused { background:#f39c12; }
+@keyframes pulse {
+  0%,100% { opacity:1; } 50% { opacity:0.4; }
+}
 </style>
 </head>
 <body>
@@ -774,6 +1177,8 @@ body {
   <button data-tab="pools">股票池</button>
   <button data-tab="trades">交割单</button>
   <button data-tab="summary">收盘总结</button>
+  <button data-tab="ops">运维监控</button>
+  <button data-tab="diagnose">个股诊断</button>
 </div>
 
 <div class="content">
@@ -912,6 +1317,95 @@ body {
       <div class="chart-box"><div class="chart-title">牛熊研判 & 次日计划</div><div id="summary-advice" style="padding:8px 0;color:var(--text-dim)"></div></div>
     </div>
   </div>
+  <!-- ═══ 运维监控 ═══ -->
+  <div class="tab-panel" id="tab-ops">
+    <!-- 系统健康 -->
+    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">🖥️ 系统健康 <span style="color:var(--text-dim);font-size:11px;margin-left:8px;" id="ops-health-time"></span></div>
+      <div class="card-row" id="ops-health-cards"></div>
+    </div>
+
+    <!-- 引擎状态 + 关键指标 -->
+    <div class="card-row" id="ops-engine-status"></div>
+
+    <!-- 策略运行监控 (4列) -->
+    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">📊 策略运行监控</div>
+      <div class="ops-strategy-grid" id="ops-strategies"></div>
+    </div>
+
+    <!-- 交易操作记录 -->
+    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">📋 交易操作记录 <span id="ops-ops-total" style="color:var(--text-dim);font-size:11px;margin-left:8px;"></span></div>
+      <div style="margin-bottom:8px;display:flex;gap:6px;align-items:center;" id="ops-ops-filter">
+        <span style="color:var(--text-dim);font-size:11px;">筛选:</span>
+        <button class="ops-filter-btn active" data-action="" style="background:var(--accent);color:#fff;border:1px solid var(--border);padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;">全部</button>
+        <button class="ops-filter-btn" data-action="buy" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;">🟢 建仓</button>
+        <button class="ops-filter-btn" data-action="add" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;">➕ 加仓</button>
+        <button class="ops-filter-btn" data-action="sell" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;">🔴 卖出</button>
+        <button class="ops-filter-btn" data-action="stop_loss" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;">⛔ 止损</button>
+        <button class="ops-filter-btn" data-action="take_profit" style="background:var(--panel);color:var(--text-dim);border:1px solid var(--border);padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;">✅ 止盈</button>
+      </div>
+      <div class="table-wrap"><table id="table-ops"><thead><tr><th>时间</th><th>策略</th><th>操作</th><th>代码</th><th>名称</th><th>价格</th><th>数量</th><th>金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <!-- 引擎日志 -->
+    <div class="chart-box"><div class="chart-title">📝 引擎日志 <span id="ops-log-total" style="color:var(--text-dim);font-size:11px;margin-left:8px;"></span></div>
+      <div class="table-wrap" style="max-height:300px;overflow-y:auto;"><table id="table-ops-logs"><thead><tr><th>时间</th><th>阶段</th><th>事件</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </div>
+  <!-- ═══ 个股诊断 ═══ -->
+  <div class="tab-panel" id="tab-diagnose">
+    <div class="diag-search">
+      <input type="text" id="diagCode" placeholder="输入股票代码 如 000001" maxlength="6" autocomplete="off">
+      <button class="btn btn-primary" onclick="doDiagnose(false)">全面诊断</button>
+      <button class="btn btn-outline" onclick="doDiagnose(true)">快速诊断</button>
+      <span style="font-size:12px;color:var(--text-dim)">提示：快速诊断仅做技术面+市场面，响应更快</span>
+    </div>
+    <div class="diag-error" id="diagError"></div>
+    <div class="diag-state" id="diagInit">
+      <div class="icon">🔍</div>
+      <div class="text">输入 6 位股票代码，点击"全面诊断"查看个股综合评估报告</div>
+    </div>
+    <div id="diagResult" style="display:none">
+      <div class="card-row" id="diagOverviewCards"></div>
+      <div class="score-gauge">
+        <div class="score-circle">
+          <div class="score-big" id="diagScore">--</div>
+          <div class="score-label" id="diagRating">--</div>
+        </div>
+        <div class="score-details" id="diagScoreDetails"></div>
+      </div>
+      <div class="recommendation-box">
+        <h3>📋 综合建议 <span class="risk-tag" id="diagRisk">--</span></h3>
+        <p id="diagRecommendation">--</p>
+        <p style="margin-top:8px;font-size:13px;color:#7ca87c" id="diagSummary"></p>
+      </div>
+      <div class="diag-panel" id="diagTechPanel">
+        <div class="diag-panel-header"><h3>📊 技术面分析</h3><span class="badge" id="diagTechBadge">--</span></div>
+        <div class="diag-panel-body">
+          <div class="chart-box" style="margin-bottom:16px"><div class="chart h300" id="chart-diag-tech"></div></div>
+          <table class="diag-table" id="diagTechTable"></table>
+        </div>
+      </div>
+      <div class="diag-panel">
+        <div class="diag-panel-header"><h3>🏢 基本面分析</h3><span class="badge" id="diagFundBadge">--</span></div>
+        <div class="diag-panel-body"><table class="diag-table" id="diagFundTable"></table></div>
+      </div>
+      <div class="diag-panel">
+        <div class="diag-panel-header"><h3>💰 资金面分析</h3><span class="badge" id="diagCapBadge">--</span></div>
+        <div class="diag-panel-body"><table class="diag-table" id="diagCapTable"></table></div>
+      </div>
+      <div class="diag-panel">
+        <div class="diag-panel-header"><h3>🌐 市场环境</h3><span class="badge" id="diagMktBadge">--</span></div>
+        <div class="diag-panel-body"><table class="diag-table" id="diagMktTable"></table></div>
+      </div>
+      <div class="diag-panel">
+        <div class="diag-panel-header"><h3>🎯 策略匹配诊断 <span class="data-quality-tag" id="diagDataQuality">--</span></h3></div>
+        <div class="diag-panel-body">
+          <div class="strategy-grid" id="diagStrategyGrid"></div>
+        </div>
+      </div>
+    </div>
+    <div class="diag-loading" id="diagLoading"><div class="diag-spinner"></div></div>
+  </div>
 </div>
 
 <script>
@@ -949,6 +1443,7 @@ function loadTab(name) {
     overview: loadOverview, race: loadRace,
     positions: loadPositions, pools: loadPools,
     trades: loadTrades, summary: loadSummary,
+    ops: loadOps, diagnose: loadDiagnose,
   };
   if (loaders[name]) loaders[name]();
 }
@@ -1607,6 +2102,453 @@ function renderZtTable(allStocks) {
       <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;" title="${s.reason||''}">${s.reason||'-'}</td>
     </tr>`;
   }).join('');
+}
+
+// ═══ 7. 运维监控 ═══════════════════════════════════════════
+let opsData = null;
+let opsRefreshTimer = null;
+async function loadOps() {
+  opsData = await API('/ops/overview');
+  if (!opsData || !opsData.success) {
+    $('#tab-ops').innerHTML = '<div class="loading">运维数据加载失败</div>'; return;
+  }
+  renderOps();
+  // 每30秒自动刷新
+  if (opsRefreshTimer) clearInterval(opsRefreshTimer);
+  opsRefreshTimer = setInterval(async () => {
+    if (!$('#tab-ops')?.classList?.contains('active')) return;
+    opsData = await API('/ops/overview');
+    if (opsData && opsData.success) renderOps();
+  }, 30000);
+}
+
+function renderOps() {
+  renderOpsHealth(opsData.system);
+  renderOpsEngine(opsData.engine);
+  renderOpsStrategies(opsData.strategies);
+  renderOpsOperations(opsData.operations);
+  renderOpsLogs(opsData.logs);
+}
+
+// ── 系统健康 ──
+function renderOpsHealth(sys) {
+  $('#ops-health-time').textContent = `采集时间: ${new Date().toLocaleTimeString()}`;
+  const getColor = (val, warn, crit) => val >= crit ? 'var(--red)' : val >= warn ? 'var(--orange)' : 'var(--green)';
+  const cards = [
+    { label:'CPU使用率', val:sys.cpu_percent+'%', color:getColor(sys.cpu_percent,60,85), sub:`${sys.cpu_count}核` },
+    { label:'内存占用', val:sys.memory_percent+'%', color:getColor(sys.memory_percent,70,90), sub:`${sys.memory_used_mb.toFixed(0)}/${sys.memory_total_mb.toFixed(0)} MB` },
+    { label:'磁盘空间', val:sys.disk_percent+'%', color:getColor(sys.disk_percent,70,90), sub:`剩余 ${sys.disk_free_gb.toFixed(1)} GB` },
+    { label:'进程内存', val:sys.process_memory_mb.toFixed(0)+' MB', color:sys.process_memory_mb>500?'var(--orange)':'var(--green)', sub:`PID ${sys.process_pid} | ${sys.process_threads}线程` },
+    { label:'运行时间', val:sys.uptime_str||'--', color:'var(--accent)', sub:`Python ${sys.python_version}` },
+  ];
+  $('#ops-health-cards').innerHTML = cards.map(c => `
+    <div class="card" style="border-left:3px solid ${c.color};">
+      <div class="card-label">${c.label}</div>
+      <div class="card-value" style="color:${c.color};font-size:20px;">${c.val}</div>
+      <div class="card-sub" style="color:var(--text-dim);font-size:11px;">${c.sub}</div>
+    </div>
+  `).join('');
+}
+
+// ── 引擎状态 ──
+function renderOpsEngine(eng) {
+  const stateColors = { running:'#27ae60', stopped:'#e74c3c', paused:'#f39c12', starting:'#f39c12', stopping:'#e74c3c' };
+  const stateLabels = { running:'运行中', stopped:'已停止', paused:'已暂停', starting:'启动中', stopping:'停止中' };
+  const sc = stateColors[eng.state]||'var(--text-dim)';
+  const sl = stateLabels[eng.state]||eng.state;
+
+  let html = `<div class="card" style="border-left:3px solid ${sc};flex:2;min-width:280px;">
+    <div class="card-label">⚙️ 引擎状态</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+      <span class="ops-engine-indicator ${eng.state==='running'?'running':eng.state==='paused'?'paused':'stopped'}"></span>
+      <span style="font-weight:700;font-size:16px;color:${sc};">${sl}</span>
+      ${eng.available ? '' : '<span style="font-size:10px;color:var(--text-dim);">(离线/未启动)</span>'}
+    </div>
+    <div class="card-sub" style="margin-top:4px;color:var(--text-dim);">阶段: ${eng.phase_label||'--'} | 交易日: ${eng.is_trading_day?'是':'否'}</div>
+  </div>`;
+
+  const metrics = [
+    { label:'信号总数', val:eng.signal_count },
+    { label:'今日决策', val:eng.decision_count },
+    { label:'日志条数', val:eng.log_count },
+    { label:'上次扫描', val:eng.last_scan_time||'--' },
+  ];
+  html += metrics.map(m => `
+    <div class="card" style="flex:1;min-width:100px;">
+      <div class="card-label">${m.label}</div>
+      <div class="card-value" style="font-size:18px;">${m.val}</div>
+    </div>
+  `).join('');
+
+  $('#ops-engine-status').innerHTML = html;
+}
+
+// ── 策略监控 ──
+function renderOpsStrategies(strategies) {
+  if (!strategies || !strategies.length) {
+    $('#ops-strategies').innerHTML = '<div class="empty">暂无策略运行数据</div>'; return;
+  }
+  const icons = { dragon_head:'🐉', sparrow:'🐦', turtle:'🐢', value_invest:'📈' };
+  const colors = { dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db' };
+
+  $('#ops-strategies').innerHTML = strategies.map(s => {
+    const icon = icons[s.key]||'📊';
+    const color = colors[s.key]||'var(--accent)';
+    const tierColors = { focus:'#e74c3c', watch:'#f1c40f', broad:'#3498db' };
+    const tiers = s.pool_tiers||{};
+    const sigActive = s.signal_count > 0;
+    const sigHtml = sigActive
+      ? `<div style="color:var(--green);font-size:11px;">🟢 信号活跃</div>`
+      : `<div style="color:var(--text-dim);font-size:11px;">⏸ 暂无信号</div>`;
+
+    // 信号标签
+    let signalsHtml = '';
+    if (s.latest_signals && s.latest_signals.length) {
+      signalsHtml = '<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px;">' +
+        s.latest_signals.slice(0,3).map(sig => {
+          const typeIcon = sig.type==='buy'?'🟢':sig.type==='sell'?'🔴':sig.type==='add'?'➕':sig.type==='reduce'?'➖':sig.type==='close'?'⏹':'👁';
+          return `<div class="signal-item">
+            <span class="ops-signal-dot" style="background:${sig.type==='buy'?'#27ae60':'#e74c3c'}"></span>
+            <span style="font-weight:600;">${sig.code} ${sig.name||''}</span>
+            <span style="color:var(--text-dim);">${typeIcon} ¥${(sig.price||0).toFixed(2)}</span>
+            <span style="color:var(--text-dim);font-size:10px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${sig.reason||''}">${sig.reason||''}</span>
+          </div>`;
+        }).join('') + '</div>';
+    }
+
+    return `
+    <div class="ops-strategy-card" style="border-top:3px solid ${color};">
+      <div class="card-header">
+        <span class="icon">${icon}</span>
+        <span class="name">${s.label}</span>
+        <span class="badge" style="background:rgba(255,255,255,0.08);color:var(--text-dim);">${s.maintenance_interval_days}天/维护</span>
+      </div>
+      <div class="metric-row"><span>买/卖信号</span><span class="val"><span style="color:var(--green)">${s.buy_count}</span>/<span style="color:var(--red)">${s.sell_count}</span></span></div>
+      <div class="metric-row"><span>扫描耗时</span><span class="val">${s.last_scan_duration||0}秒</span></div>
+      <div class="metric-row"><span>池内标的</span><span class="val">🎯${tiers.focus||0} 👀${tiers.watch||0} 📋${tiers.broad||0}</span></div>
+      <div class="metric-row"><span>总权益</span><span class="val" style="color:${(s.return_pct||0)>=0?'var(--green)':'var(--red)'}">¥${(s.equity||0).toLocaleString('zh-CN',{maximumFractionDigits:0})}</span></div>
+      <div class="metric-row"><span>收益率</span><span class="val" style="color:${(s.return_pct||0)>=0?'var(--green)':'var(--red)'}">${(s.return_pct||0)>=0?'+':''}${(s.return_pct||0).toFixed(2)}%</span></div>
+      <div class="metric-row"><span>持仓/交易</span><span class="val">${s.position_count}只 / ${s.trade_count}笔</span></div>
+      <div class="metric-row"><span>最大回撤</span><span class="val" style="color:var(--red)">${(s.max_drawdown||0).toFixed(2)}%</span></div>
+      ${sigActive ? sigHtml : ''}
+      ${signalsHtml}
+    </div>`;
+  }).join('');
+}
+
+// ── 交易操作 ──
+let opsFilterAction = '';
+function renderOpsOperations(operations) {
+  let ops = operations || [];
+  $('#ops-ops-total').textContent = `共 ${ops.length} 条记录`;
+
+  // 筛选按钮事件
+  document.querySelectorAll('.ops-filter-btn').forEach(b => b.addEventListener('click', function() {
+    opsFilterAction = this.dataset.action;
+    document.querySelectorAll('.ops-filter-btn').forEach(b => { b.classList.remove('active'); b.style.background='var(--panel)'; b.style.color='var(--text-dim)'; });
+    this.classList.add('active'); this.style.background='var(--accent)'; this.style.color='#fff';
+    renderOpsOperations(opsData?.operations || []);
+  }));
+
+  if (opsFilterAction) {
+    ops = ops.filter(o => o.action_type === opsFilterAction);
+  }
+
+  if (!ops.length) {
+    $('#table-ops tbody').innerHTML = '<tr><td colspan="10" class="empty">暂无交易操作记录</td></tr>'; return;
+  }
+
+  const actionBadge = (a, t) => {
+    const map = {
+      buy: { icon:'🟢', label:'建仓', color:'#27ae60' },
+      add: { icon:'➕', label:'加仓', color:'#3498db' },
+      sell: { icon:'🔴', label:'卖出', color:'#e74c3c' },
+      reduce: { icon:'➖', label:'减持', color:'#e67e22' },
+      close: { icon:'⏹', label:'平仓', color:'#95a5a6' },
+      stop_loss: { icon:'⛔', label:'止损', color:'#c0392b' },
+      take_profit: { icon:'✅', label:'止盈', color:'#27ae60' },
+    };
+    const m = map[t] || { icon:'📌', label:a||'--', color:'var(--text-dim)' };
+    return `<span style="color:${m.color};font-weight:600;">${m.icon} ${m.label}</span>`;
+  };
+
+  $('#table-ops tbody').innerHTML = ops.map(o => {
+    const pnlStr = (o.pnl||0) !== 0
+      ? `<span class="${(o.pnl||0)>=0?'pnl-pos':'pnl-neg'}">${(o.pnl||0)>=0?'+':''}${(o.pnl||0).toFixed(2)}</span>`
+      : '<span style="color:var(--text-dim)">--</span>';
+    return `
+    <tr>
+      <td style="color:var(--text-dim);font-size:11px;">${o.date||o.time||'--'}</td>
+      <td>${o.strategy||'--'}</td>
+      <td>${actionBadge(o.action, o.action_type)}</td>
+      <td style="font-weight:600;">${o.code||'--'}</td>
+      <td>${o.name||''}</td>
+      <td>¥${(o.price||0).toFixed(2)}</td>
+      <td>${o.volume||0}</td>
+      <td>¥${(o.amount||0).toFixed(0)}</td>
+      <td>${pnlStr}</td>
+      <td style="color:var(--text-dim);font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${o.reason||''}">${o.reason||'--'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── 引擎日志 ──
+function renderOpsLogs(logs) {
+  const items = logs || [];
+  $('#ops-log-total').textContent = `最近 ${items.length} 条`;
+  if (!items.length) {
+    $('#table-ops-logs tbody').innerHTML = '<tr><td colspan="3" class="empty">暂无引擎日志</td></tr>'; return;
+  }
+  const phaseLabels = {
+    closed:'非交易', pre_market:'盘前', auction:'竞价', auction_result:'竞价结果',
+    morning:'早盘', lunch:'午休', afternoon:'午盘', post_market:'收盘',
+  };
+  const phaseBadge = (p) => {
+    const label = phaseLabels[p] || p;
+    return `<span style="background:rgba(52,152,219,0.15);color:var(--accent);padding:0 6px;border-radius:3px;font-size:10px;">${label}</span>`;
+  };
+
+  $('#table-ops-logs tbody').innerHTML = items.map(l => `
+    <tr>
+      <td style="color:var(--text-dim);font-size:11px;white-space:nowrap;">${l.time||'--'}</td>
+      <td>${phaseBadge(l.phase)}</td>
+      <td style="font-size:12px;">${l.event||l.detail||'--'}</td>
+    </tr>
+  `).join('');
+}
+
+// ═══ 8. 个股诊断 ═════════════════════════════════════════════
+function loadDiagnose() {
+  const input = document.getElementById('diagCode');
+  if (input) input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') doDiagnose(false);
+  });
+}
+
+function doDiagnose(quick) {
+  const code = (document.getElementById('diagCode')?.value || '').trim();
+  if (!code || code.length !== 6 || !/^\\d{6}$/.test(code)) {
+    showDiagError('请输入6位数字股票代码');
+    return;
+  }
+  document.getElementById('diagResult').style.display = 'none';
+  document.getElementById('diagInit').style.display = 'none';
+  document.getElementById('diagError').classList.remove('show');
+  document.getElementById('diagLoading').style.display = 'flex';
+
+  const url = quick ? '/api/diagnose/quick/' + code : '/api/diagnose/' + code;
+  fetch(url)
+    .then(r => r.json())
+    .then(resp => {
+      document.getElementById('diagLoading').style.display = 'none';
+      if (!resp.success) { showDiagError(resp.error || '诊断失败'); return; }
+      renderDiagResult(resp.data);
+    })
+    .catch(e => {
+      document.getElementById('diagLoading').style.display = 'none';
+      showDiagError('网络请求失败: ' + e.message);
+    });
+}
+
+function showDiagError(msg) {
+  const box = document.getElementById('diagError');
+  box.textContent = '\u26a0 ' + msg;
+  box.classList.add('show');
+}
+
+function diagScoreColor(s) {
+  if (s >= 80) return 'score-color-strong';
+  if (s >= 65) return 'score-color-good';
+  if (s >= 50) return 'score-color-neutral';
+  if (s >= 35) return 'score-color-warn';
+  return 'score-color-danger';
+}
+
+function diagScoreEmoji(s) {
+  if (s >= 80) return '🟢';
+  if (s >= 65) return '🟡';
+  if (s >= 50) return '🟠';
+  if (s >= 35) return '🟤';
+  return '🔴';
+}
+
+function diagRiskClass(r) {
+  if (r === '\u4f4e') return 'risk-low';
+  if (r === '\u4e2d') return 'risk-mid';
+  if (r === '\u9ad8') return 'risk-high';
+  return 'risk-extreme';
+}
+
+function diagFmtVal(v, suffix) {
+  if (v == null || v === undefined) return '--';
+  if (typeof v === 'number') return v.toFixed(2) + (suffix || '');
+  return v + (suffix || '');
+}
+
+function diagSignalLabel(ir) {
+  if (!ir) return '--';
+  const m = {buy:'\u91d1\u53c9\u4e70\u5165 \u2705', sell:'\u6b7b\u53c9\u5356\u51fa \u26a0', hold:'\u6301\u6709 \u27f3'};
+  return (m[ir.signal] || ir.signal) + ' (' + (ir.strength||50).toFixed(0) + ')';
+}
+
+function diagTrendLabel(ir) {
+  if (!ir) return '--';
+  const m = {bullish:'\u504f\u591a', bearish:'\u504f\u7a7a', overbought:'\u8d85\u4e70', oversold:'\u8d85\u5356', neutral:'\u4e2d\u6027'};
+  return m[ir.trend] || ir.trend;
+}
+
+function diagRenderBadge(id, score, rating) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = rating + ' ' + score + '\u5206';
+  el.className = 'badge badge-' + (score>=65?'bullish':score>=50?'neutral':'bearish');
+}
+
+function renderDiagResult(d) {
+  document.getElementById('diagResult').style.display = 'block';
+  document.getElementById('diagError').classList.remove('show');
+
+  const t = d.technical, f = d.fundamental, c = d.capital, m = d.market;
+
+  document.getElementById('diagOverviewCards').innerHTML = `
+    <div class="card"><div class="card-label">${d.name} ${d.code}</div><div class="card-value" style="font-size:20px">${diagFmtVal(t.current_price)}</div><div class="card-sub">\u5f53\u524d\u4ef7\u683c</div></div>
+    <div class="card ${(t.pct_change_5d||0)>=0?'green':'red'}"><div class="card-label">5\u65e5\u6da8\u8dcc</div><div class="card-value" style="font-size:22px">${fmtPct(t.pct_change_5d)}</div></div>
+    <div class="card ${(t.pct_change_20d||0)>=0?'green':'red'}"><div class="card-label">20\u65e5\u6da8\u8dcc</div><div class="card-value" style="font-size:22px">${fmtPct(t.pct_change_20d)}</div></div>
+    <div class="card"><div class="card-label">\u8bca\u65ad\u65f6\u95f4</div><div class="card-value" style="font-size:14px">${d.timestamp||'--'}</div></div>
+  `;
+
+  const cs = d.composite_score;
+  document.getElementById('diagScore').textContent = cs;
+  document.getElementById('diagScore').className = 'score-big ' + diagScoreColor(cs);
+  document.getElementById('diagRating').textContent = diagScoreEmoji(cs) + ' ' + d.composite_rating;
+  document.getElementById('diagRisk').textContent = '\u98ce\u9669: ' + d.risk_level;
+  document.getElementById('diagRisk').className = 'risk-tag ' + diagRiskClass(d.risk_level);
+  document.getElementById('diagRecommendation').textContent = d.recommendation;
+  document.getElementById('diagSummary').textContent = d.summary;
+
+  const dims = d.detail_scores || {};
+  document.getElementById('diagScoreDetails').innerHTML = Object.entries(dims).map(([k,v]) =>
+    `<div class="score-item"><div class="dim-label">${k}</div><div class="val ${diagScoreColor(v)}">${v}\u5206</div></div>`
+  ).join('');
+
+  diagRenderBadge('diagTechBadge', t.score, t.rating);
+  document.getElementById('diagTechTable').innerHTML = `
+    <tr><td>\u5747\u7ebf\u6392\u5217</td><td>${t.ma_alignment||'--'}</td></tr>
+    <tr><td>MACD \u4fe1\u53f7</td><td>${diagSignalLabel(t.macd)}</td></tr>
+    <tr><td>KDJ \u4fe1\u53f7</td><td>${diagSignalLabel(t.kdj)}</td></tr>
+    <tr><td>RSI \u72b6\u6001</td><td>${diagTrendLabel(t.rsi)}</td></tr>
+    <tr><td>\u5e03\u6797\u5e26\u4f4d\u7f6e</td><td>${t.bollinger ? (t.bollinger.details ? (t.bollinger.details.position||'--') : '--') : '--'}</td></tr>
+    <tr><td>\u91cf\u4ef7\u5173\u7cfb</td><td>${t.volume_price ? (t.volume_price.details ? (t.volume_price.details.pattern||'--') : '--') : '--'}</td></tr>
+    <tr><td>ATR \u6ce2\u5e45</td><td>${diagFmtVal(t.atr)}</td></tr>
+    <tr><td>\u652f\u6491\u4f4d</td><td style="color:#4caf50">${diagFmtVal(t.support)}</td></tr>
+    <tr><td>\u963b\u529b\u4f4d</td><td style="color:#f44336">${diagFmtVal(t.resistance)}</td></tr>
+  `;
+
+  diagRenderBadge('diagFundBadge', f.score, f.rating);
+  document.getElementById('diagFundTable').innerHTML = f.data_available ? `
+    <tr><td>\u5e02\u76c8\u7387 (PE)</td><td>${diagFmtVal(f.pe, ' \u500d')}</td></tr>
+    <tr><td>\u5e02\u51c0\u7387 (PB)</td><td>${diagFmtVal(f.pb, ' \u500d')}</td></tr>
+    <tr><td>ROE</td><td>${fmtPct(f.roe)}</td></tr>
+    <tr><td>\u8425\u6536\u589e\u957f\u7387</td><td>${fmtPct(f.revenue_growth)}</td></tr>
+    <tr><td>\u51c0\u5229\u6da6\u589e\u957f\u7387</td><td>${fmtPct(f.profit_growth)}</td></tr>
+    <tr><td>\u603b\u5e02\u503c</td><td>${diagFmtVal(f.market_cap, ' \u4ebf')}</td></tr>
+    <tr><td>\u80a1\u606f\u7387</td><td>${fmtPct(f.dividend_yield)}</td></tr>
+    <tr><td>\u8d44\u4ea7\u8d1f\u503a\u7387</td><td>${fmtPct(f.debt_ratio)}</td></tr>
+    <tr><td>\u6bdb\u5229\u7387</td><td>${fmtPct(f.gross_margin)}</td></tr>
+    <tr><td>\u51c0\u5229\u7387</td><td>${fmtPct(f.net_margin)}</td></tr>
+  ` : `<tr><td colspan="2" style="text-align:center;color:var(--text-dim)">\u6682\u65e0\u8d22\u52a1\u6570\u636e\uff08\u975e\u8d22\u62a5\u5b63\u6216\u6570\u636e\u6e90\u4e0d\u53ef\u7528\uff09</td></tr>`;
+
+  diagRenderBadge('diagCapBadge', c.score, c.rating);
+  const mfLabel = {inflow:'主力流入 🔴', outflow:'主力流出 🟢', neutral:'中性', unknown:'--'};
+  document.getElementById('diagCapTable').innerHTML = c.data_available ? `
+    <tr><td>\u4e3b\u529b\u52a8\u5411</td><td>${mfLabel[c.main_force_direction]||'--'}</td></tr>
+    <tr><td>\u8fd15\u65e5\u4e3b\u529b\u51c0\u6d41\u5165</td><td>${diagFmtVal(c.main_force_5d_net, ' \u4ebf')}</td></tr>
+    <tr><td>\u6362\u624b\u7387</td><td>${fmtPct(c.turnover_rate)}</td></tr>
+    <tr><td>\u91cf\u6bd4</td><td>${diagFmtVal(c.volume_ratio)}</td></tr>
+  ` : `<tr><td colspan="2" style="text-align:center;color:var(--text-dim)">\u6682\u65e0\u8d44\u91d1\u6d41\u5411\u6570\u636e</td></tr>`;
+
+  diagRenderBadge('diagMktBadge', m.score, m.rating);
+  document.getElementById('diagMktTable').innerHTML = `
+    <tr><td>\u5927\u76d8\u8d8b\u52bf</td><td>${m.market_trend||'--'}</td></tr>
+    <tr><td>\u5e02\u573a\u60c5\u7eea</td><td>${m.market_sentiment||'--'}</td></tr>
+    <tr><td>\u6240\u5c5e\u677f\u5757</td><td>${m.sector_name||'--'}</td></tr>
+  `;
+
+  renderDiagTechChart(d);
+  renderDiagStrategies(d);
+  renderDiagDataQuality(d);
+  document.getElementById('tab-diagnose').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function renderDiagDataQuality(d) {
+  const el = document.getElementById('diagDataQuality');
+  if (!el) return;
+  const q = d.data_quality || '';
+  el.textContent = '\u6570\u636e: ' + q;
+  el.className = 'data-quality-tag ' + (q === '\u5b8c\u6574' ? 'dq-complete' : q === '\u90e8\u5206\u7f3a\u5931' ? 'dq-partial' : 'dq-sparse');
+}
+
+function renderDiagStrategies(d) {
+  const grid = document.getElementById('diagStrategyGrid');
+  if (!grid) return;
+  const strategies = d.strategy_diagnoses || [];
+  if (!strategies.length) { grid.innerHTML = '<div class="empty">\u7b56\u7565\u8bca\u65ad\u6570\u636e\u4e0d\u8db3</div>'; return; }
+
+  const emojiMap = {dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💰'};
+  const sigMap = {buy:'✅ 看多', hold:'⟳ 观望', sell:'⚠ 看空'};
+  const matchColorMap = [null,'stg-match-low','stg-match-low','stg-match-neutral','stg-match-good','stg-match-strong'];
+
+  grid.innerHTML = strategies.map(s => {
+    const pct = s.total_conditions > 0 ? Math.round(s.match_count / Math.max(4, s.total_conditions) * 100) : 0;
+    const matchClass = s.score >= 70 ? 'stg-match-strong' : s.score >= 55 ? 'stg-match-good' : s.score >= 40 ? 'stg-match-neutral' : 'stg-match-low';
+    const sigClass = 'stg-sig-' + s.signal;
+    return `<div class="strategy-card">
+      <div class="strategy-card-header">
+        <h4>${(emojiMap[s.key]||'')} ${s.name}</h4>
+        <span class="strategy-score-badge ${sigClass}">${s.score}</span>
+      </div>
+      <div class="stg-rating">${sigMap[s.signal]||s.signal} \u00b7 ${s.rating}</div>
+      <ul class="stg-reasons">${(s.reasons||[]).map(r => '<li>\u2714 ' + r + '</li>').join('')}</ul>
+      ${(s.warnings||[]).length ? '<ul class="stg-warnings">' + s.warnings.map(w => '<li>\u26a0 ' + w + '</li>').join('') + '</ul>' : ''}
+      <div class="stg-match-bar"><div class="stg-match-fill ${matchClass}" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join('');
+}
+
+function renderDiagTechChart(d) {
+  const dom = document.getElementById('chart-diag-tech');
+  if (!dom) return;
+  if (charts['diag-tech']) charts['diag-tech'].dispose();
+  const c = echarts.init(dom);
+  charts['diag-tech'] = c;
+
+  const cats = ['MACD','KDJ','RSI','\u5e03\u6797\u5e26','\u91cf\u4ef7','\u5747\u7ebf','\u652f\u6491\u963b\u529b'];
+  const vals = [
+    d.technical.macd ? d.technical.macd.strength : 50,
+    d.technical.kdj ? d.technical.kdj.strength : 50,
+    d.technical.rsi ? d.technical.rsi.strength : 50,
+    d.technical.bollinger ? d.technical.bollinger.strength : 50,
+    d.technical.volume_price ? d.technical.volume_price.strength : 50,
+    d.technical.score||50,
+    (d.technical.support && d.technical.resistance) ? 55 : 50,
+  ];
+
+  c.setOption({
+    tooltip: {trigger:'axis'},
+    radar: {
+      center: ['50%','55%'], radius: '65%',
+      indicator: cats.map(cat => ({name:cat, max:100})),
+      axisName: {color:'#6d8099',fontSize:11},
+      splitArea: {areaStyle:{color:['rgba(52,152,219,.02)','rgba(52,152,219,.04)']}},
+    },
+    series: [{
+      type: 'radar',
+      data: [{value:vals, name:'\u6280\u672f\u6307\u6807', areaStyle:{color:'rgba(52,152,219,.15)'}}],
+      symbol: 'circle', symbolSize: 4,
+      lineStyle: {color:'#3498db', width: 2},
+      itemStyle: {color:'#3498db'},
+    }],
+  });
 }
 
 // ═══ 启动 ═══════════════════════════════════════════════════

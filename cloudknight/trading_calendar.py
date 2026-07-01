@@ -176,8 +176,8 @@ class TradingCalendar:
         elif now >= time(15, 0):
             return TradingPhase.POST_MARKET
 
-        # 00:00-08:29，非交易日阶段
-        return TradingPhase.POST_MARKET
+        # 00:00-08:29，交易日但交易所未开盘，返回休市
+        return TradingPhase.CLOSED
 
     def time_until_next_phase(self, dt: Optional[datetime] = None) -> Optional[Tuple[TradingPhase, int]]:
         """计算距离下一阶段还有多少秒

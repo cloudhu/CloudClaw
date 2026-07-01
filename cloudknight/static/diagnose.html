@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CloudKnight 个股诊断</title>
+<script src="/static/echarts.min.js" onerror="
+ var s=document.createElement('script');
+ s.src='https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js';
+ document.head.appendChild(s);
+"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Microsoft YaHei','PingFang SC',sans-serif;background:#0f1923;color:#b7c9d9;min-height:100vh}
+.header{background:linear-gradient(135deg,#1a2a3a 0%,#0d1b2a 100%);border-bottom:1px solid #2a3f54;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.header h1{font-size:22px;color:#e8f0f8}
+.header h1 span{color:#4fc3f7;font-weight:400;font-size:14px;margin-left:10px}
+.header nav a{color:#7b93a8;text-decoration:none;margin-left:20px;font-size:14px;transition:color .2s}
+.header nav a:hover{color:#4fc3f7}
+.search-box{display:flex;gap:8px;align-items:center}
+.search-box input{width:180px;padding:8px 12px;border:1px solid #2a3f54;border-radius:6px;background:#1a2a3a;color:#e8f0f8;font-size:14px;outline:none;transition:border-color .2s}
+.search-box input:focus{border-color:#4fc3f7}
+.search-box input::placeholder{color:#556e85}
+.btn{padding:8px 18px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;transition:all .2s}
+.btn-primary{background:#2196f3;color:#fff}
+.btn-primary:hover{background:#1976d2}
+.btn-outline{background:transparent;border:1px solid #2a3f54;color:#7b93a8}
+.btn-outline:hover{border-color:#4fc3f7;color:#4fc3f7}
+.container{max-width:1200px;margin:0 auto;padding:20px 24px}
+/* 状态区 */
+.state-section{padding:40px 0;text-align:center}
+.state-icon{font-size:64px;margin-bottom:16px;opacity:.6}
+.state-text{font-size:16px;color:#5a7a96}
+/* 概览卡片 */
+.overview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}
+.overview-card{background:#1a2a3a;border:1px solid #2a3f54;border-radius:10px;padding:20px;text-align:center}
+.overview-card .label{font-size:13px;color:#5a7a96;margin-bottom:6px}
+.overview-card .value{font-size:28px;font-weight:700}
+.overview-card .sub{font-size:12px;color:#5a7a96;margin-top:4px}
+.score-color-strong{color:#4caf50}
+.score-color-good{color:#8bc34a}
+.score-color-neutral{color:#ffc107}
+.score-color-warn{color:#ff9800}
+.score-color-danger{color:#f44336}
+/* 评分仪表盘 */
+.score-gauge{background:#1a2a3a;border:1px solid #2a3f54;border-radius:10px;padding:24px;margin-bottom:24px;display:grid;grid-template-columns:1fr 3fr;gap:24px;align-items:center}
+.score-circle{text-align:center}
+.score-big{font-size:72px;font-weight:700;line-height:1}
+.score-label{font-size:16px;color:#5a7a96;margin-top:8px}
+.score-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px}
+.score-item{text-align:center;padding:12px;background:#152535;border-radius:8px}
+.score-item .dim{font-size:13px;color:#5a7a96;margin-bottom:4px}
+.score-item .val{font-size:22px;font-weight:600}
+/* 面板 */
+.panel{background:#1a2a3a;border:1px solid #2a3f54;border-radius:10px;margin-bottom:20px;overflow:hidden}
+.panel-header{background:#152535;padding:14px 20px;border-bottom:1px solid #2a3f54;display:flex;align-items:center;justify-content:space-between}
+.panel-header h3{font-size:16px;color:#e8f0f8}
+.panel-header .badge{font-size:12px;padding:3px 10px;border-radius:10px;font-weight:500}
+.badge-bullish{background:rgba(76,175,80,.15);color:#4caf50}
+.badge-bearish{background:rgba(244,67,54,.15);color:#f44336}
+.badge-neutral{background:rgba(255,193,7,.15);color:#ffc107}
+.panel-body{padding:20px}
+.chart-box{height:280px}
+/* 表格 */
+.data-table{width:100%;border-collapse:collapse}
+.data-table td{padding:8px 12px;border-bottom:1px solid #1a2e40;font-size:14px}
+.data-table td:first-child{color:#5a7a96;width:120px}
+.data-table td:last-child{color:#e8f0f8}
+/* 建议区 */
+.recommendation-box{background:linear-gradient(135deg,#1a3a2a 0%,#1a2a3a 100%);border:1px solid #2a5a3a;border-radius:10px;padding:20px 24px;margin-bottom:20px}
+.recommendation-box h3{font-size:16px;color:#4caf50;margin-bottom:8px}
+.recommendation-box p{font-size:14px;color:#a0c8a0;line-height:1.8}
+.risk-tag{padding:3px 12px;border-radius:10px;font-size:12px;font-weight:500;margin-left:6px}
+.risk-low{background:rgba(76,175,80,.15);color:#4caf50}
+.risk-mid{background:rgba(255,193,7,.15);color:#ffc107}
+.risk-high{background:rgba(255,152,0,.15);color:#ff9800}
+.risk-extreme{background:rgba(244,67,54,.15);color:#f44336}
+/* 加载遮罩 */
+.loading-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,25,35,.7);z-index:999;align-items:center;justify-content:center}
+.loading-overlay.active{display:flex}
+.spinner{width:40px;height:40px;border:3px solid #2a3f54;border-top-color:#4fc3f7;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.error-box{background:rgba(244,67,54,.1);border:1px solid rgba(244,67,54,.3);border-radius:8px;padding:16px;color:#ef9a9a;font-size:14px;text-align:center;display:none}
+.error-box.show{display:block}
+/* 响应式 */
+@media(max-width:768px){
+ .score-gauge{grid-template-columns:1fr;text-align:center}
+ .score-details{grid-template-columns:repeat(2,1fr)}
+ .header{flex-direction:column;align-items:stretch}
+ .header nav{margin-top:8px}
+}
+</style>
+</head>
+<body>
+
+<div class="loading-overlay" id="loading">
+  <div class="spinner"></div>
+</div>
+
+<div class="header">
+  <h1>🔬 个股诊断 <span>Stock Diagnosis</span></h1>
+  <nav>
+    <a href="/">返回仪表盘</a>
+    <a href="/diagnose">诊股</a>
+  </nav>
+</div>
+
+<div class="container">
+  <!-- 搜索 -->
+  <div style="padding:20px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <input type="text" id="codeInput" class="search-box" style="width:200px" placeholder="输入股票代码 如 000001" maxlength="6" autofocus>
+    <button class="btn btn-primary" onclick="doDiagnose(false)">全面诊断</button>
+    <button class="btn btn-outline" onclick="doDiagnose(true)">快速诊断</button>
+    <span style="font-size:12px;color:#5a7a96">提示：快速诊断仅做技术面+市场面，响应更快</span>
+  </div>
+  <div class="error-box" id="errorBox"></div>
+
+  <!-- 初始状态 -->
+  <div class="state-section" id="stateInit">
+    <div class="state-icon">🔍</div>
+    <div class="state-text">输入 6 位股票代码，点击"全面诊断"查看个股综合评估报告</div>
+  </div>
+
+  <!-- 诊断结果（默认隐藏） -->
+  <div id="resultArea" style="display:none">
+
+    <!-- 概览卡片 -->
+    <div class="overview-grid" id="overviewCards"></div>
+
+    <!-- 综合评分仪表盘 -->
+    <div class="score-gauge">
+      <div class="score-circle">
+        <div class="score-big" id="compositeScore">--</div>
+        <div class="score-label" id="compositeRating">--</div>
+      </div>
+      <div class="score-details" id="scoreDetails"></div>
+    </div>
+
+    <!-- 操作建议 -->
+    <div class="recommendation-box">
+      <h3>📋 综合建议 <span class="risk-tag" id="riskTag" style="margin-left:10px">--</span></h3>
+      <p id="recommendation">--</p>
+      <p style="margin-top:8px;font-size:13px;color:#7ca87c" id="summary"></p>
+    </div>
+
+    <!-- 技术面面板 -->
+    <div class="panel" id="techPanel">
+      <div class="panel-header">
+        <h3>📊 技术面分析</h3>
+        <span class="badge" id="techBadge">--</span>
+      </div>
+      <div class="panel-body">
+        <div class="chart-box" id="techChart"></div>
+        <table class="data-table" style="margin-top:16px" id="techTable"></table>
+      </div>
+    </div>
+
+    <!-- 基本面面板 -->
+    <div class="panel">
+      <div class="panel-header">
+        <h3>🏢 基本面分析</h3>
+        <span class="badge" id="fundBadge">--</span>
+      </div>
+      <div class="panel-body">
+        <table class="data-table" id="fundTable"></table>
+      </div>
+    </div>
+
+    <!-- 资金面面板 -->
+    <div class="panel">
+      <div class="panel-header">
+        <h3>💰 资金面分析</h3>
+        <span class="badge" id="capBadge">--</span>
+      </div>
+      <div class="panel-body">
+        <table class="data-table" id="capTable"></table>
+      </div>
+    </div>
+
+    <!-- 市场面面板 -->
+    <div class="panel">
+      <div class="panel-header">
+        <h3>🌐 市场环境</h3>
+        <span class="badge" id="mktBadge">--</span>
+      </div>
+      <div class="panel-body">
+        <table class="data-table" id="mktTable"></table>
+      </div>
+    </div>
+
+  </div><!-- /resultArea -->
+</div>
+
+<script>
+let techChartInst = null;
+
+function getScoreColor(s) {
+  if (s >= 80) return 'score-color-strong';
+  if (s >= 65) return 'score-color-good';
+  if (s >= 50) return 'score-color-neutral';
+  if (s >= 35) return 'score-color-warn';
+  return 'score-color-danger';
+}
+
+function getScoreEmoji(s) {
+  if (s >= 80) return '🟢';
+  if (s >= 65) return '🟡';
+  if (s >= 50) return '🟠';
+  if (s >= 35) return '🟤';
+  return '🔴';
+}
+
+function getRiskClass(r) {
+  if (r === '低') return 'risk-low';
+  if (r === '中') return 'risk-mid';
+  if (r === '高') return 'risk-high';
+  return 'risk-extreme';
+}
+
+function fmtVal(v, suffix) {
+  if (v == null || v === undefined) return '--';
+  if (typeof v === 'number') return v.toFixed(2) + (suffix || '');
+  return v + (suffix || '');
+}
+
+function fmtPct(v) {
+  if (v == null || v === undefined) return '--';
+  const n = Number(v);
+  const sign = n >= 0 ? '+' : '';
+  return sign + n.toFixed(2) + '%';
+}
+
+function doDiagnose(quick) {
+  const code = document.getElementById('codeInput').value.trim();
+  if (!code || code.length !== 6 || !/^\d{6}$/.test(code)) {
+    showError('请输入6位数字股票代码');
+    return;
+  }
+
+  document.getElementById('resultArea').style.display = 'none';
+  document.getElementById('stateInit').style.display = 'none';
+  document.getElementById('errorBox').classList.remove('show');
+  document.getElementById('loading').classList.add('active');
+
+  const url = quick ? `/api/diagnose/quick/${code}` : `/api/diagnose/${code}`;
+  fetch(url)
+    .then(r => r.json())
+    .then(resp => {
+      document.getElementById('loading').classList.remove('active');
+      if (!resp.success) {
+        showError(resp.error || '诊断失败');
+        return;
+      }
+      renderResult(resp.data);
+    })
+    .catch(e => {
+      document.getElementById('loading').classList.remove('active');
+      showError('网络请求失败: ' + e.message);
+    });
+}
+
+function showError(msg) {
+  const box = document.getElementById('errorBox');
+  box.textContent = '⚠ ' + msg;
+  box.classList.add('show');
+}
+
+function renderResult(d) {
+  document.getElementById('resultArea').style.display = 'block';
+  document.getElementById('errorBox').classList.remove('show');
+
+  // 概览卡片
+  const t = d.technical, f = d.fundamental, c = d.capital, m = d.market;
+  document.getElementById('overviewCards').innerHTML = `
+    <div class="overview-card">
+      <div class="label">${d.name} ${d.code}</div>
+      <div class="value">${fmtVal(t.current_price)}</div>
+      <div class="sub">当前价格</div>
+    </div>
+    <div class="overview-card">
+      <div class="label">5日涨跌</div>
+      <div class="value ${(t.pct_change_5d||0)>=0?'score-color-strong':'score-color-danger'}">${fmtPct(t.pct_change_5d)}</div>
+    </div>
+    <div class="overview-card">
+      <div class="label">20日涨跌</div>
+      <div class="value ${(t.pct_change_20d||0)>=0?'score-color-strong':'score-color-danger'}">${fmtPct(t.pct_change_20d)}</div>
+    </div>
+    <div class="overview-card">
+      <div class="label">诊断时间</div>
+      <div class="value" style="font-size:14px">${d.timestamp}</div>
+    </div>
+  `;
+
+  // 综合评分
+  const cs = d.composite_score;
+  document.getElementById('compositeScore').textContent = cs;
+  document.getElementById('compositeScore').className = 'score-big ' + getScoreColor(cs);
+  document.getElementById('compositeRating').textContent = getScoreEmoji(cs) + ' ' + d.composite_rating;
+  document.getElementById('riskTag').textContent = '风险: ' + d.risk_level;
+  document.getElementById('riskTag').className = 'risk-tag ' + getRiskClass(d.risk_level);
+  document.getElementById('recommendation').textContent = d.recommendation;
+  document.getElementById('summary').textContent = d.summary;
+
+  // 分维度评分
+  const dims = d.detail_scores || {};
+  document.getElementById('scoreDetails').innerHTML = Object.entries(dims).map(([k,v]) =>
+    `<div class="score-item">
+      <div class="dim">${k}</div>
+      <div class="val ${getScoreColor(v)}">${v}分</div>
+    </div>`
+  ).join('');
+
+  // 技术面
+  renderBadge('techBadge', t.score, t.rating);
+  document.getElementById('techTable').innerHTML = `
+    <tr><td>均线排列</td><td>${t.ma_alignment}</td></tr>
+    <tr><td>MACD 信号</td><td>${signalLabel(t.macd)}</td></tr>
+    <tr><td>KDJ 信号</td><td>${signalLabel(t.kdj)}</td></tr>
+    <tr><td>RSI 状态</td><td>${trendLabel(t.rsi)}</td></tr>
+    <tr><td>布林带位置</td><td>${t.bollinger ? (t.bollinger.details.position || '--') : '--'}</td></tr>
+    <tr><td>量价关系</td><td>${t.volume_price ? (t.volume_price.details.pattern || '--') : '--'}</td></tr>
+    <tr><td>ATR 波幅</td><td>${fmtVal(t.atr)}</td></tr>
+    <tr><td>支撑位</td><td style="color:#4caf50">${fmtVal(t.support)}</td></tr>
+    <tr><td>阻力位</td><td style="color:#f44336">${fmtVal(t.resistance)}</td></tr>
+  `;
+
+  // 基本面
+  renderBadge('fundBadge', f.score, f.rating);
+  document.getElementById('fundTable').innerHTML = f.data_available ? `
+    <tr><td>市盈率 (PE)</td><td>${fmtVal(f.pe, ' 倍')}</td></tr>
+    <tr><td>市净率 (PB)</td><td>${fmtVal(f.pb, ' 倍')}</td></tr>
+    <tr><td>ROE</td><td>${fmtPct(f.roe)}</td></tr>
+    <tr><td>营收增长率</td><td>${fmtPct(f.revenue_growth)}</td></tr>
+    <tr><td>净利润增长率</td><td>${fmtPct(f.profit_growth)}</td></tr>
+    <tr><td>总市值</td><td>${fmtVal(f.market_cap, ' 亿')}</td></tr>
+    <tr><td>股息率</td><td>${fmtPct(f.dividend_yield)}</td></tr>
+    <tr><td>资产负债率</td><td>${fmtPct(f.debt_ratio)}</td></tr>
+    <tr><td>毛利率</td><td>${fmtPct(f.gross_margin)}</td></tr>
+    <tr><td>净利率</td><td>${fmtPct(f.net_margin)}</td></tr>
+  ` : `<tr><td colspan="2" style="text-align:center;color:#5a7a96">暂无财务数据（非财报季或数据源不可用）</td></tr>`;
+
+  // 资金面
+  renderBadge('capBadge', c.score, c.rating);
+  const mfLabel = {inflow:'主力流入 🔴', outflow:'主力流出 🟢', neutral:'中性', unknown:'--'};
+  document.getElementById('capTable').innerHTML = c.data_available ? `
+    <tr><td>主力动向</td><td>${mfLabel[c.main_force_direction] || '--'}</td></tr>
+    <tr><td>近5日主力净流入</td><td>${fmtVal(c.main_force_5d_net, ' 亿')}</td></tr>
+    <tr><td>换手率</td><td>${fmtPct(c.turnover_rate)}</td></tr>
+    <tr><td>量比</td><td>${fmtVal(c.volume_ratio)}</td></tr>
+  ` : `<tr><td colspan="2" style="text-align:center;color:#5a7a96">暂无资金流向数据</td></tr>`;
+
+  // 市场面
+  renderBadge('mktBadge', m.score, m.rating);
+  document.getElementById('mktTable').innerHTML = `
+    <tr><td>大盘趋势</td><td>${m.market_trend}</td></tr>
+    <tr><td>市场情绪</td><td>${m.market_sentiment}</td></tr>
+    <tr><td>所属板块</td><td>${m.sector_name}</td></tr>
+  `;
+
+  // 技术面图表
+  renderTechChart(d);
+
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+function signalLabel(ir) {
+  if (!ir) return '--';
+  const m = {buy:'金叉买入 ✅', sell:'死叉卖出 ⚠', hold:'持有 ⟳'};
+  return (m[ir.signal] || ir.signal) + ' (' + (ir.strength||50).toFixed(0) + ')';
+}
+function trendLabel(ir) {
+  if (!ir) return '--';
+  const m = {bullish:'偏多', bearish:'偏空', overbought:'超买', oversold:'超卖', neutral:'中性'};
+  return m[ir.trend] || ir.trend;
+}
+function renderBadge(id, score, rating) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = rating + ' ' + score + '分';
+  el.className = 'badge badge-' + (score>=65?'bullish':score>=50?'neutral':'bearish');
+}
+
+function renderTechChart(d) {
+  const dom = document.getElementById('techChart');
+  if (!dom) return;
+  if (techChartInst) techChartInst.dispose();
+  techChartInst = echarts.init(dom);
+
+  const cats = ['MACD','KDJ','RSI','布林带','量价','均线','支撑阻力'];
+  const vals = [
+    d.technical.macd ? d.technical.macd.strength : 50,
+    d.technical.kdj ? d.technical.kdj.strength : 50,
+    d.technical.rsi ? d.technical.rsi.strength : 50,
+    d.technical.bollinger ? d.technical.bollinger.strength : 50,
+    d.technical.volume_price ? d.technical.volume_price.strength : 50,
+    d.technical.score,
+    (d.technical.support && d.technical.resistance) ? 55 : 50,
+  ];
+
+  techChartInst.setOption({
+    tooltip: {trigger:'axis'},
+    radar: {
+      center: ['50%','55%'],
+      radius: '65%',
+      indicator: cats.map(c => ({name:c, max:100})),
+      axisName: {color:'#5a7a96',fontSize:11},
+      splitArea: {areaStyle:{color:['rgba(79,195,247,.02)','rgba(79,195,247,.04)']}},
+    },
+    series: [{
+      type: 'radar',
+      data: [{value:vals, name:'技术指标', areaStyle:{color:'rgba(79,195,247,.15)'}}],
+      symbol: 'circle', symbolSize: 4,
+      lineStyle: {color:'#4fc3f7', width: 2},
+      itemStyle: {color:'#4fc3f7'},
+    }],
+  });
+
+  window.addEventListener('resize', () => { if (techChartInst) techChartInst.resize(); });
+}
+
+// 回车键搜索
+document.getElementById('codeInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') doDiagnose(false);
+});
+</script>
+</body>
+</html>

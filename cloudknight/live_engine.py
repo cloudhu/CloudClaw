@@ -19,23 +19,20 @@ import logging
 import time
 import json
 import os
-from datetime import datetime, date, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 from threading import Thread, Event, Lock
-from typing import Dict, List, Optional, Any, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 from .config import (STRATEGIES, DEFAULT_CAPITAL, LIVE_ENGINE_CHECK_INTERVAL,
-                     LIVE_ENGINE_SCAN_INTERVAL, LIVE_LOG_DIR, LIVE_TRADE_DIR,
-                     INDEX_CODES, POOL_MAX_SIZE, POOL_SCREEN_SAMPLE)
+                     LIVE_ENGINE_SCAN_INTERVAL, LIVE_LOG_DIR,
+                     POOL_MAX_SIZE)
 from .trading_calendar import (TradingCalendar, TradingPhase,
-                               trading_calendar, get_phase_label)
-from .market_analyzer import (MarketAnalyzer, MarketSnapshot, IndexAnalysis,
-                              SectorAnalysis)
-from .auction_analyzer import (AuctionAnalyzer, AuctionSnapshot,
-                               AuctionStockResult)
-from .signal_hunter import (SignalHunter, TradeSignal, SignalResult, TradingPlan)
+                               get_phase_label)
+from .market_analyzer import (MarketAnalyzer, MarketSnapshot)
+from .auction_analyzer import (AuctionAnalyzer, AuctionSnapshot)
+from .signal_hunter import (SignalHunter, SignalResult, TradingPlan)
 from .stock_pool import PoolManager
 from .data_manager import DataFetcher
 from .paper_trader import PaperTrader, SNAPSHOT_FILE as PAPER_SNAPSHOT_FILE
@@ -76,25 +73,25 @@ class LiveTradingEngine:
         # 运行状态
         self.state = EngineState.STOPPED
         self._stop_event = Event()
-        self._main_thread: Optional[Thread] = None
+        self._main_thread: Thread | None = None
         self._lock = Lock()
 
         # 交易日状态
         self._current_phase: TradingPhase = TradingPhase.CLOSED
         self._last_phase: TradingPhase = TradingPhase.CLOSED
-        self._phase_completed: set = set()
+        self._phase_completed: set[str] = set()
 
         # 分析结果缓存
-        self._latest_snapshot: Optional[MarketSnapshot] = None
-        self._latest_auction: Optional[AuctionSnapshot] = None
-        self._latest_signals: Dict[str, SignalResult] = {}
-        self._trading_plan: Optional[TradingPlan] = None
-        self._todays_decisions: List[Dict] = []
+        self._latest_snapshot: MarketSnapshot | None = None
+        self._latest_auction: AuctionSnapshot | None = None
+        self._latest_signals: dict[str, SignalResult] = {}
+        self._trading_plan: TradingPlan | None = None
+        self._todays_decisions: list[dict[str, str]] = []
 
         # 日志
-        self._logs: List[EngineLog] = []
+        self._logs: list[EngineLog] = []
         self._max_logs = 500
-        self._log_callbacks: List[Callable] = []
+        self._log_callbacks: list[Callable[..., object]] = []
 
     # ═══════════════════════════════════════════
     # 引擎生命周期
@@ -130,7 +127,10 @@ class LiveTradingEngine:
         self._log(TradingPhase.CLOSED, "引擎正在停止...")
         self.state = EngineState.STOPPING
         self._stop_event.set()
-        self._save_daily_summary()
+
+        # 仅在收盘后(15:00)才保存当日总结
+        if datetime.now().time() >= time(15, 0):
+            self._save_daily_summary()
 
         if self._main_thread and self._main_thread.is_alive():
             self._main_thread.join(timeout=10)
@@ -233,6 +233,9 @@ class LiveTradingEngine:
 
         self._phase_completed.add(phase_key)
 
+        # 保存引擎状态供 Web 仪表盘读取
+        self._save_state()
+
     # ═══════════════════════════════════════════
     # 各阶段行为实现
     # ═══════════════════════════════════════════
@@ -240,6 +243,8 @@ class LiveTradingEngine:
     def _action_non_trading_day(self, now: datetime):
         """非交易日：全策略选股入池"""
         self._log(TradingPhase.CLOSED, "非交易日 → 执行选股任务")
+        # 每个交易日开始前重置数据源状态，允许恢复重试
+        self.fetcher.reset_unavailable_sources()
         self._log(TradingPhase.CLOSED, "获取全市场股票基础池...")
 
         try:
@@ -252,8 +257,7 @@ class LiveTradingEngine:
                 label = STRATEGIES.get(key, key)
                 top_score = items[0].score if items else 0
                 self._log(TradingPhase.CLOSED,
-                          f"  [{label}] 筛选 {len(items)} 只 → "
-                          f"最高评分: {top_score}")
+                          f"  [{label}] 筛选 {len(items)} 只 → 最高评分: {top_score}")
 
             # 保存股票池
             self.pool_mgr.save_all()
@@ -265,6 +269,9 @@ class LiveTradingEngine:
     def _action_pre_market(self, now: datetime):
         """盘前准备 08:30-09:15"""
         self._log(TradingPhase.PRE_MARKET, "盘前准备开始...")
+
+        # 重置数据源状态，允许之前不可用的数据源恢复尝试
+        self.fetcher.reset_unavailable_sources()
 
         # 1. 判断是否为交易日
         if not self.calendar.is_trading_day(now):
@@ -282,9 +289,8 @@ class LiveTradingEngine:
         for idx in indices.values():
             arrow = "▲" if idx.pct_change >= 0 else "▼"
             self._log(TradingPhase.PRE_MARKET,
-                      f"  {arrow} {idx.name}: {idx.close:.2f} "
-                      f"({idx.pct_change:+.2f}%) "
-                      f"MACD:{idx.macd_signal} KDJ:{idx.kdj_signal} "
+                      f"  {arrow} {idx.name}: {idx.close:.2f} ({idx.pct_change:+.2f}%) "
+                      + f"MACD:{idx.macd_signal} KDJ:{idx.kdj_signal} "
                       f"RSI:{idx.rsi_value}")
 
         # 4. 板块热度分析
@@ -297,8 +303,7 @@ class LiveTradingEngine:
         # 5. 市场情绪评估
         sentiment = self.market.get_market_sentiment()
         self._log(TradingPhase.PRE_MARKET,
-                  f"市场情绪: {sentiment['sentiment'].upper()} "
-                  f"(评分:{sentiment['score']})")
+                  f"市场情绪: {sentiment['sentiment'].upper()} (评分:{sentiment['score']})")
 
         # 6. 生成市场快照
         self._latest_snapshot = MarketSnapshot(
@@ -349,7 +354,7 @@ class LiveTradingEngine:
         auc = self._latest_auction
         self._log(TradingPhase.AUCTION_RESULT,
                   f"竞价结果: 强势{auc.strong_auction_count} 只, "
-                  f"弱势{auc.weak_auction_count} 只, "
+                  + f"弱势{auc.weak_auction_count} 只, "
                   f"偏{bias_cn(auc.market_bias)}")
 
         # 开盘交易决策
@@ -370,7 +375,7 @@ class LiveTradingEngine:
                 self._todays_decisions.append(d)
                 self._log(TradingPhase.AUCTION_RESULT,
                           f"  [{label}] {d['code']} → {d['action']}: "
-                          f"{d['reason']} (置信度:{d['confidence']})")
+                          + f"{d['reason']} (置信度:{d['confidence']})")
 
         self._log(TradingPhase.AUCTION_RESULT,
                   f"开盘决策: {len(self._todays_decisions)} 条")
@@ -443,6 +448,11 @@ class LiveTradingEngine:
 
     def _action_post_market(self, now: datetime):
         """盘后选股 15:00-次日"""
+        # 双保险：仅在 15:00 后执行（防止跨天/时区等边缘场景）
+        if now.time() < time(15, 0):
+            self._log(TradingPhase.POST_MARKET, "未到收盘时间，暂不执行盘后作业")
+            return
+
         self._log(TradingPhase.POST_MARKET, "收盘! 开始盘后选股")
 
         # 1. 保存当日日志
@@ -463,8 +473,7 @@ class LiveTradingEngine:
                 f"{i.code}({i.score})" for i in top_items
             )
             self._log(TradingPhase.POST_MARKET,
-                      f"  [{label}] {len(items)} 只 "
-                      f"→ Top5: {top_str}")
+                      f"  [{label}] {len(items)} 只 → Top5: {top_str}")
 
         # 4. 保存股票池
         self.pool_mgr.save_all()
@@ -520,7 +529,7 @@ class LiveTradingEngine:
         self._log(TradingPhase.LUNCH,
                   f"15分K线分析 {len(focus_codes[:5])} 只重点标的...")
 
-        from .indicators import calc_macd, calc_kdj, calc_rsi
+        from .indicators import calc_macd, calc_kdj
 
         for code in focus_codes[:5]:
             try:
@@ -557,7 +566,7 @@ class LiveTradingEngine:
 
                 self._log(TradingPhase.LUNCH,
                           f"  {code}: {pct:+.2f}% [{am_swing}] "
-                          f"MACD:{macd_sig} KDJ:{kdj_sig}")
+                          + f"MACD:{macd_sig} KDJ:{kdj_sig}")
 
             except Exception as e:
                 logger.debug(f"15分K分析 {code}: {e}")
@@ -596,8 +605,7 @@ class LiveTradingEngine:
         self._log(TradingPhase.POST_MARKET, "次日交易计划概要:")
         for key, info in pool_summary.items():
             self._log(TradingPhase.POST_MARKET,
-                      f"  [{info['label']}] "
-                      f"关注 {info['count']} 只")
+                      f"  [{info['label']}] 关注 {info['count']} 只")
 
     def _report_current_signals(self):
         """输出当前信号摘要"""
@@ -621,7 +629,7 @@ class LiveTradingEngine:
                 for s in sells[:3]:
                     self._log(self._current_phase,
                               f"  [卖] {s.code} {s.name} @ ~{s.price:.2f} "
-                              f"[{s.confidence}] {s.reason[:40]}")
+                              + f"[{s.confidence}] {s.reason[:40]}")
 
     def _should_scan(self, now: datetime, key: str) -> bool:
         """判断是否应该执行扫描"""
@@ -654,19 +662,37 @@ class LiveTradingEngine:
         self.hunter.clear_cache()
 
     def _save_daily_summary(self, force: bool = False):
-        """保存每日收盘总结（已存在则跳过）"""
-        today = datetime.now().strftime("%Y%m%d")
+        """保存每日收盘总结（仅 15:00 后生成，完整总结存在则跳过）"""
+        now = datetime.now()
+        today = now.strftime("%Y%m%d")
         filepath = os.path.join(LIVE_LOG_DIR, f"summary_{today}.json")
 
-        if os.path.exists(filepath) and not force:
-            logger.info(f"今日总结已存在，跳过生成: {filepath}")
+        # 时间拦栅：15:00 前不生成（盘中止损、崩溃重启等场景不会写出残缺结论）
+        if now.time() < time(15, 0) and not force:
+            logger.info(f"未到收盘时间({now.strftime('%H:%M')})，推迟生成收盘总结")
             return
+
+        # 已存在完整总结则跳过（检查 generated_at 是否在 15:00 之后）
+        if os.path.exists(filepath) and not force:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                gen_at = existing.get("generated_at", "")
+                if gen_at:
+                    gen_time = datetime.fromisoformat(gen_at).time()
+                    if gen_time >= time(15, 0):
+                        logger.info(f"今日总结已存在(生成于{gen_at})，跳过重复生成: {filepath}")
+                        return
+                    else:
+                        logger.warning(f"已存在盘前生成的残缺总结(生成于{gen_at})，强制覆盖")
+            except Exception:
+                pass  # 文件损坏，重新生成
 
         logger.info("正在生成当日收盘总结...")
 
         # 重置不可用数据源标记
         if hasattr(self, "fetcher"):
-            self.fetcher._unavailable_sources.clear()
+            self.fetcher.reset_unavailable_sources()
 
         # ── 1. 市场总览（指数 + 成交量 + 估值） ──
         market_overview = self._build_market_overview()
@@ -1005,7 +1031,7 @@ class LiveTradingEngine:
             # 1. 获取涨停池数据（用于交叉统计和板块排名）
             today_str = datetime.now().strftime("%Y%m%d")
             zt_df = self.fetcher.fetch_limit_up_pool(today_str)
-            zt_by_sector: Dict[str, List[dict]] = {}
+            zt_by_sector: dict[str, list[dict[str, object]]] = {}
 
             if not zt_df.empty and "所属行业" in zt_df.columns:
                 for _, row in zt_df.iterrows():
@@ -1169,11 +1195,11 @@ class LiveTradingEngine:
         """添加日志回调"""
         self._log_callbacks.append(callback)
 
-    def get_recent_logs(self, n: int = 50) -> List[EngineLog]:
+    def get_recent_logs(self, n: int = 50) -> list[EngineLog]:
         """获取最近 N 条日志"""
         return self._logs[-n:]
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict[str, object]:
         """获取引擎运行状态"""
         return {
             "state": self.state.value,
@@ -1191,12 +1217,53 @@ class LiveTradingEngine:
                     "buy": sum(1 for s in r.signals if s.signal_type in ("buy", "add")),
                     "sell": sum(1 for s in r.signals if s.signal_type in ("sell", "reduce", "close")),
                     "duration": r.scan_duration,
+                    "raw_signals": [
+                        {
+                            "code": s.code, "name": s.name,
+                            "signal_type": s.signal_type,
+                            "confidence": s.confidence,
+                            "price": s.price,
+                            "stop_loss": s.stop_loss,
+                            "take_profit": s.take_profit,
+                            "reason": s.reason,
+                            "timestamp": s.timestamp.isoformat() if s.timestamp else "",
+                        }
+                        for s in r.signals[:10]
+                    ],
                 }
                 for name, r in self._latest_signals.items()
             },
             "decisions_today": len(self._todays_decisions),
             "log_count": len(self._logs),
         }
+
+    def _save_state(self, force: bool = False):
+        """将引擎实时状态写入文件（供 Web 仪表盘跨进程读取）"""
+        try:
+            now = datetime.now()
+            state = self.get_status()
+
+            state["saved_at"] = now.isoformat()
+            state["last_scan_time"] = now.strftime("%H:%M:%S")
+            state["phase_logs"] = [
+                {
+                    "time": l.timestamp.strftime("%H:%M:%S") if hasattr(l.timestamp, 'strftime') else str(l.timestamp),
+                    "phase": l.phase.value if hasattr(l.phase, 'value') else str(l.phase),
+                    "event": l.event,
+                    "detail": getattr(l, 'detail', ''),
+                }
+                for l in self._logs[-100:]
+            ]
+            state["last_trade_summary"] = self._collect_strategy_pnl()
+
+            filepath = os.path.join(LIVE_LOG_DIR, "engine_state.json")
+            tmp_path = filepath + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+            os.replace(tmp_path, filepath)  # 原子写入
+
+        except Exception as e:
+            logger.warning(f"保存引擎状态失败: {e}")
 
 
 def bias_cn(bias: str) -> str:
