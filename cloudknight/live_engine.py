@@ -36,6 +36,12 @@ from .config import (
     STRATEGIES,
 )
 from .data_manager import DataFetcher
+from .indicators import (
+    IndicatorResult,
+    analyze_kdj,
+    analyze_macd,
+    comprehensive_analysis,
+)
 from .market_analyzer import MarketAnalyzer, MarketSnapshot
 from .paper_trader import SNAPSHOT_FILE as PAPER_SNAPSHOT_FILE
 from .paper_trader import PaperTrader
@@ -501,8 +507,7 @@ class LiveTradingEngine:
         self._trading_plan = self.hunter.build_trading_plan(self._latest_signals, sentiment)
 
     def _analyze_15min_kline(self, now: datetime):
-        """15分钟K线技术分析（午间复盘用）"""
-        # 选取池中前5只重点股进行15分钟K线分析
+        """15分钟K线技术分析（午间复盘用，使用内置指标库 analyze_* 系列）"""
         focus_codes = []
         for strategy_name in STRATEGIES:
             pool = self.pool_mgr.get_pool(strategy_name)
@@ -516,47 +521,33 @@ class LiveTradingEngine:
 
         self._log(TradingPhase.LUNCH, f"15分K线分析 {len(focus_codes[:5])} 只重点标的...")
 
-        from .indicators import calc_kdj, calc_macd
-
         for code in focus_codes[:5]:
             try:
-                # 获取日K线（近期数据用于15分钟级别参考）
                 df = self.fetcher.fetch_daily_kline(code, start_date="20250601")
                 if df is None or df.empty or len(df) < 5:
                     continue
 
-                # 标准15分K不可直接获取，用日线MACD/KDJ做近似
                 col_map = {
-                    "日期": "date",
-                    "开盘": "open",
-                    "收盘": "close",
-                    "最高": "high",
-                    "最低": "low",
-                    "成交量": "volume",
+                    "日期": "date", "开盘": "open", "收盘": "close",
+                    "最高": "high", "最低": "low", "成交量": "volume",
                 }
                 df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
-                close = df["close"].iloc[-1]
-                prev = df["close"].iloc[-2] if len(df) > 1 else close
+                close = float(df["close"].iloc[-1])
+                prev = float(df["close"].iloc[-2]) if len(df) > 1 else close
                 pct = (close / prev - 1) * 100
 
-                # 日K的MACD+KDJ信号
-                macd_result = calc_macd(df)
-                kdj_result = calc_kdj(df)
-
-                k_val = kdj_result[0].iloc[-1] if not kdj_result[0].empty else 50
-                d_val = kdj_result[1].iloc[-1] if not kdj_result[1].empty else 50
-                _ = kdj_result[2].iloc[-1] if len(kdj_result) > 2 and not kdj_result[2].empty else 50
-
-                dif = macd_result[0].iloc[-1] if not macd_result[0].empty else 0
-                dea = macd_result[1].iloc[-1] if not macd_result[1].empty else 0
-
-                macd_sig = "金叉" if dif > dea else "死叉"
-                kdj_sig = "金叉" if k_val > d_val else "死叉"
+                # 使用 analyze_* 系列获取 IndicatorResult（自动判断信号）
+                macd_r = analyze_macd(df.tail(60))
+                kdj_r = analyze_kdj(df.tail(60))
 
                 am_swing = "强势" if pct > 1 else ("弱势" if pct < -1 else "震荡")
 
-                self._log(TradingPhase.LUNCH, f"  {code}: {pct:+.2f}% [{am_swing}] " + f"MACD:{macd_sig} KDJ:{kdj_sig}")
+                self._log(
+                    TradingPhase.LUNCH,
+                    f"  {code}: {pct:+.2f}% [{am_swing}] "
+                    f"MACD:{macd_r.signal}({macd_r.trend}) KDJ:{kdj_r.signal}({kdj_r.trend})",
+                )
 
             except Exception as e:
                 logger.debug(f"15分K分析 {code}: {e}")
@@ -773,7 +764,7 @@ class LiveTradingEngine:
         return overview
 
     def _build_tech_indicators(self) -> dict:
-        """构建各关键指数技术指标"""
+        """构建各关键指数技术指标（使用内置指标库）"""
         result = {}
         try:
             key_codes = {
@@ -787,23 +778,19 @@ class LiveTradingEngine:
                 if df is None or df.empty:
                     continue
                 col_map = {
-                    "日期": "date",
-                    "收盘": "close",
-                    "开盘": "open",
-                    "最高": "high",
-                    "最低": "low",
-                    "成交量": "volume",
+                    "日期": "date", "收盘": "close", "开盘": "open",
+                    "最高": "high", "最低": "low", "成交量": "volume",
                 }
                 df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
                 required = ["close", "high", "low"]
                 if not all(c in df.columns for c in required):
                     continue
 
-                from .indicators import analyze_kdj, analyze_macd, analyze_rsi
-
-                m = analyze_macd(df.tail(60))
-                k = analyze_kdj(df.tail(60))
-                r = analyze_rsi(df.tail(60))
+                # 使用 comprehensive_analysis 一次性获取所有指标
+                ca = comprehensive_analysis(df.tail(60))
+                m = ca.get("macd", IndicatorResult("neutral", "hold", 50, {}))
+                k = ca.get("kdj", IndicatorResult("neutral", "hold", 50, {}))
+                r = ca.get("rsi", IndicatorResult("neutral", "hold", 50, {}))
 
                 result[name] = {
                     "macd_signal": m.signal,

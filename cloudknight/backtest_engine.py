@@ -3,6 +3,11 @@
 
 使用 akquant.run_backtest() 替代自定义向量化回测，
 享受 Rust 内核带来的 20x 性能提升。
+
+集成高级回测指标（教材 §10）：
+  - Sortino 比率、Calmar 比率、Alpha/Beta
+  - VaR/CVaR、信息比率
+  - 月度/年度收益统计、连续胜/负期
 """
 
 import logging
@@ -11,6 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .backtest_metrics import AdvancedMetrics, compute_advanced_metrics
 from .config import (
     BACKTEST_END_DATE,
     BACKTEST_LOT_SIZE,
@@ -30,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BacktestResult:
-    """统一回测结果（兼容原有接口）"""
+    """统一回测结果（兼容原有接口 + 高级指标）"""
 
     strategy_name: str
     start_date: str
@@ -51,6 +57,9 @@ class BacktestResult:
     trades: list[dict] = field(default_factory=list)
     equity_curve: pd.DataFrame | None = None
     raw_result: object = None  # AKQuant 原始 BacktestResult 对象
+
+    # 高级指标（教材 §10）
+    advanced: AdvancedMetrics | None = None
 
 
 class BacktestEngine:
@@ -308,6 +317,23 @@ class BacktestEngine:
         except Exception as e:
             logger.warning(f"解析 AKQuant 结果异常: {e}")
 
+        # 计算高级指标（教材 §10）
+        advanced = None
+        if equity_df is not None and not equity_df.empty and "equity" in equity_df.columns and len(daily_returns) > 20:
+            try:
+                # 将 daily_returns 构造成带日期索引的 Series
+                dr_series = pd.Series(daily_returns)
+                advanced = compute_advanced_metrics(
+                    equity_curve=equity_df,
+                    daily_returns=dr_series,
+                    trades_df=(
+                        pd.DataFrame(trades_list) if trades_list else None
+                    ),
+                    initial_capital=initial_cap,
+                )
+            except Exception as e:
+                logger.debug(f"高级指标计算失败: {e}")
+
         return BacktestResult(
             strategy_name=strategy_name,
             start_date=start_date,
@@ -328,6 +354,7 @@ class BacktestEngine:
             trades=trades_list[-20:],
             equity_curve=equity_df,
             raw_result=raw_result,
+            advanced=advanced,
         )
 
     @staticmethod

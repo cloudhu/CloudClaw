@@ -27,7 +27,7 @@ from .config import (
     STRATEGIES,
 )
 from .data_manager import DataFetcher
-from .indicators import comprehensive_analysis, trend_score
+from .indicators import IndicatorResult, comprehensive_analysis, trend_score
 from .strategies import (
     BollingerBandStrategy,
     DragonHeadStrategy,
@@ -341,203 +341,137 @@ class SignalHunter:
         return filtered
 
     def _generate_signal_from_indicators(
-        self, code: str, strategy: str, df: pd.DataFrame, analysis: dict[str, Any], trend: dict[str, Any]
+        self, code: str, strategy_key: str, df: pd.DataFrame, analysis: dict[str, Any], trend: dict[str, Any]
     ) -> TradeSignal | None:
-        """根据技术指标生成买卖信号（覆盖全部 9 个策略）"""
-        close = df["close"].iloc[-1]
+        """根据技术指标生成买卖信号
+
+        优先使用策略类自身的 generate_signal() 静态方法（策略模式，教材 §5.3），
+        若未覆盖则回退到基于 comprehensive_analysis() 结果的统一信号生成。
+        """
         name = self._get_stock_name(code)
+        close = float(df["close"].iloc[-1])
         closes = df["close"].values.astype(float)
-        highs = df["high"].values.astype(float) if "high" in df.columns else np.array([])
-        volumes = df["volume"].values.astype(float) if "volume" in df.columns else np.array([])
 
-        # 检查 MACD 金叉/死叉
-        macd_result = analysis.get("macd")
-        kdj_result = analysis.get("kdj")
-        rsi_result = analysis.get("rsi")
+        # 尝试使用策略类的 generate_signal（策略模式）
+        strategy_cls = STRATEGY_HANDLERS.get(strategy_key)
+        if strategy_cls:
+            try:
+                raw = strategy_cls.generate_signal(code, name, df, analysis, trend)
+                if raw:
+                    return TradeSignal(
+                        code=raw.get("code", code),
+                        name=raw.get("name", name),
+                        strategy=strategy_key,
+                        signal_type=raw.get("signal_type", "buy"),
+                        confidence=raw.get("confidence", "medium"),
+                        price=raw.get("price", close),
+                        stop_loss=raw.get("stop_loss", 0.0),
+                        take_profit=raw.get("take_profit", 0.0),
+                        reason=raw.get("reason", ""),
+                        timestamp=datetime.now(),
+                    )
+            except Exception as e:
+                logger.debug(f"策略 {strategy_key} generate_signal 异常: {e}")
 
-        rsi_val = 50
-        if rsi_result and rsi_result.details:
-            rsi_val = float(rsi_result.details.get("rsi", 50))
+        # ── 统一信号生成：基于 comprehensive_analysis() 返回的 IndicatorResult ──
+        macd_r = analysis.get("macd")
+        kdj_r = analysis.get("kdj")
+        rsi_r = analysis.get("rsi")
+        boll_r = analysis.get("bollinger")
+        cci_r = analysis.get("cci")
+        wr_r = analysis.get("wr")
+        vol_r = analysis.get("volume_price")
 
-        # 均线
-        ma20 = np.mean(closes[-20:]) if len(closes) >= 20 else close
-        ma60 = np.mean(closes[-60:]) if len(closes) >= 60 else close
-        ma10 = np.mean(closes[-10:]) if len(closes) >= 10 else close
+        # 提取关键数值（所有 IndicatorResult 都有 .signal/.trend/.strength/.details）
+        rsi_val = float(rsi_r.details.get("rsi", 50)) if rsi_r and rsi_r.details else 50.0
+        ma20 = float(np.mean(closes[-20:])) if len(closes) >= 20 else close
+        ma60 = float(np.mean(closes[-60:])) if len(closes) >= 60 else close
 
         # 量比
-        vol_latest = volumes[-1] if len(volumes) > 0 else 0
-        avg_vol = np.mean(volumes[-6:-1]) if len(volumes) >= 6 else vol_latest
+        volumes = df["volume"].values.astype(float) if "volume" in df.columns else np.array([])
+        vol_latest = float(volumes[-1]) if len(volumes) > 0 else 0
+        avg_vol = float(np.mean(volumes[-6:-1])) if len(volumes) >= 6 else vol_latest
         vol_ratio = vol_latest / avg_vol if avg_vol > 0 else 1
 
-        # 策略特定信号
-        if strategy == "dragon_head":
-            if "金叉" in str(macd_result.signal if macd_result else ""):
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="medium", price=close,
-                    reason=f"MACD金叉+趋势评分{trend.get('score', 50)}",
-                )
+        def _sig(st, conf, reason):
+            return TradeSignal(code=code, name=name, strategy=strategy_key, signal_type=st,
+                               confidence=conf, price=close, reason=reason)
 
-        elif strategy == "sparrow":
-            if kdj_result and kdj_result.signal == "金叉" and rsi_val < 65:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="medium", price=close,
-                    reason=f"KDJ金叉 RSI={rsi_val:.1f}",
-                )
-            if kdj_result and kdj_result.signal == "死叉":
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="sell",
-                    confidence="medium", price=close,
-                    reason=f"KDJ死叉 RSI={rsi_val:.1f}",
-                )
+        # ── 策略特定信号，直接使用 analysis 中的 IndicatorResult ──
+        if strategy_key == "dragon_head":
+            if macd_r and "金叉" in str(macd_r.signal):
+                return _sig("buy", "medium", f"MACD金叉+趋势评分{trend.get('score', 50)}")
 
-        elif strategy == "turtle":
+        elif strategy_key == "sparrow":
+            if kdj_r and kdj_r.signal == "金叉" and rsi_val < 65:
+                return _sig("buy", "medium", f"KDJ金叉 RSI={rsi_val:.1f}")
+            if kdj_r and kdj_r.signal == "死叉":
+                return _sig("sell", "medium", f"KDJ死叉 RSI={rsi_val:.1f}")
+
+        elif strategy_key == "turtle":
             if trend.get("rating", "") in ("强烈看多", "看多"):
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="low", price=close,
-                    reason=f"趋势跟踪:{trend.get('rating')}",
-                )
-            # 跌破MA60卖出信号
-            if len(highs) >= 21:
-                dh20 = float(np.max(highs[-21:-1]))
-                if close < ma60 * 0.95:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="sell",
-                        confidence="medium", price=close,
-                        reason=f"跌破MA60趋势线",
-                    )
+                return _sig("buy", "low", f"趋势跟踪:{trend.get('rating')}")
+            if close < ma60 * 0.95:
+                return _sig("sell", "medium", "跌破MA60趋势线")
 
-        elif strategy == "value_invest":
-            if "金叉" in str(macd_result.signal if macd_result else "") and rsi_val < 45:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="low", price=close,
-                    reason="低估区域 MACD金叉",
-                )
+        elif strategy_key == "value_invest":
+            if macd_r and "金叉" in str(macd_r.signal) and rsi_val < 45:
+                return _sig("buy", "low", "低估区域 MACD金叉")
 
-        elif strategy == "bollinger":
-            # 布林带：触及下轨 + RSI超卖 → 买入
-            if len(closes) >= 20:
-                std = float(np.std(closes[-20:]))
-                lower = ma20 - 2 * std
-                percent_b = (close - lower) / (4 * std) if std > 0 else 0.5
+        elif strategy_key == "bollinger":
+            if boll_r and boll_r.details:
+                percent_b = float(boll_r.details.get("%B", 0.5))
                 if percent_b <= 0.15 and rsi_val < 40:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="buy",
-                        confidence="medium", price=close,
-                        reason=f"布林下轨(%B={percent_b:.2f}) RSI={rsi_val:.0f}",
-                    )
-                # 触及上轨 + RSI超买 → 卖出
+                    return _sig("buy", "medium", f"布林下轨(%B={percent_b:.2f}) RSI={rsi_val:.0f}")
                 if percent_b >= 0.85 and rsi_val > 65:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="sell",
-                        confidence="medium", price=close,
-                        reason=f"布林上轨(%B={percent_b:.2f}) RSI={rsi_val:.0f}",
-                    )
+                    return _sig("sell", "medium", f"布林上轨(%B={percent_b:.2f}) RSI={rsi_val:.0f}")
 
-        elif strategy == "grid":
-            # 网格：MA60下方 + RSI超卖 → 买入建网格
+        elif strategy_key == "grid":
             if ma60 > 0:
                 dist = (close - ma60) / ma60 * 100
                 if -20 <= dist <= -5 and rsi_val < 40:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="buy",
-                        confidence="medium", price=close,
-                        reason=f"MA60下方{dist:+.1f}% RSI={rsi_val:.0f} 适合网格建仓",
-                    )
-                # 回升至MA60上方 → 卖出
+                    return _sig("buy", "medium", f"MA60下方{dist:+.1f}% RSI={rsi_val:.0f} 适合网格建仓")
                 if dist > 3 and rsi_val > 60:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="sell",
-                        confidence="low", price=close,
-                        reason=f"MA60上方{dist:+.1f}% 网格止盈",
-                    )
+                    return _sig("sell", "low", f"MA60上方{dist:+.1f}% 网格止盈")
 
-        elif strategy == "ma_cross":
-            # 均线交叉：金叉 + 放量 → 买入
-            prev_ma10 = np.mean(closes[-11:-1]) if len(closes) >= 11 else ma10
-            prev_ma30 = np.mean(closes[-31:-1]) if len(closes) >= 31 else ma20
-            cur_ma30 = np.mean(closes[-30:]) if len(closes) >= 30 else ma20
-            golden = prev_ma10 <= prev_ma30 and ma10 > cur_ma30
-            if golden and vol_ratio >= 1.2:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="medium", price=close,
-                    reason=f"MA金叉 量比={vol_ratio:.1f} 放量确认",
-                )
-            # 死叉 → 卖出
-            dead = prev_ma10 >= prev_ma30 and ma10 < cur_ma30
-            if dead:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="sell",
-                    confidence="medium", price=close,
-                    reason=f"MA死叉 趋势反转",
-                )
+        elif strategy_key == "ma_cross":
+            prev_ma10 = float(np.mean(closes[-11:-1])) if len(closes) >= 11 else float(np.mean(closes[-10:]))
+            prev_ma30 = float(np.mean(closes[-31:-1])) if len(closes) >= 31 else ma20
+            cur_ma30 = float(np.mean(closes[-30:])) if len(closes) >= 30 else ma20
+            ma10 = float(np.mean(closes[-10:])) if len(closes) >= 10 else close
+            if prev_ma10 <= prev_ma30 and ma10 > cur_ma30 and vol_ratio >= 1.2:
+                return _sig("buy", "medium", f"MA金叉 量比={vol_ratio:.1f} 放量确认")
+            if prev_ma10 >= prev_ma30 and ma10 < cur_ma30:
+                return _sig("sell", "medium", "MA死叉 趋势反转")
 
-        elif strategy == "volume_breakout":
-            # 量价突破：突破20日高点 + 放量 → 买入
+        elif strategy_key == "volume_breakout":
+            highs = df["high"].values.astype(float) if "high" in df.columns else closes
             if len(highs) >= 21:
                 dh20 = float(np.max(highs[-21:-1]))
-                breakout = close > dh20 and vol_ratio >= 1.5
-                near_breakout = float(dh20 - close) / dh20 * 100 <= 2 if dh20 > 0 else False
-                if breakout:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="buy",
-                        confidence="high", price=close,
-                        reason=f"突破20日高点 量比={vol_ratio:.1f}",
-                    )
-                if near_breakout and vol_ratio >= 1.2 and rsi_val > 50:
-                    return TradeSignal(
-                        code=code, name=name, strategy=strategy, signal_type="buy",
-                        confidence="medium", price=close,
-                        reason=f"逼近突破 量能放大 RSI={rsi_val:.0f}",
-                    )
-            # 缩量回落 → 卖出
-            if vol_ratio < 0.5 and "金叉" not in str(macd_result.signal if macd_result else ""):
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="sell",
-                    confidence="low", price=close,
-                    reason=f"缩量回落 量比={vol_ratio:.1f}",
-                )
+                if close > dh20 and vol_ratio >= 1.5:
+                    return _sig("buy", "high", f"突破20日高点 量比={vol_ratio:.1f}")
+                near = dh20 > 0 and abs(close - dh20) / dh20 <= 0.02
+                if near and vol_ratio >= 1.2 and rsi_val > 50:
+                    return _sig("buy", "medium", f"逼近突破 量能放大 RSI={rsi_val:.0f}")
+            if vol_ratio < 0.5 and (not macd_r or "金叉" not in str(macd_r.signal)):
+                return _sig("sell", "low", f"缩量回落 量比={vol_ratio:.1f}")
 
-        elif strategy == "trend_accel":
-            # 趋势加速：均线多头排列 + 回调至MA20 → 买入
-            mas = [(5, np.mean(closes[-5:]) if len(closes) >= 5 else 0),
-                   (10, ma10), (20, ma20), (60, ma60)]
-            aligned = sum(1 for i in range(len(mas)-1)
-                         if mas[i][1] > 0 and mas[i+1][1] > 0 and mas[i][1] > mas[i+1][1])
+        elif strategy_key == "trend_accel":
+            mas = [(5, float(np.mean(closes[-5:])) if len(closes) >= 5 else 0),
+                   (10, float(np.mean(closes[-10:])) if len(closes) >= 10 else 0),
+                   (20, ma20), (60, ma60)]
+            aligned = sum(1 for i in range(len(mas) - 1) if mas[i][1] > 0 and mas[i+1][1] > 0 and mas[i][1] > mas[i+1][1])
             near_ma20 = abs(close / ma20 - 1) * 100 <= 3 if ma20 > 0 else False
             if aligned >= 2 and near_ma20 and rsi_val > 40:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="medium", price=close,
-                    reason=f"多头排列回调MA20[{aligned}/3] RSI={rsi_val:.0f}",
-                )
-            # 均线发散过快 → 注意风险
+                return _sig("buy", "medium", f"多头排列回调MA20[{aligned}/3] RSI={rsi_val:.0f}")
             if aligned < 1 and close < ma20:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="sell",
-                    confidence="low", price=close,
-                    reason="趋势加速结束，跌破MA20",
-                )
+                return _sig("sell", "low", "趋势加速结束，跌破MA20")
 
-        elif strategy == "high_growth":
-            # 高增长：MA60上方 + RSI适中 + 量能正常 → 买入
+        elif strategy_key == "high_growth":
             if close > ma60 and 35 <= rsi_val <= 55 and vol_ratio >= 0.8:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="buy",
-                    confidence="medium", price=close,
-                    reason=f"高增长趋势确认 RSI={rsi_val:.0f}",
-                )
-            # 跌破MA60 + RSI弱势 → 卖出
+                return _sig("buy", "medium", f"高增长趋势确认 RSI={rsi_val:.0f}")
             if close < ma60 * 0.95 and rsi_val < 40:
-                return TradeSignal(
-                    code=code, name=name, strategy=strategy, signal_type="sell",
-                    confidence="medium", price=close,
-                    reason="高增长趋势破位",
-                )
+                return _sig("sell", "medium", "高增长趋势破位")
 
         return None
 

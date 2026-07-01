@@ -4,6 +4,79 @@
 
 ---
 
+## [2.7.1] - 2026-07-01
+
+### Changed
+- **全项目内置指标库深度集成**：5 个核心模块完成优化，消除 ~260 行冗余手写代码
+  - `strategies/base.py`：6 个手写 `_calc_*` 方法委托给 `indicators.py`，保持 numpy 接口兼容
+  - `signal_hunter.py`：~130 行手写 if-elif 链改为读取 `analysis` 字典中的 `IndicatorResult.signal`
+  - `stock_diagnose.py`：移除 `_safe_indicator()` 动态调用，5 次 `analyze_*` → 1 次 `comprehensive_analysis()`
+  - `live_engine.py`：2 处动态导入 → 顶部导入，盘后总结使用 `analyze_*` 信号判断
+  - `market_analyzer.py`：4 次函数调用 → 1 次 `comprehensive_analysis()`，减少 DataFrame 遍历
+- 策略信号生成统一使用 `IndicatorResult.signal/.trend/.strength`，消除手工 K/D/%B 判断
+
+### Fixed
+- 修复 `live_engine.py` 和 `market_analyzer.py` 中 `IndicatorResult` 可能为 `None` 的问题
+
+---
+
+## [2.7.0] - 2026-07-01
+
+### Added
+- **内置指标库 (indicators.py 重构)**：参考教材 §16，从 5 种扩展到 6 大类 30+ 种指标
+  - 趋势类 (7): SMA/EMA/WMA/MACD/TRIX/DMI(ADX+DI)/Parabolic SAR
+  - 动量类 (8): RSI/KDJ/CCI/WR/MOM/ROC/MFI/Ultimate Oscillator
+  - 波动类 (5): Bollinger/ATR/Keltner/Donchian/Historical Volatility
+  - 量价类 (8): OBV/VWAP/VPT/Chaikin A_D/VR/Force Index/Volume MA/Volume Ratio
+  - 统计类 (6): Beta/Correlation/Linear Regression(Z-Score/Mean Reversion)/Rolling Sharpe/Drawdown
+  - K线形态 (8): Doji/Hammer/Shooting Star/Engulfing/Morning Star/Evening Star/Three Soldiers/Three Crows
+  - `compute_all_indicators()` 批量计算所有指标到 DataFrame
+  - `comprehensive_analysis()` 扩展至 8 维度分析
+- **因子引擎 (factor_engine.py)**：参考教材 §14 多因子体系
+  - 33 个默认因子覆盖 7 大类: size(2)/value(6)/momentum(4)/quality(7)/growth(4)/volatility(5)/technical(5)
+  - `@register_factor` 装饰器注册模式，扩展新因子只需加装饰器
+  - 预处理管道: Winsorization → Z-Score 标准化 → 行业+市值中性化
+  - 评估体系: Pearson IC / Spearman Rank IC / IR / t-stat / 分层收益 / Long-Short / 换手率
+  - 因子合成: 等权 / 自定义权重 / IC_IR 加权三种方式
+  - 全部纯 numpy/pandas 实现，零外部依赖
+
+## [2.6.0] - 2026-07-01
+
+### Added
+- **系统级风控熔断 (RiskManager)**：参考教材 §15 实盘风控标准
+  - 日内亏损熔断（5%）、连续亏损熔断（5笔）、最大回撤熔断（15%）
+  - 市场异常波动熔断（大盘暴跌5%/急涨3%暂停开仓）
+  - 交易频率限制（单日20笔）、流动性过滤（最小成交量/成交额）
+  - 涨停不可买、跌停不可卖的 A 股微观结构检查
+  - `CircuitBreaker` 支持自动冷却恢复和状态记录
+- **高级回测指标 (backtest_metrics.py)**：参考教材 §10 策略评价体系
+  - Sortino 比率、Calmar 比率、Alpha/Beta 系数
+  - 95%/99% VaR / CVaR 在险价值
+  - 信息比率 (IR)、月度/年度收益率统计
+  - 最大连续胜/负期、日胜率
+- **参数优化框架 (param_optimizer.py)**：参考教材 §11 参数优化
+  - 网格搜索 (Grid Search)：多参数组合遍历 + 指标最大化
+  - Walk-Forward Optimization (WFO)：滚动训练窗口 + 测试验证
+  - 参数敏感性分析：各参数取值对指标的边际影响
+- **策略生命周期回调**：参考教材 §5 完整 on_xxx 回调地图
+  - `on_start()`、`pre_open()`、`on_stop()` 生命周期回调
+  - `generate_signal()` 静态方法支持策略模式信号生成
+- **A 股微观结构处理**：参考教材 §6
+  - 涨跌停判断（±9.5% 阈值含容差）
+  - 交易合规检查（涨停不可买、跌停不可卖）自动集成到 `enter_long/add_position/exit_position`
+  - T+1 制度工程处理、滑点模型 (`apply_slippage`)
+
+### Changed
+- `CloudKnightStrategy` 基类增强：生命周期回调 + 微观结构检查 + 滑点模型
+- `BacktestEngine` 集成高级指标，`BacktestResult` 新增 `advanced` 字段
+- `SignalHunter._generate_signal_from_indicators` 优先使用策略类自身的 `generate_signal()` 方法（策略模式）再回退 if-elif 链
+- `config.py` 新增风控参数段 (`RISK_*`)
+
+### Fixed
+- `signal_hunter.py` 内部变量 `strategy` → `strategy_key` 避免与模块变量冲突
+
+---
+
 ## [2.5.0] - 2026-07-01
 
 ### Added

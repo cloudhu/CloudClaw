@@ -20,10 +20,9 @@ import pandas as pd
 from .config import INDEX_CODES
 from .data_manager import DataFetcher
 from .indicators import (
-    analyze_kdj,
-    analyze_macd,
-    analyze_rsi,
+    IndicatorResult,
     calc_ma,
+    comprehensive_analysis,
     trend_score,
 )
 
@@ -138,11 +137,13 @@ class MarketAnalyzer:
                 ts = score_result.get("score", 50)
                 tr = score_result.get("rating", "中性")
 
-                macd_result = analyze_macd(df)
-                kdj_result = analyze_kdj(df)
-                rsi_result = analyze_rsi(df)
+                # 使用 comprehensive_analysis() 一次性获取全部指标信号
+                ca = comprehensive_analysis(df)
+                macd_result = ca.get("macd") or IndicatorResult("neutral", "hold", 50, {})
+                kdj_result = ca.get("kdj") or IndicatorResult("neutral", "hold", 50, {})
+                rsi_result = ca.get("rsi") or IndicatorResult("neutral", "hold", 50, {})
 
-                rsi_val = float(rsi_result.details.get("rsi", 50)) if rsi_result.details else 50.0
+                rsi_val = float(rsi_result.details.get("rsi", 50)) if rsi_result and rsi_result.details else 50.0
 
                 # 支撑位/阻力位
                 df_calc = calc_ma(df, [20, 60])

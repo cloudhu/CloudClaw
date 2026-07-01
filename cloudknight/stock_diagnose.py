@@ -25,9 +25,9 @@ from .config import MA_PERIODS
 from .indicators import (
     IndicatorResult,
     calc_atr,
-    calc_bollinger,
     calc_breakout,
     calc_ma,
+    comprehensive_analysis,
     trend_score,
 )
 
@@ -373,7 +373,7 @@ class StockDiagnoser:
             recent_5 = df.tail(5)
             amp_5d = round((float(recent_5["high"].max()) / float(recent_5["low"].min()) - 1) * 100, 2)
 
-        # 均线计算与排列判断
+        # 均线计算与排列判断（使用 comprehensive_analysis 中的 MA 数据）
         ma_values = {}
         ma_alignment = "未知"
         df_ma = calc_ma(df, MA_PERIODS)
@@ -385,7 +385,6 @@ class StockDiagnoser:
                     ma_values[col] = round(float(val), 2)
 
         # 判断均线排列
-        sorted(ma_values.items(), key=lambda x: x[1], reverse=True)
         ideal_multi = [f"MA{p}" for p in [5, 10, 20, 60, 120, 250] if f"MA{p}" in ma_values]
         is_bullish = all(
             ma_values.get(ideal_multi[i], 0) >= ma_values.get(ideal_multi[i + 1], 0)
@@ -400,7 +399,6 @@ class StockDiagnoser:
         elif is_bearish and len(ideal_multi) >= 4:
             ma_alignment = "空头排列"
         elif len(ma_values) >= 2:
-            # 检查是否有交叉
             first = next(iter(ma_values.keys()))
             last = list(ma_values.keys())[-1]
             if ma_values[first] > ma_values[last]:
@@ -408,12 +406,13 @@ class StockDiagnoser:
             else:
                 ma_alignment = "偏空头"
 
-        # 各项技术指标
-        macd = self._safe_indicator(df, "analyze_macd")
-        kdj = self._safe_indicator(df, "analyze_kdj")
-        rsi = self._safe_indicator(df, "analyze_rsi")
-        boll = self._safe_indicator(df, "analyze_bollinger")
-        vol_pr = self._safe_indicator(df, "analyze_volume_price")
+        # ── 使用 comprehensive_analysis() 一次性获取全部技术指标（教材 §16） ──
+        ca = comprehensive_analysis(df)
+        macd = ca.get("macd", IndicatorResult("neutral", "hold", 50, {}))
+        kdj = ca.get("kdj", IndicatorResult("neutral", "hold", 50, {}))
+        rsi = ca.get("rsi", IndicatorResult("neutral", "hold", 50, {}))
+        boll = ca.get("bollinger", IndicatorResult("neutral", "hold", 50, {}))
+        vol_pr = ca.get("volume_price", IndicatorResult("neutral", "hold", 50, {}))
 
         # ATR
         atr_val = None
@@ -423,8 +422,8 @@ class StockDiagnoser:
         except Exception:
             pass
 
-        # 支撑位/阻力位
-        support, resistance = self._calc_sr(df, current_price)
+        # 支撑位/阻力位（利用 comprehensive_analysis 中已计算的指标）
+        support, resistance = self._calc_sr(df, current_price, ca)
 
         # 技术面评分
         ts = trend_score(df)
@@ -451,31 +450,33 @@ class StockDiagnoser:
             stock_name=stock_name,
         )
 
-    def _safe_indicator(self, df, func_name: str) -> IndicatorResult:
-        """安全计算技术指标"""
-        try:
-            from . import indicators as ind
-
-            fn = getattr(ind, func_name)
-            return fn(df)
-        except Exception:
-            return IndicatorResult("neutral", "hold", 50, {})
-
-    def _calc_sr(self, df: pd.DataFrame, price: float) -> tuple[float, float]:
-        """计算支撑位和阻力位"""
+    def _calc_sr(self, df: pd.DataFrame, price: float, ca: dict | None = None) -> tuple[float, float]:
+        """计算支撑位和阻力位（利用 comprehensive_analysis 结果）"""
         support, resistance = price * 0.95, price * 1.05  # 默认 ±5%
         try:
-            df = df.copy()
             if len(df) < 60:
                 return round(support, 2), round(resistance, 2)
-            # 布林带
-            df_bb = calc_bollinger(df)
-            if "BOLL_DN" in df_bb.columns and "BOLL_UP" in df_bb.columns:
-                bb_low = df_bb["BOLL_DN"].iloc[-1]
-                bb_high = df_bb["BOLL_UP"].iloc[-1]
-                if pd.notna(bb_low) and pd.notna(bb_high):
-                    support = min(support, float(bb_low))
-                    resistance = max(resistance, float(bb_high))
+
+            # 布林带上下轨
+            if ca and "bollinger" in ca:
+                boll_det = ca["bollinger"].details
+                bb_low = float(boll_det.get("lower", 0))
+                bb_high = float(boll_det.get("upper", 0))
+                if bb_low > 0 and bb_low < price:
+                    support = max(support, bb_low)
+                if bb_high > price:
+                    resistance = min(resistance, bb_high)
+            else:
+                # 降级：手动计算
+                from .indicators import calc_bollinger
+                df_bb = calc_bollinger(df)
+                if "BOLL_DN" in df_bb.columns and "BOLL_UP" in df_bb.columns:
+                    bb_low = float(df_bb["BOLL_DN"].iloc[-1])
+                    bb_high = float(df_bb["BOLL_UP"].iloc[-1])
+                    if pd.notna(bb_low) and pd.notna(bb_high):
+                        support = min(support, bb_low)
+                        resistance = max(resistance, bb_high)
+
             # Donchian 突破
             hh, ll = calc_breakout(df, 20)
             if not hh.empty and not ll.empty:
@@ -483,14 +484,14 @@ class StockDiagnoser:
                 if pd.notna(hh_val) and pd.notna(ll_val):
                     resistance = max(resistance, hh_val)
                     support = min(support, ll_val)
-            # MA20/MA60
+
+            # MA20/MA60 支撑阻力
             df_ma = calc_ma(df, [20, 60])
             for p in [20, 60]:
                 col = f"MA{p}"
                 if col in df_ma.columns:
-                    ma_val = df_ma[col].iloc[-1]
+                    ma_val = float(df_ma[col].iloc[-1])
                     if pd.notna(ma_val):
-                        ma_val = float(ma_val)
                         if ma_val < price:
                             support = max(support, ma_val)
                         else:

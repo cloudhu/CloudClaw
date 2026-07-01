@@ -58,6 +58,19 @@ POOL_SCREEN_INTERVAL = 5  # 筛选间隔（交易日）
 ENGINE_BACKEND = "akquant"  # 回测引擎后端: "akquant"
 
 # ═══════════════════════════════════════════
+# 系统级风控配置（教材 §15 - 风控与熔断机制）
+# ═══════════════════════════════════════════
+RISK_DAILY_LOSS_LIMIT = 5.0           # 日内亏损熔断阈值 (%)
+RISK_CONSECUTIVE_LOSS_LIMIT = 5       # 连续亏损笔数熔断
+RISK_MAX_DRAWDOWN_LIMIT = 15.0        # 最大回撤熔断阈值 (%)
+RISK_MARKET_PANIC = -5.0              # 大盘暴跌恐慌熔断 (%)
+RISK_MARKET_FRENZY = 3.0              # 大盘急涨狂热熔断 (%)
+RISK_MAX_DAILY_TRADES = 20            # 单日最大交易次数
+RISK_SINGLE_STOCK_MAX_PCT = 30.0      # 单票最大仓位 (%)
+RISK_MIN_DAILY_VOLUME = 1_000_000     # 最小日成交量过滤（股）
+RISK_MIN_DAILY_AMOUNT = 10_000_000    # 最小日成交额过滤（元）
+
+# ═══════════════════════════════════════════
 # 实时交易：A股交易时间周期
 # ═══════════════════════════════════════════
 TRADING_PRE_MARKET_START = time(8, 30)
