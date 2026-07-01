@@ -262,6 +262,8 @@ class OpsCollector:
             "operations": self._collect_trade_operations(data_dir),
             "logs": self._collect_logs(live_log_dir),
             "pool_overview": self._collect_pool_overview(data_dir),
+            "equity_history": self._collect_equity_history(data_dir),
+            "trade_analysis": self._collect_trade_analysis(data_dir),
             "collected_at": datetime.now().isoformat(),
         }
         return result
@@ -402,6 +404,13 @@ class OpsCollector:
             if include_signals:
                 latest_sigs = self._extract_recent_signals(key, engine_signals)
                 strategy["latest_signals"] = latest_sigs
+
+            # 策略当前生命周期阶段（从引擎状态读取）
+            strategy_phases = engine_state.get("lifecycle", {}).get("strategy_phases", {})
+            sp = strategy_phases.get(key, {})
+            strategy["lifecycle_phase"] = sp.get("phase", "idle")
+            strategy["lifecycle_phase_label"] = sp.get("label", "空闲")
+            strategy["lifecycle_updated_at"] = sp.get("updated_at", "")
 
             strategies.append(strategy)
 
@@ -575,6 +584,170 @@ class OpsCollector:
                 pass
 
         return overview
+
+    def _collect_equity_history(self, data_dir: str) -> dict[str, list[dict]]:
+        """采集各策略权益历史（供前端绘制权益曲线和回撤图）。
+
+        返回 {strategy_key: [{date, equity, return_pct}, ...]}
+        只返回有实际数据的策略。
+        """
+        history: dict[str, list[dict]] = {}
+        snapshot_path = os.path.join(data_dir, "paper_race.json")
+        if not os.path.exists(snapshot_path):
+            return history
+
+        try:
+            with open(snapshot_path, encoding="utf-8") as f:
+                race_data = json.load(f)
+        except Exception:
+            return history
+
+        accounts = race_data.get("accounts", {})
+        for key, acc in accounts.items():
+            initial = acc.get("initial_capital", 100000)
+            daily = acc.get("daily_snapshots", [])
+            initial_date = acc.get("start_date", "")
+            if not daily:
+                # 至少有一个起点
+                history[key] = [{"date": initial_date or "", "equity": initial, "return_pct": 0}]
+                continue
+
+            series = []
+            # 如有 start_date 且第一个快照日期不同，插入初始点
+            if initial_date and daily:
+                first_date = daily[0].get("date", "") if daily else ""
+                if initial_date != first_date:
+                    series.append({"date": initial_date, "equity": initial, "return_pct": 0})
+
+            for s in daily:
+                eq = s.get("equity", initial)
+                ret = round((eq / initial - 1) * 100, 2) if initial > 0 else 0
+                series.append({
+                    "date": s.get("date", ""),
+                    "equity": eq,
+                    "return_pct": ret,
+                })
+            # 标记 account 名称
+            label = acc.get("strategy_label", key)
+            history[key] = series
+
+        return history
+
+    def _collect_trade_analysis(self, data_dir: str) -> dict[str, Any]:
+        """交易统计分析 - 胜率、盈亏分布、MAE/MFE 风格指标。
+
+        返回:
+          - win_rate: 胜率
+          - total_trades: 总交易笔数
+          - total_pnl: 总盈亏
+          - avg_win: 平均盈利
+          - avg_loss: 平均亏损
+          - profit_factor: 盈亏比
+          - max_consecutive_wins: 最大连胜
+          - max_consecutive_losses: 最大连亏
+          - pnl_distribution: [{range, count}] 盈亏分布区间
+        """
+        trades: list[dict] = []
+        snapshot_path = os.path.join(data_dir, "paper_race.json")
+        if os.path.exists(snapshot_path):
+            try:
+                with open(snapshot_path, encoding="utf-8") as f:
+                    race_data = json.load(f)
+                for acc in race_data.get("accounts", {}).values():
+                    for t in acc.get("trades", []):
+                        pnl = t.get("pnl", 0)
+                        if pnl is None:
+                            pnl = 0
+                        action = (t.get("action", "") or "").lower()
+                        # 只统计卖出/止盈/止损类的交易（有实际盈亏的）
+                        if any(kw in action for kw in ["sell", "卖出", "stop_loss", "止损", "take_profit", "止盈", "close", "平仓"]):
+                            trades.append({"pnl": float(pnl), "date": t.get("date", "")})
+                    # 也纳入 pnl != 0 的加仓/建仓（虽然少见）
+                    for t in acc.get("trades", []):
+                        pnl = t.get("pnl", 0)
+                        if pnl is None:
+                            pnl = 0
+                        if float(pnl) != 0:
+                            action = (t.get("action", "") or "").lower()
+                            if not any(kw in action for kw in ["sell", "卖出", "stop_loss", "止损", "take_profit", "止盈", "close", "平仓"]):
+                                trades.append({"pnl": float(pnl), "date": t.get("date", "")})
+            except Exception:
+                pass
+
+        # 去重（同一日期+"卖出"和 pnl!=0 可能重复）
+        seen = set()
+        unique_trades = []
+        for t in trades:
+            key = f"{t['date']}_{t['pnl']}"
+            if key not in seen:
+                seen.add(key)
+                unique_trades.append(t)
+
+        total = len(unique_trades)
+        if total == 0:
+            return {
+                "total_trades": 0, "win_rate": 0, "total_pnl": 0,
+                "avg_win": 0, "avg_loss": 0, "profit_factor": 0,
+                "max_consecutive_wins": 0, "max_consecutive_losses": 0,
+                "pnl_distribution": [],
+            }
+
+        wins = [t for t in unique_trades if t["pnl"] > 0]
+        losses = [t for t in unique_trades if t["pnl"] < 0]
+        win_rate = round(len(wins) / total * 100, 1) if total > 0 else 0
+        total_pnl = round(sum(t["pnl"] for t in unique_trades), 2)
+        avg_win = round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else 0
+        avg_loss = round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0
+        gross_profit = sum(t["pnl"] for t in wins)
+        gross_loss = abs(sum(t["pnl"] for t in losses))
+        profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (999 if gross_profit > 0 else 0)
+
+        # 最大连胜/连亏
+        max_cw = max_cl = cur_w = cur_l = 0
+        for t in unique_trades:
+            if t["pnl"] > 0:
+                cur_w += 1
+                cur_l = 0
+                max_cw = max(max_cw, cur_w)
+            elif t["pnl"] < 0:
+                cur_l += 1
+                cur_w = 0
+                max_cl = max(max_cl, cur_l)
+            # pnl == 0 不重置 streak
+
+        # 盈亏分布区间（按金额分桶）
+        pnl_values = [t["pnl"] for t in unique_trades]
+        if pnl_values:
+            min_pnl = min(pnl_values)
+            max_pnl = max(pnl_values)
+            # 自适应桶宽
+            bucket_count = min(10, max(4, total // 2))
+            span = max(max_pnl - min_pnl, 1)
+            bucket_width = span / bucket_count
+            buckets = [0] * bucket_count
+            for p in pnl_values:
+                idx = min(int((p - min_pnl) / bucket_width), bucket_count - 1)
+                if idx < 0:
+                    idx = 0
+                buckets[idx] += 1
+            distribution = [
+                {"range": f"{min_pnl + i * bucket_width:.1f}~{min_pnl + (i+1) * bucket_width:.1f}", "count": buckets[i]}
+                for i in range(bucket_count)
+            ]
+        else:
+            distribution = []
+
+        return {
+            "total_trades": total,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": profit_factor,
+            "max_consecutive_wins": max_cw,
+            "max_consecutive_losses": max_cl,
+            "pnl_distribution": distribution,
+        }
 
 
 def _action_type(action: str) -> str:

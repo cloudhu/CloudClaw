@@ -4,6 +4,20 @@
 
 ---
 
+## [2.8.0] - 2026-07-01
+
+### Added
+- **各策略独立生命周期阶段追踪**：10 大策略各自维护 `LifecyclePhase` 状态
+  - 引擎层：`_strategy_phase` / `_strategy_phase_label` / `_strategy_phase_updated` 三字典独立跟踪
+  - 引擎级阶段 (SCREENING/SIGNAL_SCAN/STOP_MONITOR/TRADE_PLAN/BACKTEST/ML) 统一更新所有策略
+  - TRADE_EXEC 阶段仅更新有实际交易的策略（精确到 executed_strategies）
+  - `get_status()` 输出 `lifecycle.strategy_phases` 字典供前端/API 消费
+- **运维监控策略阶段 Badge**：策略卡片展示 8 阶段颜色标签（⏸空闲 🔍选股 📡信号扫描 🛡止损监控 💹交易执行 📋制定计划 🔄回测 🧠ML）
+- **开发者指南** (`DEVELOPER_GUIDE.md`)：完整生命周期系统文档，含状态流转图、配置表、扩展指南
+
+### Changed
+- `live_engine.py`：`_reset_lifecycle()` 新增策略阶段重置
+
 ## [2.7.1] - 2026-07-01
 
 ### Changed

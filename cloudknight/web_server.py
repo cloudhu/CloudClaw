@@ -59,6 +59,7 @@ STRATEGY_KEYS = [
     "bollinger",
     "volume_breakout",
     "trend_accel",
+    "high_growth",
 ]
 STRATEGY_LABELS = {
     "dragon": "龙头战法",
@@ -70,6 +71,7 @@ STRATEGY_LABELS = {
     "bollinger": "布林带回归",
     "volume_breakout": "量价突破",
     "trend_accel": "趋势加速",
+    "high_growth": "高增长",
 }
 
 
@@ -239,14 +241,17 @@ def _inject_pool_gains(items: list[dict]) -> list[dict]:
     }
 
     deadline = _time.time() + _WEB_POOL_INJECT_MAX_TIME
+    processed_count = 0
 
     for item in items:
-        # 总时间超限则立即返回（剩余股票保留原始数据）
+        # 总时间超限则停止获取 K 线，但确保所有剩余股票都有 tier
         if _time.time() > deadline:
             logger.warning(
                 f"股票池涨幅注入超总时限({_WEB_POOL_INJECT_MAX_TIME}s)，"
-                f"已处理{items.index(item)}/{len(items)}只，剩余跳过"
+                f"已处理{processed_count}/{len(items)}只，剩余只设置层级"
             )
+            for remaining in items[processed_count:]:
+                remaining["tier"] = remaining.get("tier") or _score_to_tier(remaining.get("score", 0) or 0)
             break
 
         code = item.get("code", "")
@@ -255,6 +260,7 @@ def _inject_pool_gains(items: list[dict]) -> list[dict]:
         # 确保 tier 字段存在
         tier = item.get("tier", "")
         score = item.get("score", 0) or 0
+        processed_count += 1
 
         try:
             # 带超时的 K 线获取（线程隔离，VPN 下不会无限挂起）
@@ -326,12 +332,20 @@ def _inject_pool_gains(items: list[dict]) -> list[dict]:
 
 def _score_to_tier(score: float, cum_gain: float = 0) -> str:
     """根据评分和累计涨幅计算层级"""
+    # 硬淘汰
+    if score < 30:
+        return "eliminated"
+    if cum_gain <= -8.0:
+        return "eliminated"
+    # 评分阈值
     if score >= 80:
         return TIER_FOCUS
     elif score >= 60:
         return TIER_WATCH
     elif score >= 40:
         return TIER_BROAD
+    elif score >= 30:
+        return "basic"
     else:
         return "eliminated"
 
@@ -603,7 +617,7 @@ def create_app() -> FastAPI:
             items = _inject_pool_gains(items)
             # 层级统计（只统计 active 的）
             active_items = [it for it in items if it.get("status") == "active"]
-            tier_counts = {"focus": 0, "watch": 0, "broad": 0}
+            tier_counts = {"focus": 0, "watch": 0, "broad": 0, "basic": 0}
             for it in active_items:
                 t = it.get("tier", "")
                 if t in tier_counts:
@@ -628,11 +642,11 @@ def create_app() -> FastAPI:
                 "label": STRATEGY_LABELS[key],
                 "last_screened": None,
                 "items": [],
-                "tier_counts": {"focus": 0, "watch": 0, "broad": 0},
+                "tier_counts": {"focus": 0, "watch": 0, "broad": 0, "basic": 0},
             }
         items = _inject_pool_gains(data.get("items", []))
         active_items = [it for it in items if it.get("status") == "active"]
-        tier_counts = {"focus": 0, "watch": 0, "broad": 0}
+        tier_counts = {"focus": 0, "watch": 0, "broad": 0, "basic": 0}
         for it in active_items:
             t = it.get("tier", "")
             if t in tier_counts:
@@ -871,6 +885,80 @@ def create_app() -> FastAPI:
         except Exception as e:
             return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
+    @app.get("/api/stock-info/cache")
+    async def get_stock_info_cache():
+        """获取股票基本信息本地缓存状态与统计"""
+        try:
+            from .stock_info_cache import get_stock_info_cache
+
+            cache = get_stock_info_cache()
+            stats = cache.get_stats()
+            return {"success": True, "data": stats}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.post("/api/stock-info/refresh")
+    async def refresh_stock_info_cache():
+        """强制刷新股票基本信息本地缓存"""
+        try:
+            from .stock_info_cache import get_stock_info_cache
+
+            cache = get_stock_info_cache()
+            result = cache.refresh_cache()
+            return {"success": True, "data": result}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/stock-info/search")
+    async def search_stock_info(q: str = "", industry: str = "", limit: int = 100):
+        """搜索/筛选股票基本信息。
+
+        - q: 代码或名称模糊搜索
+        - industry: 按行业精确筛选
+        - limit: 返回条数上限
+        """
+        try:
+            from .stock_info_cache import get_stock_info_cache
+
+            cache = get_stock_info_cache()
+            if industry:
+                stocks = cache.get_by_industry(industry)
+                if q:
+                    stocks = [
+                        s for s in stocks
+                        if q.upper() in s.get("code", "").upper()
+                        or q in s.get("name", "")
+                    ]
+                return {"success": True, "data": stocks[:limit], "total": len(stocks)}
+            elif q:
+                # 简单代码/名称搜索（全表）
+                from .data_manager import Database
+                db = Database()
+                cur = db._get_conn().execute(
+                    "SELECT code, name, industry, area, market, list_date FROM stock_info "
+                    "WHERE code LIKE ? OR name LIKE ? ORDER BY code LIMIT ?",
+                    (f"%{q}%", f"%{q}%", limit),
+                )
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+                return {"success": True, "data": rows, "total": len(rows)}
+            else:
+                return {"success": True, "data": [], "total": 0, "message": "请提供 q 或 industry 参数"}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/stock-info/industries")
+    async def get_stock_info_industries():
+        """获取所有已缓存的行业分类列表"""
+        try:
+            from .stock_info_cache import get_stock_info_cache
+
+            cache = get_stock_info_cache()
+            industries = cache.get_industries()
+            return {"success": True, "data": industries, "total": len(industries)}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
     @app.post("/api/datasource/reset")
     async def reset_datasource():
         """重置不可用数据源标记，强制下次请求重新尝试所有数据源"""
@@ -1019,6 +1107,9 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = Fals
     _ensure_echarts_local()
     _ensure_dashboard_html()
 
+    # 初始化股票基本信息本地缓存（后台线程，不阻塞启动）
+    _init_stock_info_cache()
+
     print(f"""
 ╔══════════════════════════════════════════════╗
 ║    CloudKnight Dashboard                     ║
@@ -1034,6 +1125,30 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = Fals
 
     app = create_app()
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def _init_stock_info_cache():
+    """后台初始化股票基本信息本地缓存（不阻塞 Web 启动）"""
+    import threading
+
+    def _do_init():
+        try:
+            from .stock_info_cache import get_stock_info_cache
+
+            cache = get_stock_info_cache()
+            result = cache.ensure_cache()
+            stats = cache.get_stats()
+            print(
+                f"[stock_cache] 初始化完成: {stats['total_stocks']} 只股票, "
+                f"{stats['total_industries']} 个行业, "
+                f"来源={result.get('source', 'unknown')}, "
+                f"状态={result.get('status', 'unknown')}"
+            )
+        except Exception as e:
+            print(f"[stock_cache] 初始化失败: {e}")
+
+    t = threading.Thread(target=_do_init, daemon=True, name="stock_cache_init")
+    t.start()
 
 
 def _ensure_dashboard_html():
@@ -1333,6 +1448,71 @@ body {
 @keyframes pulse {
   0%,100% { opacity:1; } 50% { opacity:0.4; }
 }
+
+/* Ops - 生命周期时间线 */
+.phase-timeline {
+  display:flex; align-items:flex-start; gap:6px; flex-wrap:wrap; padding:8px 0;
+}
+.phase-node {
+  display:flex; flex-direction:column; align-items:center; gap:4px; min-width:64px;
+  position:relative; font-size:10px;
+}
+.phase-node .dot {
+  width:14px; height:14px; border-radius:50%;
+  border:2px solid var(--border); background:var(--panel);
+  transition:all .3s; position:relative; z-index:1;
+}
+.phase-node .dot.active {
+  border-color:var(--accent); background:var(--accent);
+  box-shadow:0 0 8px rgba(52,152,219,0.5);
+}
+.phase-node .dot.done {
+  border-color:var(--green); background:var(--green);
+}
+.phase-node .dot.pending {
+  border-color:var(--border); background:var(--panel);
+}
+.phase-node .label { color:var(--text-dim); text-align:center; max-width:70px; }
+.phase-node .label.active { color:var(--accent); font-weight:600; }
+.phase-node .label.done { color:var(--green); }
+.phase-connector {
+  flex:0 0 12px; height:2px; background:var(--border);
+  align-self:center; margin-bottom:22px;
+}
+.phase-connector.done { background:var(--green); }
+.phase-connector.active { background:linear-gradient(to right, var(--green), var(--accent)); }
+
+/* Ops - 系统健康 sparkline 趋势 */
+.health-sparkline {
+  display:flex; align-items:flex-end; gap:2px; height:36px; margin-top:6px;
+}
+.health-sparkline .bar {
+  flex:1; border-radius:1px; min-width:2px;
+  transition:height .3s;
+}
+.health-sparkline .bar.cpu-low { background:rgba(39,174,96,0.5); }
+.health-sparkline .bar.cpu-mid { background:rgba(243,156,18,0.5); }
+.health-sparkline .bar.cpu-high { background:rgba(231,76,60,0.5); }
+.health-sparkline .bar.mem-low { background:rgba(52,152,219,0.5); }
+.health-sparkline .bar.mem-mid { background:rgba(243,156,18,0.5); }
+.health-sparkline .bar.mem-high { background:rgba(231,76,60,0.5); }
+
+/* Ops - 新 chart 高度 */
+.chart.h120 { height:120px; }
+.chart.h200 { height:200px; }
+.chart.h220 { height:220px; }
+
+/* Ops - 交易统计卡片 */
+.trade-stat-card {
+  background:var(--panel); border:1px solid var(--border); border-radius:6px;
+  padding:10px 14px; text-align:center; flex:1; min-width:80px;
+}
+.trade-stat-card .stat-val {
+  font-size:18px; font-weight:700; color:#fff;
+}
+.trade-stat-card .stat-label {
+  font-size:10px; color:var(--text-dim); margin-top:2px;
+}
 </style>
 </head>
 <body>
@@ -1494,16 +1674,49 @@ body {
   </div>
   <!-- ═══ 运维监控 ═══ -->
   <div class="tab-panel" id="tab-ops">
-    <!-- 系统健康 -->
+    <!-- 系统健康 + 趋势图 -->
     <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">🖥️ 系统健康 <span style="color:var(--text-dim);font-size:11px;margin-left:8px;" id="ops-health-time"></span></div>
       <div class="card-row" id="ops-health-cards"></div>
+      <div class="grid-2" style="margin-top:8px;">
+        <div style="background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px;">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;">📊 CPU 使用率趋势 %</div>
+          <div id="ops-cpu-sparkline" class="health-sparkline"></div>
+        </div>
+        <div style="background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px;">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;">📊 内存占用趋势 MB</div>
+          <div id="ops-mem-sparkline" class="health-sparkline"></div>
+        </div>
+      </div>
     </div>
 
-    <!-- 引擎状态 + 关键指标 -->
+    <!-- 引擎状态 + 生命周期时间线 -->
     <div class="card-row" id="ops-engine-status"></div>
+    <div class="chart-box" style="margin-bottom:14px;">
+      <div class="chart-title">🔄 生命周期阶段流转 <span style="color:var(--text-dim);font-size:10px;margin-left:8px;" id="ops-phase-subtitle"></span></div>
+      <div id="ops-phase-timeline" class="phase-timeline" style="min-height:48px;"></div>
+    </div>
+
+    <!-- 策略权益曲线 + 回撤图（水下曲线） -->
+    <div class="grid-2">
+      <div class="chart-box"><div class="chart-title">📈 策略权益曲线（对数坐标）</div><div class="chart h300" id="chart-ops-equity"></div></div>
+      <div class="chart-box"><div class="chart-title">📉 策略回撤（水下曲线）<span style="color:var(--text-dim);font-size:10px;margin-left:8px;">越深越痛</span></div><div class="chart h300" id="chart-ops-drawdown"></div></div>
+    </div>
+
+    <!-- 交易分析 -->
+    <div class="grid-2">
+      <div class="chart-box" style="margin-bottom:14px;">
+        <div class="chart-title">📊 交易盈亏分析</div>
+        <div class="card-row" id="ops-trade-stats"></div>
+        <div class="chart h200" id="chart-ops-pnl-dist"></div>
+      </div>
+      <div class="chart-box" style="margin-bottom:14px;">
+        <div class="chart-title">📝 引擎日志阶段分布</div>
+        <div class="chart h200" id="chart-ops-log-dist"></div>
+      </div>
+    </div>
 
     <!-- 策略运行监控 (4列) -->
-    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">📊 策略运行监控</div>
+    <div class="chart-box" style="margin-bottom:14px;"><div class="chart-title">📊 策略运行监控 <span style="color:var(--text-dim);font-size:10px;margin-left:8px;">10策略全覆盖</span></div>
       <div class="ops-strategy-grid" id="ops-strategies"></div>
     </div>
 
@@ -1604,6 +1817,15 @@ const fmtPct = (n) => ((n||0)>=0?'+':'')+(n||0).toFixed(2)+'%';
 const fmtVol = (v) => v>=1e12 ? (v/1e12).toFixed(2)+'万亿' : v>=1e8 ? (v/1e8).toFixed(2)+'亿' : v>=1e4 ? (v/1e4).toFixed(2)+'万' : fmtNum(v);
 const pnlClass = (n) => (n||0)>0?'pnl-pos':(n||0)<0?'pnl-neg':'';
 const dateLabel = (d) => d ? d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8) : '';
+
+// Hex → RGBA 转换（用于 ECharts 半透明填充）
+const _hexToRgba = (hex, alpha) => {
+  const h = hex.replace('#','');
+  const r = parseInt(h.substring(0,2), 16);
+  const g = parseInt(h.substring(2,4), 16);
+  const b = parseInt(h.substring(4,6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+};
 
 // ═══ 时钟 ═══════════════════════════════════════════════════
 function updateClock() {
@@ -2296,7 +2518,15 @@ function renderZtTable(allStocks) {
 // ═══ 7. 运维监控 ═══════════════════════════════════════════
 let opsData = null;
 let opsRefreshTimer = null;
+let _opsCharts = [];  // 运维面板 ECharts 实例管理
+
+function _disposeOpsCharts() {
+  _opsCharts.forEach(c => { try { c.dispose(); } catch(e){} });
+  _opsCharts = [];
+}
+
 async function loadOps() {
+  _disposeOpsCharts();
   opsData = await API('/ops/overview');
   if (!opsData || !opsData.success) {
     $('#tab-ops').innerHTML = '<div class="loading">运维数据加载失败</div>'; return;
@@ -2314,12 +2544,20 @@ async function loadOps() {
 function renderOps() {
   renderOpsHealth(opsData.system);
   renderOpsEngine(opsData.engine);
+  renderOpsPhaseTimeline(opsData.engine);
+  renderOpsEquityChart(opsData.equity_history);
+  renderOpsDrawdownChart(opsData.equity_history);
+  renderOpsTradeAnalysis(opsData.trade_analysis);
+  renderOpsLogDistribution(opsData.logs);
   renderOpsStrategies(opsData.strategies);
   renderOpsOperations(opsData.operations);
   renderOpsLogs(opsData.logs);
 }
 
-// ── 系统健康 ──
+// ── 系统健康（含趋势 sparkline） ──
+let _healthHistory = { cpu:[], mem:[] };
+const _HEALTH_MAX_HISTORY = 30;  // 保留最近30次采集（15分钟@30s间隔）
+
 function renderOpsHealth(sys) {
   $('#ops-health-time').textContent = `采集时间: ${new Date().toLocaleTimeString()}`;
   const getColor = (val, warn, crit) => val >= crit ? 'var(--red)' : val >= warn ? 'var(--orange)' : 'var(--green)';
@@ -2337,6 +2575,28 @@ function renderOpsHealth(sys) {
       <div class="card-sub" style="color:var(--text-dim);font-size:11px;">${c.sub}</div>
     </div>
   `).join('');
+
+  // 维护趋势历史缓冲区
+  _healthHistory.cpu.push(sys.cpu_percent);
+  _healthHistory.mem.push(sys.memory_used_mb);
+  if (_healthHistory.cpu.length > _HEALTH_MAX_HISTORY) _healthHistory.cpu.shift();
+  if (_healthHistory.mem.length > _HEALTH_MAX_HISTORY) _healthHistory.mem.shift();
+
+  // 渲染 sparkline
+  const renderSparkline = (containerId, data, maxVal, clsFn) => {
+    const el = document.getElementById(containerId);
+    if (!el || !data.length) return;
+    el.innerHTML = data.map(v => {
+      const pct = maxVal > 0 ? Math.max(2, (v / maxVal) * 100) : 5;
+      return `<div class="bar ${clsFn(v)}" style="height:${pct}%;" title="${v.toFixed(1)}"></div>`;
+    }).join('');
+  };
+  const cpuMax = Math.max(..._healthHistory.cpu, 100);
+  const memMax = Math.max(..._healthHistory.mem, 1000);
+  renderSparkline('ops-cpu-sparkline', _healthHistory.cpu, cpuMax,
+    v => v >= 85 ? 'cpu-high' : v >= 60 ? 'cpu-mid' : 'cpu-low');
+  renderSparkline('ops-mem-sparkline', _healthHistory.mem, memMax,
+    v => v >= 2000 ? 'mem-high' : v >= 1000 ? 'mem-mid' : 'mem-low');
 }
 
 // ── 引擎状态 ──
@@ -2372,13 +2632,326 @@ function renderOpsEngine(eng) {
   $('#ops-engine-status').innerHTML = html;
 }
 
+// ── 生命周期阶段流转时间线 ──
+function renderOpsPhaseTimeline(eng) {
+  // 定义全部生命周期阶段（按顺序）
+  const allPhases = [
+    { key:'screening', label:'选股', icon:'🔍' },
+    { key:'signal_scan', label:'信号', icon:'📡' },
+    { key:'stop_monitor', label:'止损', icon:'🛡' },
+    { key:'trade_exec', label:'交易', icon:'💹' },
+    { key:'trade_plan', label:'计划', icon:'📋' },
+    { key:'backtest', label:'回测', icon:'🔄' },
+    { key:'machine_learning', label:'ML', icon:'🧠' },
+    { key:'idle', label:'空闲', icon:'⏸' },
+  ];
+
+  const currentPhase = (eng.phase || '').toLowerCase();
+  let currentFound = false;
+  let subtitle = '';
+  const isRunning = eng.state === 'running';
+
+  const nodes = allPhases.map((p, i) => {
+    let cls = 'pending';
+    if (p.key === currentPhase) {
+      cls = 'active';
+      currentFound = true;
+      subtitle = `当前: ${p.icon} ${p.label}` + (isRunning ? '' : '（引擎未运行）');
+    } else if (!currentFound) {
+      cls = 'done';
+    }
+    return { ...p, cls };
+  });
+
+  $('#ops-phase-subtitle').textContent = subtitle;
+
+  const timelineHtml = nodes.map((p, i) => {
+    const connector = i < nodes.length - 1
+      ? `<div class="phase-connector ${p.cls === 'done' ? 'done' : (p.cls === 'active' && nodes[i+1].cls === 'pending') ? 'active' : ''}"></div>`
+      : '';
+    return `
+      <div class="phase-node">
+        <div class="dot ${p.cls}"></div>
+        <div class="label ${p.cls}">${p.icon}<br>${p.label}</div>
+      </div>${connector}`;
+  }).join('');
+
+  $('#ops-phase-timeline').innerHTML = nodes.length
+    ? `<div class="phase-timeline">${timelineHtml}</div>`
+    : '<div style="color:var(--text-dim);font-size:12px;">等待引擎启动...</div>';
+}
+
+// ── 策略权益曲线（对数坐标，AKQuant §13.2.1） ──
+function renderOpsEquityChart(history) {
+  const dom = document.getElementById('chart-ops-equity');
+  if (!dom) return;
+  const chart = echarts.init(dom);
+  if (!history || !Object.keys(history).length) {
+    chart.setOption({ title:{text:'暂无权益数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  const strategyColors = {
+    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
+    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
+    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4'
+  };
+  const strategyLabels = {
+    dragon_head:'龙头', sparrow:'麻雀', turtle:'海龟', value_invest:'价值',
+    grid:'网格', ma_cross:'均线', bollinger:'布林',
+    volume_breakout:'量价', trend_accel:'趋势', high_growth:'高增长'
+  };
+
+  // 只取有数据的策略（至少2个点）
+  const entries = Object.entries(history).filter(([,s]) => Array.isArray(s) && s.length >= 2);
+  if (!entries.length) {
+    chart.setOption({ title:{text:'暂无足够权益数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  const series = entries.map(([key, seriesData]) => ({
+    name: strategyLabels[key] || key,
+    type: 'line',
+    data: seriesData.map(s => [s.date, s.equity]),
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 2, color: strategyColors[key] || '#6d8099' },
+    emphasis: { focus: 'series' },
+  }));
+
+  const allEquities = entries.flatMap(([, s]) => s.map(d => d.equity));
+  const minEquity = Math.min(...allEquities);
+  const maxEquity = Math.max(...allEquities);
+
+  chart.setOption({
+    tooltip: { trigger: 'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'} },
+    legend: { bottom:0, textStyle:{color:'#6d8099',fontSize:10}, data:series.map(s=>s.name) },
+    grid: { left:60, right:20, top:10, bottom:35 },
+    xAxis: { type:'category', axisLine:{lineStyle:{color:'#2a3a4a'}}, axisLabel:{color:'#6d8099',fontSize:9} },
+    yAxis: {
+      type: 'log',  // 对数坐标 → 斜率直接反映复利增长率
+      min: Math.max(minEquity * 0.95, 100),
+      max: maxEquity * 1.05,
+      axisLine:{lineStyle:{color:'#2a3a4a'}},
+      axisLabel:{color:'#6d8099',fontSize:9,formatter:v => '¥'+(v/10000).toFixed(1)+'万'},
+      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
+    },
+    series,
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
+// ── 策略回撤水下曲线（AKQuant §13.2.2） ──
+function renderOpsDrawdownChart(history) {
+  const dom = document.getElementById('chart-ops-drawdown');
+  if (!dom) return;
+  const chart = echarts.init(dom);
+  if (!history || !Object.keys(history).length) {
+    chart.setOption({ title:{text:'暂无数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+
+  const strategyColors = {
+    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
+    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
+    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4'
+  };
+  const strategyLabels = {
+    dragon_head:'龙头', sparrow:'麻雀', turtle:'海龟', value_invest:'价值',
+    grid:'网格', ma_cross:'均线', bollinger:'布林',
+    volume_breakout:'量价', trend_accel:'趋势', high_growth:'高增长'
+  };
+
+  // 计算每个策略的回撤序列
+  const calcDD = (series) => {
+    let peak = series[0].equity;
+    return series.map(s => {
+      if (s.equity > peak) peak = s.equity;
+      return { date: s.date, dd: peak > 0 ? ((s.equity - peak) / peak * 100) : 0 };
+    });
+  };
+
+  const entries = Object.entries(history)
+    .filter(([,s]) => Array.isArray(s) && s.length >= 2)
+    .map(([key, s]) => [key, calcDD(s)]);
+
+  if (!entries.length) {
+    chart.setOption({ title:{text:'暂无足够数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  const series = entries.map(([key, dd]) => ({
+    name: strategyLabels[key] || key,
+    type: 'line',
+    data: dd.map(d => [d.date, d.dd]),
+    smooth: true,
+    symbol: 'none',
+    lineStyle: { width: 1.5, color: strategyColors[key] || '#6d8099' },
+    areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,
+      [{offset:0, color: _hexToRgba(strategyColors[key]||'#6d8099', 0.25)},
+       {offset:1, color:'rgba(0,0,0,0)'}]) },
+    emphasis: { focus: 'series' },
+  }));
+
+  // 找最深回撤
+  const allDDs = entries.flatMap(([, dd]) => dd.map(d => d.dd));
+  const minDD = Math.min(0, ...allDDs);
+
+  chart.setOption({
+    tooltip: { trigger:'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'},
+      formatter: ps => ps.map(p => `${p.marker} ${p.seriesName}: ${p.value[1].toFixed(2)}%`).join('<br>') },
+    legend: { bottom:0, textStyle:{color:'#6d8099',fontSize:10}, data:series.map(s=>s.name) },
+    grid: { left:55, right:20, top:10, bottom:35 },
+    xAxis: { type:'category', axisLine:{lineStyle:{color:'#2a3a4a'}}, axisLabel:{color:'#6d8099',fontSize:9} },
+    yAxis: {
+      type:'value', min: minDD - 2, max: 2,
+      axisLabel:{color:'#6d8099',fontSize:9,formatter:v=>v.toFixed(0)+'%'},
+      axisLine:{lineStyle:{color:'#2a3a4a'}},
+      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
+    },
+    series,
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
+// ── 交易盈亏分析（AKQuant §13.2.8 MAE/MFE 风格） ──
+function renderOpsTradeAnalysis(ta) {
+  if (!ta) return;
+  const stats = [
+    { label:'总交易', val:ta.total_trades||0 },
+    { label:'胜率', val:(ta.win_rate||0)+'%', color:(ta.win_rate||0)>=50?'var(--green)':'var(--orange)' },
+    { label:'总盈亏', val:'¥'+(ta.total_pnl||0).toFixed(0), color:(ta.total_pnl||0)>=0?'var(--green)':'var(--red)' },
+    { label:'平均盈利', val:'¥'+(ta.avg_win||0).toFixed(0), color:'var(--green)' },
+    { label:'平均亏损', val:'¥'+(ta.avg_loss||0).toFixed(0), color:'var(--red)' },
+    { label:'盈亏比', val:(ta.profit_factor||0).toFixed(2), color:(ta.profit_factor||0)>=1.5?'var(--green)':(ta.profit_factor||0)>=1?'var(--orange)':'var(--red)' },
+    { label:'最大连胜', val:ta.max_consecutive_wins||0 },
+    { label:'最大连亏', val:ta.max_consecutive_losses||0, color:(ta.max_consecutive_losses||0)>3?'var(--red)':'' },
+  ];
+  $('#ops-trade-stats').innerHTML = stats.map(s => `
+    <div class="trade-stat-card">
+      <div class="stat-val" style="color:${s.color||'#fff'}">${s.val}</div>
+      <div class="stat-label">${s.label}</div>
+    </div>
+  `).join('');
+
+  // 盈亏分布柱状图
+  const distDom = document.getElementById('chart-ops-pnl-dist');
+  if (!distDom) return;
+  const chart = echarts.init(distDom);
+  const dist = ta.pnl_distribution || [];
+  if (!dist.length) {
+    chart.setOption({ title:{text:'暂无交易数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  chart.setOption({
+    tooltip: { trigger:'axis', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'} },
+    grid: { left:45, right:15, top:10, bottom:30 },
+    xAxis: {
+      type:'category', data:dist.map(d=>d.range),
+      axisLabel:{color:'#6d8099',fontSize:9,rotate:30},
+      axisLine:{lineStyle:{color:'#2a3a4a'}},
+    },
+    yAxis: {
+      type:'value', name:'笔数',
+      axisLabel:{color:'#6d8099',fontSize:9},
+      splitLine:{lineStyle:{color:'#2a3a4a',type:'dashed'}},
+    },
+    series: [{
+      type:'bar', data:dist.map((d,i) => {
+        const range = d.range;
+        const midVal = parseFloat(range.split('~')[0]) || 0;
+        return { value:d.count, itemStyle:{color:midVal>=0?'#27ae60':'#e74c3c'} };
+      }),
+      barWidth:'60%',
+    }],
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
+// ── 引擎日志阶段分布 ──
+function renderOpsLogDistribution(logs) {
+  const dom = document.getElementById('chart-ops-log-dist');
+  if (!dom) return;
+  const chart = echarts.init(dom);
+
+  if (!logs || !logs.length) {
+    chart.setOption({ title:{text:'暂无日志数据',left:'center',top:'center',textStyle:{color:'#6d8099',fontSize:13}} });
+    return;
+  }
+
+  // 统计各阶段出现次数
+  const phaseCount = {};
+  const phaseLabels = {
+    closed:'非交易', pre_market:'盘前', auction:'竞价', auction_result:'竞价结果',
+    morning:'早盘', lunch:'午休', afternoon:'午盘', post_market:'收盘',
+    screening:'选股', signal_scan:'信号', stop_monitor:'止损', trade_exec:'交易',
+    trade_plan:'计划', backtest:'回测', machine_learning:'ML', idle:'空闲',
+  };
+  logs.forEach(l => {
+    const p = l.phase || 'other';
+    const label = phaseLabels[p] || p;
+    phaseCount[label] = (phaseCount[label] || 0) + 1;
+  });
+
+  const entries = Object.entries(phaseCount).sort((a,b) => b[1] - a[1]);
+  const colors = ['#3498db','#27ae60','#f39c12','#e74c3c','#9b59b6','#1abc9c','#e67e22','#2ecc71','#e91e63','#00bcd4','#f1c40f','#95a5a6'];
+
+  chart.setOption({
+    tooltip: { trigger:'item', backgroundColor:'#1a2332', borderColor:'#2a3a4a', textStyle:{color:'#c8d6e5'},
+      formatter:'{b}: {c} 条 ({d}%)' },
+    series: [{
+      type:'pie',
+      radius:['45%','75%'],
+      center:['50%','50%'],
+      avoidLabelOverlap:false,
+      itemStyle:{borderRadius:4,borderColor:'#0f1923',borderWidth:2},
+      label:{show:true,position:'outside',color:'#6d8099',fontSize:10,formatter:'{b}'},
+      emphasis:{label:{fontSize:14,fontWeight:'bold'}},
+      data:entries.map(([name,val],i) => ({
+        name, value:val, itemStyle:{color:colors[i%colors.length]}
+      })),
+    }],
+  });
+
+  window.addEventListener('resize', () => chart.resize());
+  _opsCharts.push(chart);
+}
+
 // ── 策略监控 ──
 function renderOpsStrategies(strategies) {
   if (!strategies || !strategies.length) {
     $('#ops-strategies').innerHTML = '<div class="empty">暂无策略运行数据</div>'; return;
   }
-  const icons = { dragon_head:'🐉', sparrow:'🐦', turtle:'🐢', value_invest:'📈' };
-  const colors = { dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db' };
+  const icons = {
+    dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💎',
+    grid:'🔲', ma_cross:'📈', bollinger:'📊',
+    volume_breakout:'💥', trend_accel:'🚀', high_growth:'🌱',
+  };
+  const colors = {
+    dragon_head:'#e74c3c', sparrow:'#f39c12', turtle:'#27ae60', value_invest:'#3498db',
+    grid:'#9b59b6', ma_cross:'#1abc9c', bollinger:'#e67e22',
+    volume_breakout:'#2ecc71', trend_accel:'#e91e63', high_growth:'#00bcd4',
+  };
+
+  // 生命周期阶段 Badge 配置
+  const phaseBadge = {
+    idle:          { icon:'⏸', label:'空闲', color:'#636e72', bg:'rgba(99,110,114,0.15)' },
+    screening:     { icon:'🔍', label:'选股', color:'#0984e3', bg:'rgba(9,132,227,0.15)' },
+    signal_scan:   { icon:'📡', label:'信号扫描', color:'#00b894', bg:'rgba(0,184,148,0.15)' },
+    stop_monitor:  { icon:'🛡', label:'止损监控', color:'#e17055', bg:'rgba(225,112,85,0.15)' },
+    trade_exec:    { icon:'💹', label:'交易执行', color:'#fdcb6e', bg:'rgba(253,203,110,0.15)' },
+    trade_plan:    { icon:'📋', label:'制定计划', color:'#a29bfe', bg:'rgba(162,155,254,0.15)' },
+    backtest:      { icon:'🔄', label:'回测', color:'#74b9ff', bg:'rgba(116,185,255,0.15)' },
+    machine_learning: { icon:'🧠', label:'ML', color:'#fd79a8', bg:'rgba(253,121,168,0.15)' },
+  };
 
   $('#ops-strategies').innerHTML = strategies.map(s => {
     const icon = icons[s.key]||'📊';
@@ -2389,6 +2962,10 @@ function renderOpsStrategies(strategies) {
     const sigHtml = sigActive
       ? `<div style="color:var(--green);font-size:11px;">🟢 信号活跃</div>`
       : `<div style="color:var(--text-dim);font-size:11px;">⏸ 暂无信号</div>`;
+
+    // 生命周期阶段 Badge
+    const ph = phaseBadge[s.lifecycle_phase] || phaseBadge['idle'];
+    const phaseBadgeHtml = `<span style="display:inline-flex;align-items:center;gap:3px;background:${ph.bg};color:${ph.color};padding:1px 8px;border-radius:10px;font-size:10px;border:1px solid ${ph.color}40;">${ph.icon} ${ph.label}</span>`;
 
     // 信号标签
     let signalsHtml = '';
@@ -2412,6 +2989,7 @@ function renderOpsStrategies(strategies) {
         <span class="name">${s.label}</span>
         <span class="badge" style="background:rgba(255,255,255,0.08);color:var(--text-dim);">${s.maintenance_interval_days}天/维护</span>
       </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">${phaseBadgeHtml}</div>
       <div class="metric-row"><span>买/卖信号</span><span class="val"><span style="color:var(--green)">${s.buy_count}</span>/<span style="color:var(--red)">${s.sell_count}</span></span></div>
       <div class="metric-row"><span>扫描耗时</span><span class="val">${s.last_scan_duration||0}秒</span></div>
       <div class="metric-row"><span>池内标的</span><span class="val">🎯${tiers.focus||0} 👀${tiers.watch||0} 📋${tiers.broad||0}</span></div>

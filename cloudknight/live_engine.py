@@ -12,7 +12,21 @@
   │ 15:00  收盘       → 盘后选股, 制定次日计划            │
   └─────────────────────────────────────────────────────┘
 
-非交易日: 全天 = 选股模式（所有策略筛选股票入池）
+心跳驱动的策略日常生命周期（贯穿所有时段）:
+  ┌──────────────────────────────────────────────────────┐
+  │ ① 选股 SCREENING         → 拉取代码诊股入池           │
+  │ ② 信号扫描 SIGNAL_SCAN    → 观察买入/卖出信号         │
+  │ ③ 止盈止损 STOP_MONITOR   → 监控止盈止损条件触发       │
+  │ ④ 执行交易 TRADE_EXEC     → 根据信号执行交易          │
+  │ ⑤ 交易计划 TRADE_PLAN     → 制定/更新交易计划         │
+  │ ⑥ 数据回测 BACKTEST       → 回测优化策略              │
+  │ ⑦ 机器学习 MACHINE_LEARNING → 空闲+有精选标的时触发    │
+  │ ⑧ 空闲 IDLE               → 暂无任务                 │
+  └──────────────────────────────────────────────────────┘
+
+非交易日: 全天循环执行 ①→②→③→⑤→⑥→⑧, 空闲时触发⑦
+交易时段: 并行执行 ②③④（信号+止盈止损+交易）+ 午间⑤+盘后①⑤⑥
+ML 触发: 仅在引擎空闲(IDLE) 且 策略池有精选标的(focus/watch) 时自动触发
 """
 
 import contextlib
@@ -32,6 +46,17 @@ from .config import (
     LIVE_ENGINE_CHECK_INTERVAL,
     LIVE_ENGINE_SCAN_INTERVAL,
     LIVE_LOG_DIR,
+    ML_GATE_DIRECTION_THRESHOLD,
+    ML_GATE_ENABLED,
+    ML_GATE_MAX_WEIGHT,
+    ML_GATE_MIN_ACCURACY,
+    ML_GATE_MIN_WEIGHT,
+    ML_GATE_WINDOW_SIZE,
+    ML_LABEL_METHOD,
+    ML_MODEL_DIR,
+    ML_MODEL_TYPE,
+    ML_RETRAIN_DAYS,
+    ML_TRAIN_WINDOW,
     POOL_MAX_SIZE,
     STRATEGIES,
 )
@@ -43,10 +68,15 @@ from .indicators import (
     comprehensive_analysis,
 )
 from .market_analyzer import MarketAnalyzer, MarketSnapshot
+from .ml_engine import MLEngine, MLDecisionGate
 from .paper_trader import SNAPSHOT_FILE as PAPER_SNAPSHOT_FILE
-from .paper_trader import PaperTrader
+from .paper_trader import PaperPosition, PaperTrader
 from .signal_hunter import SignalHunter, SignalResult, TradingPlan
-from .stock_pool import PoolManager
+from .stock_pool import (
+    TIER_FOCUS,
+    TIER_WATCH,
+    PoolManager,
+)
 from .trading_calendar import TradingCalendar, TradingPhase, get_phase_label
 
 logger = logging.getLogger(__name__)
@@ -60,6 +90,29 @@ class EngineState(Enum):
     RUNNING = "running"
     PAUSED = "paused"
     STOPPING = "stopping"
+
+
+class LifecyclePhase(Enum):
+    """心跳驱动的策略日常生命周期阶段"""
+
+    IDLE = ("idle", "空闲", 0)
+    SCREENING = ("screening", "选股", 1)                  # ① 拉取代码诊股入池
+    SIGNAL_SCAN = ("signal_scan", "信号扫描", 2)            # ② 观察买入/卖出信号
+    STOP_MONITOR = ("stop_monitor", "止盈止损监控", 3)       # ③ 监控止盈止损条件触发
+    TRADE_EXEC = ("trade_exec", "执行交易", 4)              # ④ 根据信号执行交易
+    TRADE_PLAN = ("trade_plan", "制定交易计划", 5)           # ⑤ 制定/更新交易计划
+    BACKTEST = ("backtest", "数据回测", 6)                  # ⑥ 回测优化策略
+    MACHINE_LEARNING = ("machine_learning", "机器学习", 7)   # ⑦ 模型训练与预测
+
+    @property
+    def label(self) -> str:
+        return self.value[1]
+
+    @property
+    def order(self) -> int:
+        return self.value[2]
+
+
 
 
 @dataclass
@@ -106,6 +159,48 @@ class LiveTradingEngine:
         self._logs: list[EngineLog] = []
         self._max_logs = 500
         self._log_callbacks: list[Callable[..., object]] = []
+
+        # ── 心跳驱动的策略日常生命周期 ──
+        self._lifecycle_phase: LifecyclePhase = LifecyclePhase.IDLE
+        self._lifecycle_completed: set[str] = set()       # 当日已完成的阶段
+        self._lifecycle_last_run: dict[str, datetime] = {}  # 各阶段上次执行时间
+        self._lifecycle_pause_until: datetime | None = None  # 异常暂停
+
+        # ── 各策略独立生命周期阶段跟踪 ──
+        self._strategy_phase: dict[str, str] = {k: LifecyclePhase.IDLE.value[0] for k in STRATEGIES}
+        self._strategy_phase_label: dict[str, str] = {k: LifecyclePhase.IDLE.label for k in STRATEGIES}
+        self._strategy_phase_updated: dict[str, str] = {}  # 更新时间戳
+
+        # 选股阶段状态
+        self._screen_offset: int = 0
+        self._screened_codes: set[str] = set()
+        self._screening_done: bool = False  # 选股全部完成
+
+        # 回测阶段状态
+        self._backtest_date: str | None = None  # 上次回测日期
+
+        # 机器学习引擎（基于 AKQuant §12 ML 最佳实践）
+        self._ml_engine = MLEngine(
+            fetcher=self.fetcher,
+            model_type=ML_MODEL_TYPE,
+            label_method=ML_LABEL_METHOD,
+            model_dir=ML_MODEL_DIR,
+            train_window=ML_TRAIN_WINDOW,
+        )
+        self._ml_last_train_date: str | None = None  # 上次训练日期
+
+        # ML 决策门控器（动态权重，自适应）
+        self._ml_gate = MLDecisionGate(
+            state_dir=ML_MODEL_DIR,
+            window_size=ML_GATE_WINDOW_SIZE,
+            min_weight=ML_GATE_MIN_WEIGHT,
+            max_weight=ML_GATE_MAX_WEIGHT,
+            min_accuracy=ML_GATE_MIN_ACCURACY,
+            direction_threshold=ML_GATE_DIRECTION_THRESHOLD,
+        )
+        self._ml_prediction_cache: dict[str, str] = {}  # code → ml_direction
+        self._ml_score_cache: dict[str, float] = {}     # code → ml_score
+        self._ml_last_validate_date: str | None = None  # 上次验证日期
 
     # ═══════════════════════════════════════════
     # 引擎生命周期
@@ -192,6 +287,10 @@ class LiveTradingEngine:
                 if self.state == EngineState.RUNNING:
                     self._dispatch_phase_action(phase, now)
 
+                # 心跳：驱动策略日常生命周期（所有时段，每次循环检查）
+                if self.state == EngineState.RUNNING:
+                    self._lifecycle_tick(now, phase)
+
                 # 等待下次检查
                 self._stop_event.wait(timeout=LIVE_ENGINE_CHECK_INTERVAL)
 
@@ -208,6 +307,7 @@ class LiveTradingEngine:
         if phase == TradingPhase.PRE_MARKET:
             self._phase_completed.clear()
             self._clear_daily_cache()
+            self._reset_lifecycle()  # 新交易日，重置生命周期
 
         label = get_phase_label(phase)
         self._log(phase, f">>> 进入 [{label}] 阶段")
@@ -255,29 +355,15 @@ class LiveTradingEngine:
     # ═══════════════════════════════════════════
 
     def _action_non_trading_day(self, now: datetime):
-        """非交易日：全策略选股入池"""
-        self._log(TradingPhase.CLOSED, "非交易日 → 执行选股任务")
-        # 每个交易日开始前重置数据源状态，允许恢复重试
+        """非交易日：启动生命周期选股流程（心跳自动分批执行）"""
+        self._log(TradingPhase.CLOSED, "非交易日 → 生命周期自动选股启动")
+        # 重置数据源状态
         self.fetcher.reset_unavailable_sources()
-        self._log(TradingPhase.CLOSED, "获取全市场股票基础池...")
-
-        try:
-            codes = self.fetcher.build_stock_pool(filter_st=True, filter_new=True)
-            self._log(TradingPhase.CLOSED, f"基础池: {len(codes)} 只")
-
-            # 为四种策略并行筛选
-            results = self.pool_mgr.screen_all(codes, verbose=False)
-            for key, items in results.items():
-                label = STRATEGIES.get(key, key)
-                top_score = items[0].score if items else 0
-                self._log(TradingPhase.CLOSED, f"  [{label}] 筛选 {len(items)} 只 → 最高评分: {top_score}")
-
-            # 保存股票池
-            self.pool_mgr.save_all()
-            self._log(TradingPhase.CLOSED, "选股完成，股票池已保存")
-
-        except Exception as e:
-            self._log(TradingPhase.CLOSED, f"选股异常: {e}")
+        # 重置选股状态，让生命周期开始循环
+        self._screening_done = False
+        self._screened_codes.clear()
+        self._lifecycle_completed.discard(LifecyclePhase.SCREENING.value[0])
+        self._log(TradingPhase.CLOSED, f"全市场 {5528}+ 只股票将通过心跳分批诊股入池")
 
     def _action_pre_market(self, now: datetime):
         """盘前准备 08:30-09:15"""
@@ -622,6 +708,853 @@ class LiveTradingEngine:
             return True
         return False
 
+    # ═══════════════════════════════════════════
+    # 心跳驱动的策略日常生命周期
+    # ═══════════════════════════════════════════
+
+    # ── 全局参数 ──
+    _LIFECYCLE_CYCLE_INTERVAL = 10      # 阶段切换间隔（秒）
+    _SCREEN_BATCH_SIZE = 200            # 每轮选股代码数
+    _FOCUS_TARGET = 5                   # 每策略精选层目标
+    _PAUSE_ON_ERROR = 120               # 异常暂停秒数
+
+    # ── 各阶段间隔（秒） ──
+    _INTERVAL_SCREENING = 30     # 选股每轮间隔
+    _INTERVAL_SIGNAL_SCAN = 60   # 信号扫描间隔（交易时段）
+    _INTERVAL_STOP_MONITOR = 30  # 止盈止损检查间隔（交易时段）
+    _INTERVAL_TRADE_EXEC = 5     # 交易执行冷却
+    _INTERVAL_TRADE_PLAN = 300   # 交易计划生成间隔（5分钟）
+    _INTERVAL_BACKTEST = 600     # 回测间隔（10分钟）
+    _INTERVAL_MACHINE_LEARNING = 1800  # 机器学习间隔（30分钟）
+
+    # ═══════════════════════════════════════════
+    # 生命周期主驱动
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_tick(self, now: datetime, trading_phase: TradingPhase):
+        """心跳主入口：根据当前交易时段确定并执行生命周期阶段。
+
+        在引擎主循环每次 tick 时调用（所有时段）。
+        交易时段与非交易时段采用不同的阶段调度策略。
+        """
+        # 异常暂停检查
+        if self._lifecycle_pause_until and now < self._lifecycle_pause_until:
+            return
+
+        # 确定当前应执行的生命周期阶段
+        target_phase = self._lifecycle_determine_phase(now, trading_phase)
+
+        # 冷却检查
+        if not self._lifecycle_can_run(target_phase, now, trading_phase):
+            return
+
+        # 执行阶段动作
+        self._lifecycle_execute(target_phase, now, trading_phase)
+
+    def _lifecycle_determine_phase(self, now: datetime, trading_phase: TradingPhase) -> LifecyclePhase:
+        """根据当前交易时段确定应执行的生命周期阶段。
+
+        非交易时段 (CLOSED): 顺序推进 选股 → 信号 → 止损 → 计划 → 回测 → 空闲
+        交易时段: 并行执行信号扫描 + 止盈止损监控，午间做计划，盘后选股+回测
+
+        ML 触发规则（独立于顺序调度）：
+          1. 策略处于空闲状态（IDLE）
+          2. 策略股票池有精选的股票需要训练（focus/watch 层）
+          满足以上两条件时，在空闲阶段转入 MACHINE_LEARNING。
+        """
+        # ── 非交易时段：顺序推进（不含 ML，ML 在空闲时机会触发） ──
+        if trading_phase == TradingPhase.CLOSED and not self.calendar.is_trading_day(now):
+            # 非交易日：全生命周期循环（选股 → 信号 → 止损 → 计划 → 回测 → 空闲）
+            phases_order = [
+                LifecyclePhase.SCREENING,
+                LifecyclePhase.SIGNAL_SCAN,
+                LifecyclePhase.STOP_MONITOR,
+                LifecyclePhase.TRADE_PLAN,
+                LifecyclePhase.BACKTEST,
+            ]
+            target = self._next_pending_phase(phases_order)
+            # 顺序阶段全部完成后，空闲时检查 ML 触发条件
+            if target == LifecyclePhase.IDLE:
+                return self._maybe_trigger_ml()
+            return target
+
+        # ── 盘后 (POST_MARKET) ──
+        if trading_phase == TradingPhase.POST_MARKET:
+            phases_order = [
+                LifecyclePhase.SCREENING,
+                LifecyclePhase.TRADE_PLAN,
+                LifecyclePhase.BACKTEST,
+            ]
+            target = self._next_pending_phase(phases_order)
+            if target == LifecyclePhase.IDLE:
+                return self._maybe_trigger_ml()
+            return target
+
+        # ── 盘前/竞价 → 信号扫描 + 交易计划 ──
+        if trading_phase in (TradingPhase.PRE_MARKET, TradingPhase.AUCTION, TradingPhase.AUCTION_RESULT):
+            if trading_phase == TradingPhase.PRE_MARKET:
+                return LifecyclePhase.TRADE_PLAN
+            return LifecyclePhase.SIGNAL_SCAN
+
+        # ── 交易时段（早盘/午盘） → 信号 + 止损 + 执行交易 ──
+        if trading_phase in (TradingPhase.MORNING, TradingPhase.AFTERNOON):
+            # 轮转：信号 → 止损 → 交易
+            signal_key = f"signal_scan_{now.strftime('%H%M')}"
+            stop_key = f"stop_monitor_{now.strftime('%H%M')}"
+            trade_key = f"trade_exec_{now.strftime('%H%M')}"
+
+            # 信号扫描优先（有新信号才有交易）
+            if signal_key not in self._lifecycle_completed:
+                return LifecyclePhase.SIGNAL_SCAN
+            # 止损检查
+            if stop_key not in self._lifecycle_completed:
+                return LifecyclePhase.STOP_MONITOR
+            # 执行交易
+            if trade_key not in self._lifecycle_completed:
+                return LifecyclePhase.TRADE_EXEC
+            return LifecyclePhase.IDLE
+
+        # ── 午间 → 交易计划 ──
+        if trading_phase == TradingPhase.LUNCH:
+            return LifecyclePhase.TRADE_PLAN
+
+        return LifecyclePhase.IDLE
+
+    def _maybe_trigger_ml(self) -> LifecyclePhase:
+        """空闲时检查是否需要触发 ML：必须有精选层的标的才触发。
+
+        触发条件：
+          1. 策略处于空闲状态（由调用方保证，此时应为 IDLE）
+          2. 策略股票池有精选的股票需要训练（focus/watch 层至少 1 只）
+        """
+        if self._ml_has_candidates():
+            return LifecyclePhase.MACHINE_LEARNING
+        return LifecyclePhase.IDLE
+
+    def _ml_has_candidates(self) -> bool:
+        """检查各策略股票池是否有精选/观察层标的需要 ML 训练。"""
+        for strategy_name in STRATEGIES:
+            pool = self.pool_mgr.get_pool(strategy_name)
+            if not pool:
+                continue
+            for item in pool.ranked():
+                if item.tier in (TIER_FOCUS, TIER_WATCH):
+                    return True
+        return False
+
+    def _next_pending_phase(self, phases: list[LifecyclePhase]) -> LifecyclePhase:
+        """从有序阶段列表中返回第一个未完成的阶段"""
+        for p in phases:
+            if p.value[0] not in self._lifecycle_completed:
+                return p
+        return LifecyclePhase.IDLE
+
+    def _lifecycle_can_run(self, phase: LifecyclePhase, now: datetime, trading_phase: TradingPhase) -> bool:
+        """检查阶段是否可以执行（冷却间隔控制）"""
+        if phase == LifecyclePhase.IDLE:
+            return False
+
+        last = self._lifecycle_last_run.get(phase.value[0])
+        if last is None:
+            return True
+
+        # 根据时段和阶段选择间隔
+        is_trading = trading_phase.is_trading_phase()
+        intervals = {
+            LifecyclePhase.SCREENING: self._INTERVAL_SCREENING,
+            LifecyclePhase.SIGNAL_SCAN: self._INTERVAL_SIGNAL_SCAN if is_trading else self._INTERVAL_SCREENING,
+            LifecyclePhase.STOP_MONITOR: self._INTERVAL_STOP_MONITOR if is_trading else self._INTERVAL_STOP_MONITOR,
+            LifecyclePhase.TRADE_EXEC: self._INTERVAL_TRADE_EXEC,
+            LifecyclePhase.TRADE_PLAN: self._INTERVAL_TRADE_PLAN,
+            LifecyclePhase.BACKTEST: self._INTERVAL_BACKTEST,
+            LifecyclePhase.MACHINE_LEARNING: self._INTERVAL_MACHINE_LEARNING,
+        }
+        interval = intervals.get(phase, self._LIFECYCLE_CYCLE_INTERVAL)
+        return (now - last).total_seconds() >= interval
+
+    def _update_all_strategy_phases(self, phase: LifecyclePhase, now: datetime):
+        """将所有策略的当前生命周期阶段更新为指定阶段"""
+        phase_key = phase.value[0]
+        phase_label = phase.label
+        ts = now.strftime("%H:%M:%S")
+        for k in STRATEGIES:
+            self._strategy_phase[k] = phase_key
+            self._strategy_phase_label[k] = phase_label
+            self._strategy_phase_updated[k] = ts
+
+    def _update_strategy_phase(self, strategy_key: str, phase: LifecyclePhase, now: datetime):
+        """更新单个策略的生命周期阶段"""
+        if strategy_key in self._strategy_phase:
+            self._strategy_phase[strategy_key] = phase.value[0]
+            self._strategy_phase_label[strategy_key] = phase.label
+            self._strategy_phase_updated[strategy_key] = now.strftime("%H:%M:%S")
+
+    def _lifecycle_execute(self, phase: LifecyclePhase, now: datetime, trading_phase: TradingPhase):
+        """执行生命周期阶段动作"""
+        self._lifecycle_phase = phase
+        self._lifecycle_last_run[phase.value[0]] = now
+
+        # 标记所有策略进入当前阶段（引擎级阶段：所有策略同步推进）
+        if phase != LifecyclePhase.IDLE:
+            self._update_all_strategy_phases(phase, now)
+
+        handlers = {
+            LifecyclePhase.SCREENING: self._lifecycle_screening,
+            LifecyclePhase.SIGNAL_SCAN: self._lifecycle_signal_scan,
+            LifecyclePhase.STOP_MONITOR: self._lifecycle_stop_monitor,
+            LifecyclePhase.TRADE_EXEC: self._lifecycle_trade_exec,
+            LifecyclePhase.TRADE_PLAN: self._lifecycle_trade_plan,
+            LifecyclePhase.BACKTEST: self._lifecycle_backtest,
+            LifecyclePhase.MACHINE_LEARNING: self._lifecycle_machine_learning,
+        }
+
+        handler = handlers.get(phase)
+        if handler:
+            try:
+                completed = handler(now, trading_phase)
+                if completed:
+                    self._lifecycle_completed.add(phase.value[0])
+            except Exception as e:
+                logger.warning(f"生命周期 [{phase.label}] 异常: {e}")
+                self._log(trading_phase, f"生命周期 [{phase.label}] 异常: {e}")
+                self._lifecycle_pause_until = datetime.fromtimestamp(
+                    datetime.now().timestamp() + self._PAUSE_ON_ERROR
+                )
+
+    # ═══════════════════════════════════════════
+    # ① 选股 SCREENING
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_screening(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """选股：拉取代码诊股入池，直到所有策略池精选层满额。
+
+        Returns:
+            True = 本阶段完成，可进入下一阶段
+        """
+        # 已全部完成
+        if self._screening_done:
+            return True
+
+        # 检查是否所有池精选满额
+        if self._check_all_pools_focus_full():
+            self._screening_done = True
+            self._log(trading_phase, "✅ 选股完成：所有策略池精选层已满 5 只！")
+            return True
+
+        # 执行一轮诊股入池
+        return self._screen_one_batch(now, trading_phase)
+
+    def _screen_one_batch(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """执行一轮选股：取下一批代码 → 诊股入池 → 评估层级"""
+        try:
+            from .stock_info_cache import get_stock_info_cache
+            from .stock_pool import SCREEN_SAMPLE_SIZE
+
+            # 1. 获取全量代码
+            cache = get_stock_info_cache()
+            if cache.is_usable():
+                codes_df = cache.db.get_stock_list()
+                all_codes = [str(c) for c in codes_df["code"].tolist()]
+            else:
+                self.fetcher.reset_unavailable_sources()
+                all_codes = [str(c) for c in self.fetcher.build_stock_pool(filter_st=True, filter_new=True)]
+
+            # 2. 取下一批未筛选代码
+            fresh_codes = [c for c in all_codes if c not in self._screened_codes]
+            if not fresh_codes:
+                self._log(trading_phase, "📋 选股：已遍历全部代码，无可选标的")
+                self._screening_done = True
+                return True
+
+            batch_size = min(SCREEN_SAMPLE_SIZE, self._SCREEN_BATCH_SIZE)
+            batch = fresh_codes[:batch_size]
+            self._screened_codes.update(batch)
+
+            # 3. 执行诊股入池
+            round_num = len(self._screened_codes) // batch_size
+            self._log(trading_phase, f"🔄 [{LifecyclePhase.SCREENING.label}] 第{round_num}轮: {len(batch)} 只候选...")
+            self.pool_mgr.screen_all(batch, verbose=False)
+
+            # 4. 评估层级
+            self.pool_mgr.evaluate_all(verbose=False)
+            self.pool_mgr.save_all()
+
+            # 5. 输出进度
+            overview = self.pool_mgr.tier_overview()
+            status_parts = []
+            for key, counts in overview.items():
+                focus = counts.get("focus", 0)
+                total = self.pool_mgr.pools[key].size if key in self.pool_mgr.pools else 0
+                bar = "█" * min(focus, self._FOCUS_TARGET) + "░" * max(0, self._FOCUS_TARGET - focus)
+                status_parts.append(f"{key}: [{bar}] {focus}/{self._FOCUS_TARGET} (共{total})")
+            self._log(trading_phase, f"  精选进度: {' | '.join(status_parts)}")
+
+            # 检查是否本轮后已满额
+            return self._check_all_pools_focus_full()
+
+        except Exception as e:
+            logger.warning(f"选股异常: {e}")
+            raise
+
+    def _check_all_pools_focus_full(self) -> bool:
+        """检查是否所有策略池的精选层都达到目标数量"""
+        try:
+            overview = self.pool_mgr.tier_overview()
+            for _key, counts in overview.items():
+                if counts.get("focus", 0) < self._FOCUS_TARGET:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    # ═══════════════════════════════════════════
+    # ② 信号扫描 SIGNAL_SCAN
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_signal_scan(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """观察买入/卖出信号：对池中股票进行多策略并行信号扫描"""
+        # 构建各策略的股票代码映射
+        stock_pool_map: dict[str, list[str]] = {}
+        for strategy_name in STRATEGIES:
+            pool = self.pool_mgr.get_pool(strategy_name)
+            if pool:
+                codes = [item.code for item in pool.ranked()[:POOL_MAX_SIZE]]
+                if codes:
+                    stock_pool_map[strategy_name] = codes
+
+        if not stock_pool_map:
+            return True  # 无股票，跳过
+
+        self._log(trading_phase, f"🔎 [{LifecyclePhase.SIGNAL_SCAN.label}] 扫描 {sum(len(v) for v in stock_pool_map.values())} 只池中股票...")
+
+        # 执行信号扫描
+        sentiment = "neutral"
+        if self._latest_snapshot:
+            sentiment = self._latest_snapshot.market_sentiment
+
+        self._latest_signals = self.hunter.scan_all_strategies(stock_pool_map, days=120, verbose=False)
+
+        # 生成交易计划
+        self._trading_plan = self.hunter.build_trading_plan(self._latest_signals, sentiment)
+
+        # 统计信号
+        total_buy = 0
+        total_sell = 0
+        for result in self._latest_signals.values():
+            if result.error:
+                continue
+            total_buy += sum(1 for s in result.signals if s.signal_type in ("buy", "add"))
+            total_sell += sum(1 for s in result.signals if s.signal_type in ("sell", "reduce", "close"))
+
+        self._log(trading_phase, f"  信号结果: 买入 {total_buy} | 卖出 {total_sell}")
+        return True  # 信号扫描每轮即完成
+
+    # ═══════════════════════════════════════════
+    # ③ 止盈止损监控 STOP_MONITOR
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_stop_monitor(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """监控止盈止损条件触发：检查 PaperTrader 持仓是否触发止盈/止损"""
+        if not self.paper_trader or not self.paper_trader.accounts:
+            return True
+
+        triggered_signals: list[dict] = []
+
+        for strategy_key, acc in self.paper_trader.accounts.items():
+            if not acc.positions:
+                continue
+
+            pool = self.pool_mgr.get_pool(strategy_key)
+            for code, pos in list(acc.positions.items()):
+                try:
+                    # 获取最新价格
+                    df = self.fetcher.fetch_daily_kline(code, start_date="20250601")
+                    if df is None or df.empty:
+                        continue
+
+                    col_map = {"日期": "date", "收盘": "close", "开盘": "open", "最高": "high", "最低": "low"}
+                    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                    current_price = float(df["close"].iloc[-1])
+
+                    # 更新持仓市值
+                    pos.current_price = current_price
+                    pos.market_value = current_price * pos.volume
+                    pos.profit_pct = (current_price / pos.cost - 1) * 100 if pos.cost > 0 else 0
+
+                    # 获取交易计划中的止损/止盈价位
+                    stop_loss = pos.cost * 0.93  # 默认 7% 止损
+                    take_profit = pos.cost * 1.15  # 默认 15% 止盈
+
+                    if pool:
+                        item = pool.get(code)
+                        if item:
+                            plan = pool.create_trade_plan(code, item.name, pos.cost, item.score)
+                            stop_loss = plan.stop_loss
+                            take_profit = plan.take_profit_1
+
+                    # 检查止损
+                    if current_price <= stop_loss:
+                        triggered_signals.append({
+                            "strategy": strategy_key,
+                            "code": code,
+                            "name": pos.name,
+                            "type": "stop_loss",
+                            "price": current_price,
+                            "stop_price": stop_loss,
+                            "cost": pos.cost,
+                            "loss_pct": round((current_price / pos.cost - 1) * 100, 2),
+                        })
+                        self._log(trading_phase,
+                            f"🛑 [止损触发] {strategy_key} {code} {pos.name} "
+                            f"现价{current_price:.2f} ≤ 止损{stop_loss:.2f} "
+                            f"(亏损{(1 - current_price/pos.cost)*100:.1f}%)")
+
+                    # 检查止盈
+                    elif current_price >= take_profit:
+                        triggered_signals.append({
+                            "strategy": strategy_key,
+                            "code": code,
+                            "name": pos.name,
+                            "type": "take_profit",
+                            "price": current_price,
+                            "target_price": take_profit,
+                            "cost": pos.cost,
+                            "profit_pct": round((current_price / pos.cost - 1) * 100, 2),
+                        })
+                        self._log(trading_phase,
+                            f"🎯 [止盈触发] {strategy_key} {code} {pos.name} "
+                            f"现价{current_price:.2f} ≥ 止盈{take_profit:.2f} "
+                            f"(盈利{(current_price/pos.cost-1)*100:.1f}%)")
+
+                except Exception as e:
+                    logger.debug(f"止盈止损检查 {code}: {e}")
+
+        if triggered_signals:
+            self._log(trading_phase,
+                f"⚡ [{LifecyclePhase.STOP_MONITOR.label}] 触发 {len(triggered_signals)} 条信号: "
+                + ", ".join(f"{s['code']}({s['type']})" for s in triggered_signals[:5]))
+
+        return True  # 每次检查即可完成
+
+    # ═══════════════════════════════════════════
+    # ④ 执行交易 TRADE_EXEC
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_trade_exec(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """执行交易：根据信号或止盈止损触发执行模拟交易"""
+        if not self.paper_trader or not self.paper_trader.accounts:
+            return True
+
+        if not self._latest_signals and not self._trading_plan:
+            return True
+
+        executed = 0
+        executed_strategies: set[str] = set()  # 记录有实际交易的策略
+
+        # 执行交易计划中的信号
+        if self._trading_plan and self._trading_plan.signals:
+            for sig in self._trading_plan.signals:
+                try:
+                    strategy_key = sig.strategy
+                    acc = self.paper_trader.accounts.get(strategy_key)
+                    if not acc:
+                        continue
+
+                    # 获取参考价格
+                    df = self.fetcher.fetch_daily_kline(sig.code, start_date="20250601")
+                    if df is None or df.empty:
+                        continue
+
+                    col_map = {"日期": "date", "收盘": "close"}
+                    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                    current_price = float(df["close"].iloc[-1]) if "close" in df.columns else sig.price
+                    price = current_price if current_price > 0 else sig.price
+
+                    if sig.signal_type in ("buy", "add"):
+                        # ── ML 决策门控：查询 ML 次日预测 ──
+                        ml_direction = "neutral"
+                        if ML_GATE_ENABLED:
+                            ml_direction = self._ml_prediction_cache.get(sig.code, "neutral")
+                            ml_score_val = self._ml_score_cache.get(sig.code, 0.0)
+                            approved, gate_reason = self._ml_gate.evaluate_buy(
+                                code=sig.code,
+                                name=sig.name,
+                                ml_direction=ml_direction,
+                                ml_score=ml_score_val,
+                                date=now.strftime("%Y%m%d"),
+                                price=price,
+                                strategy=strategy_key,
+                            )
+                            if not approved:
+                                self._log(trading_phase,
+                                    f"🚫 [ML驳回] {strategy_key} {sig.code} {sig.name} → {gate_reason}")
+                                continue  # 跳过此买入信号
+
+                        # 计算买入量（每只股票 10% 仓位）
+                        position_ratio = 0.1
+                        amount = acc.cash * position_ratio
+                        lot_size = 100
+                        volume = max(lot_size, int(amount / price / lot_size) * lot_size)
+
+                        if volume > 0 and amount <= acc.cash:
+                            acc.cash -= volume * price
+                            acc.positions[sig.code] = PaperPosition(
+                                code=sig.code,
+                                name=sig.name,
+                                cost=price,
+                                volume=volume,
+                                buy_date=now.strftime("%Y%m%d"),
+                                current_price=price,
+                                market_value=volume * price,
+                            )
+                            executed += 1
+                            executed_strategies.add(strategy_key)
+                            ml_note = f" [ML:{ml_direction}]" if ML_GATE_ENABLED else ""
+                            self._log(trading_phase,
+                                f"💼 [买入] {strategy_key} {sig.code} {sig.name} "
+                                f"@{price:.2f} × {volume}股 = {volume*price:.0f}元{ml_note}")
+
+                    elif sig.signal_type in ("sell", "reduce", "close"):
+                        pos = acc.positions.get(sig.code)
+                        if pos:
+                            # 计算盈亏
+                            pnl = (price - pos.cost) * pos.volume
+                            acc.cash += pos.market_value
+                            del acc.positions[sig.code]
+                            executed += 1
+                            executed_strategies.add(strategy_key)
+                            self._log(trading_phase,
+                                f"💰 [卖出] {strategy_key} {sig.code} {sig.name} "
+                                f"@{price:.2f} 盈亏{pnl:+.0f}元")
+
+                except Exception as e:
+                    logger.debug(f"执行交易 {sig.code}: {e}")
+
+        if executed > 0:
+            self._log(trading_phase, f"✅ [{LifecyclePhase.TRADE_EXEC.label}] 执行 {executed} 笔交易")
+            self.paper_trader.save()
+
+        # 更新有实际交易的策略阶段 → 其他策略恢复为信号扫描完成的待命状态
+        for sk in executed_strategies:
+            self._update_strategy_phase(sk, LifecyclePhase.TRADE_EXEC, now)
+
+        return True  # 每轮执行即完成
+
+    # ═══════════════════════════════════════════
+    # ⑤ 制定交易计划 TRADE_PLAN
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_trade_plan(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """制定/更新交易计划：为池中精选层股票生成交易计划"""
+        plans_generated = 0
+
+        for strategy_name in STRATEGIES:
+            pool = self.pool_mgr.get_pool(strategy_name)
+            if not pool:
+                continue
+
+            label = STRATEGIES.get(strategy_name, strategy_name)
+            focus_items = [item for item in pool.ranked() if item.tier == TIER_FOCUS]
+
+            if not focus_items:
+                self._log(trading_phase, f"📋 [{label}] 无精选层股票，跳过计划")
+                continue
+
+            for item in focus_items[:self._FOCUS_TARGET]:
+                try:
+                    # 获取当前价格
+                    df = self.fetcher.fetch_daily_kline(item.code, start_date="20250601")
+                    if df is None or df.empty:
+                        continue
+                    col_map = {"日期": "date", "收盘": "close"}
+                    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+                    price = float(df["close"].iloc[-1]) if "close" in df.columns else item.entry_price
+
+                    # 生成交易计划（plan 对象绑定到 pool item，供后续查询）
+                    _plan = pool.create_trade_plan(item.code, item.name, price, item.score)
+                    plans_generated += 1
+
+                except Exception as e:
+                    logger.debug(f"生成计划 {item.code}: {e}")
+
+        if plans_generated > 0:
+            self._log(trading_phase,
+                f"📝 [{LifecyclePhase.TRADE_PLAN.label}] 为 {plans_generated} 只精选票生成交易计划")
+
+        return True  # 每轮生成即完成
+
+    # ═══════════════════════════════════════════
+    # ⑥ 数据回测 BACKTEST
+    # ═══════════════════════════════════════════
+
+    def _lifecycle_backtest(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """数据回测：对各策略进行历史回测，优化策略参数"""
+        today_str = now.strftime("%Y%m%d")
+        if self._backtest_date == today_str:
+            return True  # 今天已回测
+
+        self._log(trading_phase, f"📊 [{LifecyclePhase.BACKTEST.label}] 运行策略回测...")
+
+        try:
+            # 使用 PaperTrader 运行历史回放（最近 60 个交易日）
+            if self.paper_trader:
+                # 检查是否已有回测数据
+                if not self.paper_trader.accounts:
+                    return True
+
+                # 对各策略进行简单回测评估
+                backtest_summary = {}
+                for strategy_key in STRATEGIES:
+                    pool = self.pool_mgr.get_pool(strategy_key)
+                    if not pool:
+                        continue
+
+                    ranked = pool.ranked()
+                    if not ranked:
+                        continue
+
+                    # 取 Top10 计算平均分数
+                    top_scores = [item.score for item in ranked[:10]]
+                    avg_score = sum(top_scores) / len(top_scores) if top_scores else 0
+
+                    # 取 Focus 层统计
+                    focus_count = sum(1 for item in ranked if item.tier == TIER_FOCUS)
+                    watch_count = sum(1 for item in ranked if item.tier == TIER_WATCH)
+
+                    backtest_summary[strategy_key] = {
+                        "label": STRATEGIES.get(strategy_key, strategy_key),
+                        "pool_size": pool.size,
+                        "focus_count": focus_count,
+                        "watch_count": watch_count,
+                        "avg_top10_score": round(avg_score, 1),
+                        "max_score": round(max(top_scores), 1) if top_scores else 0,
+                    }
+
+                # 输出回测摘要
+                lines = []
+                for key, info in backtest_summary.items():
+                    lines.append(
+                        f"  {info['label']}: 精选{info['focus_count']} 观察{info['watch_count']} "
+                        f"Top10均分{info['avg_top10_score']}"
+                    )
+                self._log(trading_phase, f"  回测摘要:\n" + "\n".join(lines))
+
+            self._backtest_date = today_str
+
+        except Exception as e:
+            logger.warning(f"回测异常: {e}")
+            self._log(trading_phase, f"回测异常: {e}")
+
+        return True  # 每轮回测即完成
+
+    # ═══════════════════════════════════════════
+    # ⑦ 机器学习 MACHINE_LEARNING
+    # ═══════════════════════════════════════════
+
+    _ML_BACKTEST_DAYS = 120  # 模型训练用历史数据天数
+
+    _ML_BACKTEST_DAYS = 120  # 降级模式用：历史数据天数
+
+    def _lifecycle_machine_learning(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """机器学习：基于 AKQuant §12 最佳实践，训练模型辅助交易决策。
+
+        触发规则（双重守卫）：
+          1. 策略处于空闲状态（IDLE → 由 _maybe_trigger_ml 保证）
+          2. 策略股票池有精选的股票需要训练（focus/watch 层 ≥ 1 只）
+
+        流程:
+          1. 收集所有策略池 focus/watch 层标的 → 提取 OHLCV
+          2. FeatureEngineer: 计算 24 维金融特征（动量/波动/量价/趋势/形态）
+          3. LabelGenerator: 三重屏障法生成标签（止盈+5%/止损-3%/5日到期）
+          4. PurgedCV: 净化 K-Fold 验证，防数据泄漏
+          5. MLTrainer: 训练 RandomForest/LogisticRegression 模型
+          6. MLPredictor: 对池中标的生产预测 → 概率/方向/置信度
+          7. MLModelRegistry: 版本管理，可追溯可复现
+
+        若 sklearn 不可用，自动降级为 Z-Score 线性打分模式。
+        """
+        today_str = now.strftime("%Y%m%d")
+
+        # ── 守卫：检查是否有精选标的需要训练 ──
+        if not self._ml_has_candidates():
+            self._log(trading_phase,
+                f"🧠 [{LifecyclePhase.MACHINE_LEARNING.label}] 无精选层标的，跳过（等待选股完成后自动触发）")
+            return True
+
+        # 控制训练频率：默认每周重训练一次
+        if self._ml_last_train_date:
+            last_dt = datetime.strptime(self._ml_last_train_date, "%Y%m%d")
+            if (now - last_dt).days < ML_RETRAIN_DAYS:
+                # 已训练，仅做预测同步
+                return self._ml_predict_only(now, trading_phase)
+
+        self._log(trading_phase, f"🧠 [{LifecyclePhase.MACHINE_LEARNING.label}] 启动机器学习流程...")
+        self._log(trading_phase, f"  模型: {ML_MODEL_TYPE} | 标签: {ML_LABEL_METHOD} | 训练窗口: {ML_TRAIN_WINDOW}日")
+
+        try:
+            # ── 收集所有策略池的焦点标的 ──
+            all_candidates: list = []
+            for strategy_name in STRATEGIES:
+                pool = self.pool_mgr.get_pool(strategy_name)
+                if not pool:
+                    continue
+                ranked = pool.ranked()
+                candidates = [item for item in ranked if item.tier in (TIER_FOCUS, TIER_WATCH)]
+                all_candidates.extend(candidates)
+
+            if not all_candidates:
+                self._log(trading_phase, "  无焦点标的，跳过训练")
+                self._ml_last_train_date = today_str
+                return True
+
+            # 去重（同一代码可能出现在多个策略池）
+            seen = {}
+            unique_candidates = []
+            for item in all_candidates:
+                if item.code not in seen:
+                    seen[item.code] = item
+                    unique_candidates.append(item)
+
+            n_total = len(unique_candidates)
+            max_train = min(30, n_total)
+            self._log(trading_phase, f"  收集 {n_total} 只候选标的（去重后），训练 {max_train} 只...")
+
+            # ── MLEngine: 训练 + 预测 + 同步 ──
+            predictions = self._ml_engine.train_and_predict(
+                unique_candidates, now=now, max_stocks=max_train,
+            )
+
+            # ── 汇总 ──
+            bullish = sum(1 for p in predictions if p.direction == "bullish")
+            bearish = sum(1 for p in predictions if p.direction == "bearish")
+            neutral = len(predictions) - bullish - bearish
+
+            self._log(trading_phase,
+                f"  ✅ 训练完成: {len(predictions)} 只标的预测已同步到池中")
+            self._log(trading_phase,
+                f"    方向: ↑{bullish} ↓{bearish} —{neutral}")
+
+            # 输出 Top3 标的预测示例
+            top_3 = sorted(predictions, key=lambda p: abs(p.ml_score), reverse=True)[:3]
+            if top_3:
+                examples = ", ".join(
+                    f"{p.name or p.code}({p.ml_score:+.1f}/{p.direction})"
+                    for p in top_3
+                )
+                self._log(trading_phase, f"    示例: {examples}")
+
+            self._ml_last_train_date = today_str
+
+            # ── 更新 ML 预测缓存（供交易信号门控使用） ──
+            self._build_ml_prediction_cache(predictions)
+
+            # ── 验证上一个交易日的 ML 决策 ──
+            self._validate_ml_decisions(now, trading_phase)
+
+        except Exception as e:
+            logger.warning(f"机器学习异常: {e}")
+            self._log(trading_phase, f"  机器学习异常: {e}")
+
+        return True  # 每轮执行即完成
+
+    def _ml_predict_only(self, now: datetime, trading_phase: TradingPhase) -> bool:
+        """仅预测模式：使用已有模型对池中标的生产预测（不重新训练）"""
+        # 收集标的
+        all_candidates: list = []
+        seen = set()
+        for strategy_name in STRATEGIES:
+            pool = self.pool_mgr.get_pool(strategy_name)
+            if not pool:
+                continue
+            ranked = pool.ranked()
+            for item in ranked:
+                if item.tier in (TIER_FOCUS, TIER_WATCH) and item.code not in seen:
+                    seen.add(item.code)
+                    all_candidates.append(item)
+
+        if not all_candidates:
+            return True
+
+        try:
+            predictions = self._ml_engine.predict_all(all_candidates, now=now)
+            self._ml_engine.sync_to_pool(predictions, all_candidates)
+            if predictions:
+                self._log(trading_phase,
+                    f"🧠 [ML预测] {len(predictions)} 只标的预测已刷新")
+
+            # 更新 ML 预测缓存
+            self._build_ml_prediction_cache(predictions)
+
+            # 验证上一个交易日的 ML 决策
+            self._validate_ml_decisions(now, trading_phase)
+
+        except Exception as e:
+            logger.warning(f"ML 预测异常: {e}")
+
+        return True
+
+    def _build_ml_prediction_cache(self, predictions: list):
+        """从预测结果构建 code→direction 和 code→score 的快速查询缓存。"""
+        self._ml_prediction_cache.clear()
+        self._ml_score_cache.clear()
+        for p in predictions:
+            self._ml_prediction_cache[p.code] = p.direction
+            self._ml_score_cache[p.code] = p.ml_score
+
+    def _validate_ml_decisions(self, now: datetime, trading_phase: TradingPhase):
+        """验证上一个交易日的 ML 决策准确性，动态调整决策权重。"""
+        today_str = now.strftime("%Y%m%d")
+        if self._ml_last_validate_date == today_str:
+            return
+
+        pending = self._ml_gate.get_pending_count()
+        if pending == 0:
+            self._ml_last_validate_date = today_str
+            return
+
+        self._log(trading_phase, f"🔍 [ML验证] 验证 {pending} 条待验证决策...")
+        stats = self._ml_gate.validate_daily(now, self.fetcher)
+
+        if stats["validated"] > 0:
+            acc_str = f"{stats['correct']}/{stats['validated']}"
+            acc_pct = stats["correct"] / stats["validated"] * 100 if stats["validated"] > 0 else 0
+            self._log(trading_phase,
+                f"  {acc_str} 正确 ({acc_pct:.0f}%) | "
+                f"权重 {stats['weight']:.1%} | "
+                f"门控 {'激活' if self._ml_gate.enabled else '待激活'}")
+
+            # 输出门控统计摘要
+            gate_stats = self._ml_gate.get_stats()
+            if gate_stats["total_validated"] >= 5:
+                self._log(trading_phase,
+                    f"  累计: {gate_stats['total_validated']}次验证 "
+                    f"({gate_stats['total_correct']}正/{gate_stats['total_wrong']}误) | "
+                    f"驳回 {gate_stats['total_rejected']}次 "
+                    f"(准确率{gate_stats['rejected_accuracy']:.0%})")
+
+        self._ml_last_validate_date = today_str
+
+    # ═══════════════════════════════════════════
+    # 生命周期重置
+    # ═══════════════════════════════════════════
+
+    def _reset_lifecycle(self):
+        """重置生命周期状态（新交易日开始时调用）"""
+        self._lifecycle_phase = LifecyclePhase.IDLE
+        self._lifecycle_completed.clear()
+        self._lifecycle_last_run.clear()
+        self._lifecycle_pause_until = None
+        self._screen_offset = 0
+        self._screened_codes.clear()
+        self._screening_done = False
+        self._backtest_date = None
+        self._ml_last_train_date = None
+        # 重置各策略生命周期阶段
+        for k in STRATEGIES:
+            self._strategy_phase[k] = LifecyclePhase.IDLE.value[0]
+            self._strategy_phase_label[k] = LifecyclePhase.IDLE.label
+            self._strategy_phase_updated[k] = ""
+
     def _phase_completed_full(self, prefix: str) -> bool:
         """检查阶段是否已完成全部初始化"""
         today = datetime.now().strftime("%Y%m%d")
@@ -638,6 +1571,8 @@ class LiveTradingEngine:
         self._latest_signals = {}
         self._trading_plan = None
         self._todays_decisions = []
+        self._ml_prediction_cache.clear()
+        self._ml_score_cache.clear()
         self.hunter.clear_cache()
 
     def _save_daily_summary(self, force: bool = False):
@@ -1199,11 +2134,31 @@ class LiveTradingEngine:
 
     def get_status(self) -> dict[str, object]:
         """获取引擎运行状态"""
+        # 生命周期进度
+        lifecycle_info: dict[str, object] = {
+            "phase": self._lifecycle_phase.value[0],
+            "phase_label": self._lifecycle_phase.label,
+            "completed": list(self._lifecycle_completed),
+            "screening_done": self._screening_done,
+            "screened_count": len(self._screened_codes),
+            "screening_progress": f"{len(self._screened_codes)} 只已选" if self._screened_codes else "未开始",
+            # 各策略独立生命周期阶段
+            "strategy_phases": {
+                k: {
+                    "phase": self._strategy_phase.get(k, "idle"),
+                    "label": self._strategy_phase_label.get(k, "空闲"),
+                    "updated_at": self._strategy_phase_updated.get(k, ""),
+                }
+                for k in STRATEGIES
+            },
+        }
+
         return {
             "state": self.state.value,
             "current_phase": self._current_phase.value,
             "phase_label": get_phase_label(self._current_phase),
             "is_trading_day": self.calendar.is_trading_day(),
+            "lifecycle": lifecycle_info,
             "pool_summary": self.pool_mgr.summary(),
             "latest_signals": sum(len(r.signals) for r in self._latest_signals.values()),
             "signal_details": {

@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-VERSION_STRING = "2.4.0"
+VERSION_STRING = "2.8.0"
 
 SEMVER_PATTERN = re.compile(
     r"^(?P<major>0|[1-9]\d*)"
