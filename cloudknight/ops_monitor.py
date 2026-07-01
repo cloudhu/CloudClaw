@@ -274,6 +274,7 @@ class OpsCollector:
         from .stock_pool import MAINTENANCE_INTERVALS, POOL_LABEL_MAP
 
         strategy_keys = list(POOL_LABEL_MAP.keys())
+        strategies: list[dict] = []
 
         # 读取赛马数据获取各策略持仓/盈亏
         race_data = None
