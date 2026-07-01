@@ -29,7 +29,7 @@ if %errorlevel% neq 0 (
 )
 echo   依赖 OK
 
-echo [3/3] 启动仪表盘: http://localhost:8080
+echo [3/3] 启动仪表盘: http://127.0.0.1:8080
 echo   按 Ctrl+C 停止服务
 echo.
 call python main.py web

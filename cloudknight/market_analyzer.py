@@ -9,19 +9,23 @@
 """
 
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from .config import INDEX_CODES, MACD_FAST, MACD_SLOW, MACD_SIGNAL
-from .indicators import (calc_macd, calc_kdj, calc_rsi, calc_ma,
-                         analyze_macd, analyze_kdj, analyze_rsi,
-                         trend_score, IndicatorResult)
+from .config import INDEX_CODES
 from .data_manager import DataFetcher
+from .indicators import (
+    analyze_kdj,
+    analyze_macd,
+    analyze_rsi,
+    calc_ma,
+    trend_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,48 +33,51 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IndexAnalysis:
     """指数分析结果"""
+
     code: str
     name: str
     close: float
-    pct_change: float          # 涨跌幅 %
-    amplitude: float            # 振幅 %
-    volume_ratio: float         # 量比
-    trend_score: int            # 趋势评分 0-100
-    trend_rating: str           # 趋势评级
-    macd_signal: str            # MACD 信号
-    kdj_signal: str             # KDJ 信号
-    rsi_value: float            # RSI 值
-    support: float = 0.0        # 支撑位
-    resistance: float = 0.0     # 阻力位
-    details: Dict[str, Any] = field(default_factory=dict)
+    pct_change: float  # 涨跌幅 %
+    amplitude: float  # 振幅 %
+    volume_ratio: float  # 量比
+    trend_score: int  # 趋势评分 0-100
+    trend_rating: str  # 趋势评级
+    macd_signal: str  # MACD 信号
+    kdj_signal: str  # KDJ 信号
+    rsi_value: float  # RSI 值
+    support: float = 0.0  # 支撑位
+    resistance: float = 0.0  # 阻力位
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class SectorAnalysis:
     """板块分析结果"""
+
     name: str
     code: str
     pct_change: float
-    strength_rank: int          # 板块强度排名
-    leading_stocks: List[str]   # 领涨股（前3名，简短字符串）
-    volume_surge: bool          # 是否放量
-    trend: str                  # 趋势方向
-    top_stocks: List[Dict] = field(default_factory=list)  # 板块内涨幅Top10详细数据
-    total_stocks: int = 0       # 板块成分股总数
+    strength_rank: int  # 板块强度排名
+    leading_stocks: list[str]  # 领涨股（前3名，简短字符串）
+    volume_surge: bool  # 是否放量
+    trend: str  # 趋势方向
+    top_stocks: list[dict] = field(default_factory=list)  # 板块内涨幅Top10详细数据
+    total_stocks: int = 0  # 板块成分股总数
 
 
 @dataclass
 class MarketSnapshot:
     """市场快照 - 汇总所有分析结果"""
+
     timestamp: datetime
     is_trading_day: bool
-    indices: Dict[str, IndexAnalysis]
-    hot_sectors: List[SectorAnalysis]
-    market_sentiment: str       # bullish / bearish / neutral
-    sentiment_score: int        # 0-100 市场情绪评分
-    buy_signals: int            # 买入信号数
-    sell_signals: int           # 卖出信号数
-    capital_flow_summary: str   # 资金流向概要
+    indices: dict[str, IndexAnalysis]
+    hot_sectors: list[SectorAnalysis]
+    market_sentiment: str  # bullish / bearish / neutral
+    sentiment_score: int  # 0-100 市场情绪评分
+    buy_signals: int  # 买入信号数
+    sell_signals: int  # 卖出信号数
+    capital_flow_summary: str  # 资金流向概要
 
 
 class MarketAnalyzer:
@@ -79,17 +86,17 @@ class MarketAnalyzer:
     def __init__(self):
         self.fetcher = DataFetcher()
 
-    def analyze_indices(self, days: int = 60) -> Dict[str, IndexAnalysis]:
+    def analyze_indices(self, days: int = 60) -> dict[str, IndexAnalysis]:
         """分析六大核心指数
 
         Args:
             days: 分析用历史数据天数
         """
         results = {}
-        today = datetime.now().strftime("%Y%m%d")
+        datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
 
-        def _analyze_one(code: str, name: str) -> Optional[IndexAnalysis]:
+        def _analyze_one(code: str, name: str) -> IndexAnalysis | None:
             try:
                 clean_code = code[2:]  # 去掉 sh/sz 前缀
                 df = self.fetcher.fetch_index_daily(clean_code, start_date=start)
@@ -97,8 +104,14 @@ class MarketAnalyzer:
                     return None
 
                 # 标准化列名
-                col_map = {"日期": "date", "开盘": "open", "收盘": "close",
-                           "最高": "high", "最低": "low", "成交量": "volume"}
+                col_map = {
+                    "日期": "date",
+                    "开盘": "open",
+                    "收盘": "close",
+                    "最高": "high",
+                    "最低": "low",
+                    "成交量": "volume",
+                }
                 df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
                 required = ["close", "high", "low", "volume"]
@@ -134,19 +147,21 @@ class MarketAnalyzer:
                 # 支撑位/阻力位
                 df_calc = calc_ma(df, [20, 60])
                 support = min(
-                    df_calc["MA20"].iloc[-1] if "MA20" in df_calc.columns else close,
-                    df["low"].tail(20).min()
+                    df_calc["MA20"].iloc[-1] if "MA20" in df_calc.columns else close, df["low"].tail(20).min()
                 )
                 resistance = max(
-                    df["high"].tail(20).max(),
-                    df_calc["MA60"].iloc[-1] if "MA60" in df_calc.columns else close
+                    df["high"].tail(20).max(), df_calc["MA60"].iloc[-1] if "MA60" in df_calc.columns else close
                 )
 
                 return IndexAnalysis(
-                    code=code, name=name, close=close,
-                    pct_change=round(pct, 2), amplitude=round(amplitude, 2),
+                    code=code,
+                    name=name,
+                    close=close,
+                    pct_change=round(pct, 2),
+                    amplitude=round(amplitude, 2),
                     volume_ratio=round(vol_ratio, 2),
-                    trend_score=ts, trend_rating=tr,
+                    trend_score=ts,
+                    trend_rating=tr,
                     macd_signal=macd_result.signal,
                     kdj_signal=kdj_result.signal,
                     rsi_value=round(rsi_val, 1),
@@ -157,15 +172,14 @@ class MarketAnalyzer:
                         "macd_strength": macd_result.strength,
                         "kdj_trend": kdj_result.trend,
                         "rsi_trend": rsi_result.trend,
-                    }
+                    },
                 )
             except Exception as e:
                 logger.debug(f"分析指数 {name}({code}) 失败: {e}")
                 return None
 
         with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {pool.submit(_analyze_one, code, name): code
-                       for code, name in INDEX_CODES.items()}
+            futures = {pool.submit(_analyze_one, code, name): code for code, name in INDEX_CODES.items()}
             for f in as_completed(futures):
                 result = f.result()
                 if result:
@@ -173,7 +187,7 @@ class MarketAnalyzer:
 
         return results
 
-    def analyze_sectors(self, top_n: int = 10) -> List[SectorAnalysis]:
+    def analyze_sectors(self, top_n: int = 10) -> list[SectorAnalysis]:
         """分析热门板块 - 按涨停家数排名 Top N，板块内按五日涨幅选 Top10 成分股
 
         不依赖板块指数接口（避免网络不可用时数据为空），直接使用涨停池数据：
@@ -184,7 +198,6 @@ class MarketAnalyzer:
         Returns:
             板块分析结果列表，按涨停家数降序排列
         """
-        import pandas as pd
 
         results = []
         try:
@@ -220,7 +233,6 @@ class MarketAnalyzer:
                     logger.debug(f"获取板块 {sec_name} 成分股失败: {e}")
 
                 # 4. 降级：若成分股接口不可用，用涨停池内该行业股票作为成分股
-                use_zt_fallback = False
                 if detail is None or detail.empty or "代码" not in detail.columns:
                     logger.info(f"板块 {sec_name} 成分股接口不可用，降级使用涨停池数据")
                     # 从涨停池中提取该行业所有股票构造 detail
@@ -228,27 +240,27 @@ class MarketAnalyzer:
                     # 统一列名
                     col_rename = {}
                     for src, dst in [
-                        ("代码", "代码"), ("名称", "名称"), ("最新价", "最新价"),
-                        ("涨跌幅", "涨跌幅"), ("成交量", "成交量"), ("成交额", "成交额"),
-                        ("换手率", "换手率"), ("流通市值", "总市值"),
+                        ("代码", "代码"),
+                        ("名称", "名称"),
+                        ("最新价", "最新价"),
+                        ("涨跌幅", "涨跌幅"),
+                        ("成交量", "成交量"),
+                        ("成交额", "成交额"),
+                        ("换手率", "换手率"),
+                        ("流通市值", "总市值"),
                     ]:
                         if src in detail.columns:
                             col_rename[src] = dst
                     if col_rename:
                         detail = detail.rename(columns=col_rename)
-                    use_zt_fallback = True
 
                 if detail is not None and not detail.empty and "代码" in detail.columns:
                     total_stocks = len(detail)
 
-                    codes = [
-                        str(r.get("代码", ""))
-                        for _, r in detail.iterrows()
-                        if str(r.get("代码", ""))
-                    ]
+                    codes = [str(r.get("代码", "")) for _, r in detail.iterrows() if str(r.get("代码", ""))]
 
                     # 5. 批量计算五日涨幅（仅对涨停池降级时的少量股票计算）
-                    gains_5d: Dict[str, float] = {}
+                    gains_5d: dict[str, float] = {}
                     if codes:
                         gains_5d = self.fetcher.fetch_batch_5day_gains(codes)
 
@@ -258,17 +270,19 @@ class MarketAnalyzer:
                         code = str(row.get("代码", ""))
                         if not code:
                             continue
-                        stock_list.append({
-                            "code": code,
-                            "name": str(row.get("名称", "")),
-                            "price": round(float(row.get("最新价", 0) or 0), 2),
-                            "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
-                            "pct_5d": round(gains_5d.get(code, 0.0), 2),
-                            "volume": round(float(row.get("成交量", 0) or 0) / 1e4, 1),
-                            "amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
-                            "turnover": round(float(row.get("换手率", 0) or 0), 2),
-                            "pe": round(float(row.get("市盈率-动态", 0) or 0), 1),
-                        })
+                        stock_list.append(
+                            {
+                                "code": code,
+                                "name": str(row.get("名称", "")),
+                                "price": round(float(row.get("最新价", 0) or 0), 2),
+                                "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
+                                "pct_5d": round(gains_5d.get(code, 0.0), 2),
+                                "volume": round(float(row.get("成交量", 0) or 0) / 1e4, 1),
+                                "amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
+                                "turnover": round(float(row.get("换手率", 0) or 0), 2),
+                                "pe": round(float(row.get("市盈率-动态", 0) or 0), 1),
+                            }
+                        )
 
                     # 按五日涨幅降序
                     stock_list.sort(key=lambda x: x["pct_5d"], reverse=True)
@@ -276,22 +290,21 @@ class MarketAnalyzer:
 
                     # 领涨股 Top3（按五日涨幅）
                     top3 = stock_list[:3]
-                    leaders = [
-                        f"{s['code']}({s['pct_5d']:.1f}%)"
-                        for s in top3
-                    ]
+                    leaders = [f"{s['code']}({s['pct_5d']:.1f}%)" for s in top3]
 
-                results.append(SectorAnalysis(
-                    name=sec_name,
-                    code="",
-                    pct_change=round(avg_pct, 2),
-                    strength_rank=rank_idx + 1,
-                    leading_stocks=leaders,
-                    volume_surge=zt_count >= 3,
-                    trend="up",
-                    top_stocks=top_stocks,
-                    total_stocks=total_stocks,
-                ))
+                results.append(
+                    SectorAnalysis(
+                        name=sec_name,
+                        code="",
+                        pct_change=round(avg_pct, 2),
+                        strength_rank=rank_idx + 1,
+                        leading_stocks=leaders,
+                        volume_surge=zt_count >= 3,
+                        trend="up",
+                        top_stocks=top_stocks,
+                        total_stocks=total_stocks,
+                    )
+                )
 
         except Exception as e:
             logger.warning(f"获取板块数据失败: {e}", exc_info=True)
@@ -299,7 +312,7 @@ class MarketAnalyzer:
         logger.info(f"板块分析完成（按涨停家数）, 获取 {len(results)} 个热门板块")
         return results
 
-    def get_market_sentiment(self) -> Dict[str, Any]:
+    def get_market_sentiment(self) -> dict[str, Any]:
         """综合市场情绪评估
 
         Returns:
@@ -345,13 +358,19 @@ class MarketAnalyzer:
             "sentiment": sentiment,
             "score": score,
             "factors": factor_scores,
-            "indices": {i.code: {
-                "name": i.name, "pct": i.pct_change, "trend": i.trend_score,
-                "macd": i.macd_signal, "kdj": i.kdj_signal
-            } for i in indices.values()}
+            "indices": {
+                i.code: {
+                    "name": i.name,
+                    "pct": i.pct_change,
+                    "trend": i.trend_score,
+                    "macd": i.macd_signal,
+                    "kdj": i.kdj_signal,
+                }
+                for i in indices.values()
+            },
         }
 
-    def diagnose_market_trend(self, days: int = 120) -> Dict[str, Any]:
+    def diagnose_market_trend(self, days: int = 120) -> dict[str, Any]:
         """牛熊行情研判 - 基于多指数长期趋势分析
 
         判断依据:
@@ -360,7 +379,7 @@ class MarketAnalyzer:
           - MACD 周线级别趋势
           - 涨跌比与成交量趋势
         """
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "phase": "震荡",
             "phase_code": "neutral",
             "confidence": 50,
@@ -375,15 +394,17 @@ class MarketAnalyzer:
 
             # 分析关键指数趋势
             key_indices = {
-                "sh000001": "上证指数", "sz399001": "深证成指",
-                "sh000300": "沪深300", "sh000905": "中证500",
+                "sh000001": "上证指数",
+                "sz399001": "深证成指",
+                "sh000300": "沪深300",
+                "sh000905": "中证500",
             }
 
             bull_signals = 0
             bear_signals = 0
             total_checks = 0
 
-            for code, name in key_indices.items():
+            for code, _name in key_indices.items():
                 clean = code[2:]
                 df = fetcher.fetch_index_daily(clean, start_date=start)
                 if df is None or df.empty or len(df) < 60:
@@ -477,10 +498,12 @@ class MarketAnalyzer:
         sentiment = self.get_market_sentiment()
 
         # 统计买卖信号数
-        buy_count = sum(1 for i in indices.values()
-                        if "金叉" in i.macd_signal.lower() or "金叉" in i.kdj_signal.lower())
-        sell_count = sum(1 for i in indices.values()
-                         if "死叉" in i.macd_signal.lower() or "死叉" in i.kdj_signal.lower())
+        buy_count = sum(
+            1 for i in indices.values() if "金叉" in i.macd_signal.lower() or "金叉" in i.kdj_signal.lower()
+        )
+        sell_count = sum(
+            1 for i in indices.values() if "死叉" in i.macd_signal.lower() or "死叉" in i.kdj_signal.lower()
+        )
 
         return MarketSnapshot(
             timestamp=datetime.now(),
@@ -491,7 +514,7 @@ class MarketAnalyzer:
             sentiment_score=sentiment["score"],
             buy_signals=buy_count,
             sell_signals=sell_count,
-            capital_flow_summary="待获取"  # 实盘中填充
+            capital_flow_summary="待获取",  # 实盘中填充
         )
 
     def format_snapshot_report(self, snapshot: MarketSnapshot) -> str:
@@ -501,17 +524,21 @@ class MarketAnalyzer:
         lines.append("║        A 股市场全景分析报告              ║")
         lines.append(f"║  时间: {snapshot.timestamp.strftime('%Y-%m-%d %H:%M')}                     ║")
         sentiment_icon = {"bullish": "🐂 多头", "bearish": "🐻 空头", "neutral": "→ 中性"}
-        lines.append(f"║  情绪: {sentiment_icon.get(snapshot.market_sentiment, '中立')} "
-                     f"({snapshot.sentiment_score}/100)        ║")
+        lines.append(
+            f"║  情绪: {sentiment_icon.get(snapshot.market_sentiment, '中立')} "
+            f"({snapshot.sentiment_score}/100)        ║"
+        )
         lines.append("╠══════════════════════════════════════════╣")
 
         # 指数
         lines.append("║ 核心指数:                                  ║")
         for idx in snapshot.indices.values():
             arrow = "▲" if idx.pct_change >= 0 else "▼"
-            lines.append(f"║  {arrow} {idx.name:<10s} {idx.close:>8.2f} "
-                         f"{idx.pct_change:+.2f}%  "
-                         f"MACD:{idx.macd_signal:<4s} RSI:{idx.rsi_value:<5.1f} ║")
+            lines.append(
+                f"║  {arrow} {idx.name:<10s} {idx.close:>8.2f} "
+                f"{idx.pct_change:+.2f}%  "
+                f"MACD:{idx.macd_signal:<4s} RSI:{idx.rsi_value:<5.1f} ║"
+            )
 
         # 板块
         if snapshot.hot_sectors:

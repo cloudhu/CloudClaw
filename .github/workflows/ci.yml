@@ -1,0 +1,185 @@
+name: CI — Code Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # 允许手动触发
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== Lint ====================
+  lint:
+    name: "Lint (Ruff)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install .[dev]
+
+      - name: Run Ruff Lint
+        run: ruff check --output-format=github .
+
+      - name: Run Ruff Format Check
+        run: ruff format --check --diff .
+
+  # ==================== Type Check ====================
+  typecheck:
+    name: "Type Check (Pyright)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install .[dev]
+
+      - name: Run Pyright
+        run: pyright
+
+  # ==================== Test ====================
+  test:
+    name: "Test | py${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install .[dev]
+
+      - name: Run Tests
+        run: |
+          python -m pytest --cov=cloudknight --cov-report=xml --cov-report=term-missing
+
+      - name: Upload Coverage
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ==================== Import Sanity ====================
+  import-check:
+    name: "Import Check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project deps
+        run: |
+          pip install .[dev]
+
+      - name: Verify All Modules Import
+        run: |
+          python -c "
+          from cloudknight.data_manager import DataFetcher
+          from cloudknight.live_engine import LiveTradingEngine
+          from cloudknight.market_analyzer import MarketAnalyzer
+          from cloudknight.backtest_engine import BacktestEngine
+          from cloudknight.trading_calendar import TradingCalendar
+          from cloudknight.ops_monitor import OpsCollector, SystemMonitor
+          from cloudknight.stock_diagnose import StockDiagnoser
+          from cloudknight.signal_hunter import SignalHunter
+          from cloudknight.paper_trader import PaperTrader
+          from cloudknight.stock_pool import PoolManager
+          from cloudknight.auction_analyzer import AuctionAnalyzer
+          from cloudknight import __version__, __engine__, __author__
+          print(f'CloudKnight v{__version__} ({__engine__}) — all modules OK')
+          "
+
+  # ==================== Security ====================
+  security:
+    name: "Security Scan (Bandit)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install bandit
+
+      - name: Run Bandit
+        run: |
+          bandit -r cloudknight/ -c pyproject.toml -f json --exit-zero -o bandit-report.json
+          bandit -r cloudknight/ -c pyproject.toml -ll
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          retention-days: 7
+
+  # ==================== Version Gate ====================
+  version-check:
+    name: "Version & Lockfile Consistency"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Version Consistency
+        run: |
+          set -e
+          # 1. pyproject.toml vs version.py
+          PYPROJ_VER=$(python -c "import tomllib; c=tomllib.load(open('pyproject.toml','rb')); print(c['project']['version'])")
+          CODE_VER=$(python -c "exec(open('cloudknight/version.py').read()); print(VERSION_STRING)")
+          echo "pyproject.toml: $PYPROJ_VER"
+          echo "cloudknight/version.py: $CODE_VER"
+          if [ "$PYPROJ_VER" != "$CODE_VER" ]; then
+            echo "VERSION MISMATCH" && exit 1
+          fi
+          # 2. CHANGELOG 包含当前版本
+          grep -q "\[${CODE_VER}\]" CHANGELOG.md || { echo "CHANGELOG MISSING ${CODE_VER}" && exit 1; }
+          # 3. README 包含当前版本
+          grep -q "v${CODE_VER}" README.md || { echo "README MISSING v${CODE_VER}" && exit 1; }
+          echo "All version checks passed ✓"

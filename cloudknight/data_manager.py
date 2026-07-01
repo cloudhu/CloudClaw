@@ -3,15 +3,15 @@
 使用 akshare 作为免费数据源，SQLite 作为本地存储
 """
 
+import hashlib
+import logging
 import os
 import pickle
-import sqlite3
-import hashlib
-import time
 import random
-import logging
+import sqlite3
+import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Callable
 from functools import wraps
 
 import pandas as pd
@@ -28,7 +28,7 @@ def retry_on_network_error(
     jitter: float = 1.0,
 ):
     """网络请求重试装饰器，带指数退避和随机抖动
-    
+
     处理以下异常:
     - ConnectionError / RemoteDisconnected / Timeout
     - HTTPError (429 限流等)
@@ -67,11 +67,8 @@ def retry_on_network_error(
                         # 不可重试的错误直接抛
                         raise
                     if attempt < max_retries:
-                        delay = base_delay * (backoff ** attempt) + random.uniform(0, jitter)
-                        logger.warning(
-                            "请求失败(第%d/%d次重试)，%.1f秒后重试: %s",
-                            attempt + 1, max_retries, delay, e
-                        )
+                        delay = base_delay * (backoff**attempt) + random.uniform(0, jitter)
+                        logger.warning("请求失败(第%d/%d次重试)，%.1f秒后重试: %s", attempt + 1, max_retries, delay, e)
                         time.sleep(delay)
                     else:
                         logger.error(f"请求重试{max_retries}次后仍然失败: {e}")
@@ -81,6 +78,7 @@ def retry_on_network_error(
         return wrapper
 
     return decorator
+
 
 AK_AVAILABLE = False
 _last_request_time = 0.0
@@ -101,17 +99,19 @@ def _get_http_session():
         adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
         _http_session.mount("http://", adapter)
         _http_session.mount("https://", adapter)
-        _http_session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        })
+        _http_session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+            }
+        )
         _http_session.timeout = 15
     return _http_session
 
@@ -130,13 +130,15 @@ def _ensure_akshare():
     if not AK_AVAILABLE:
         try:
             import akshare as _ak
+
             _configure_akshare_session(_ak)
             # 首轮导入成功，设置全局可用标记
             globals()["AK_AVAILABLE"] = True
             return _ak
-        except ImportError:
-            raise ImportError("请安装 akshare: pip install akshare")
+        except ImportError as err:
+            raise ImportError("请安装 akshare: pip install akshare") from err
     import akshare as _ak
+
     return _ak
 
 
@@ -165,17 +167,19 @@ def _configure_akshare_session(ak):
 
         ak_session.mount("http://", adapter)
         ak_session.mount("https://", adapter)
-        ak_session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        })
+        ak_session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+            }
+        )
         logger.debug("AKShare HTTP 会话已配置")
     except Exception as e:
         logger.debug(f"AKShare 会话配置跳过: {e}")
@@ -244,9 +248,19 @@ class Database:
     def save_daily(self, df: pd.DataFrame):
         if df.empty:
             return
-        col_map = {"股票代码": "code", "日期": "date", "开盘": "open", "最高": "high",
-                   "最低": "low", "收盘": "close", "成交量": "volume", "成交额": "amount",
-                   "振幅": "amplitude", "涨跌幅": "pct_change", "换手率": "turnover"}
+        col_map = {
+            "股票代码": "code",
+            "日期": "date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "成交量": "volume",
+            "成交额": "amount",
+            "振幅": "amplitude",
+            "涨跌幅": "pct_change",
+            "换手率": "turnover",
+        }
         df_db = df.rename(columns=col_map)
         # 过滤掉缺少 code/date 的行
         if "code" not in df_db.columns or "date" not in df_db.columns:
@@ -261,10 +275,7 @@ class Database:
         all_cols = cols + extra_cols
         with self._get_conn() as conn:
             for _, row in df_db[all_cols].iterrows():
-                values = tuple(
-                    row[col] if not pd.isna(row[col]) else None
-                    for col in all_cols
-                )
+                values = tuple(row[col] if not pd.isna(row[col]) else None for col in all_cols)
                 placeholders = ",".join(["?"] * len(all_cols))
                 cols_str = ",".join(all_cols)
                 sql = f"INSERT OR REPLACE INTO stock_daily ({cols_str}) VALUES ({placeholders})"
@@ -285,12 +296,23 @@ class Database:
             return pd.read_sql_query(sql, conn, params=params)
 
     def save_stock_info(self, df: pd.DataFrame):
-        col_map = {"股票代码": "code", "股票简称": "name", "行业": "industry",
-                   "市场类型": "market", "上市时间": "list_date",
-                   "总市值": "total_mv", "流通市值": "circ_mv", "市盈率-动态": "pe", "市净率": "pb"}
+        col_map = {
+            "股票代码": "code",
+            "股票简称": "name",
+            "行业": "industry",
+            "市场类型": "market",
+            "上市时间": "list_date",
+            "总市值": "total_mv",
+            "流通市值": "circ_mv",
+            "市盈率-动态": "pe",
+            "市净率": "pb",
+        }
         df_db = df.rename(columns=col_map)
-        cols = [c for c in ["code", "name", "industry", "market", "list_date",
-                             "total_mv", "circ_mv", "pe", "pb"] if c in df_db.columns]
+        cols = [
+            c
+            for c in ["code", "name", "industry", "market", "list_date", "total_mv", "circ_mv", "pe", "pb"]
+            if c in df_db.columns
+        ]
         with self._get_conn() as conn:
             for _, row in df_db[cols].iterrows():
                 placeholders = ",".join(["?"] * len(cols))
@@ -310,10 +332,69 @@ class Database:
 
 
 class DataFetcher:
+    # 数据源不可用冷却时间（秒），超时后自动恢复重试
+    SOURCE_COOLDOWN_SECONDS: float = 300.0
+
     def __init__(self):
         self.cache = CacheManager()
         self.db = Database()
-        self._unavailable_sources: set[str] = set()  # 已知不可用的数据源，跳过重试浪费时间
+        # 格式: {source_label: blocked_until_timestamp}
+        self._unavailable_sources: dict[str, float] = {}
+        # 收费数据源管理器（懒加载）
+        self._ds_manager = None
+
+    @property
+    def ds_manager(self):
+        """获取数据源管理器（懒加载，避免循环引用）"""
+        if self._ds_manager is None:
+            from .datasource.manager import DataSourceManager
+
+            self._ds_manager = DataSourceManager()
+            self._ds_manager.initialize()
+        return self._ds_manager
+
+    def _try_premium_datasource(self, method: str, *args, **kwargs) -> tuple[pd.DataFrame | None, str]:
+        """尝试通过收费数据源获取数据
+
+        返回: (DataFrame | None, 来源名称)
+        若 DataFrame 为 None 表示收费源不可用/返回空，应降级到免费源
+        """
+        from .datasource.base import FetchResult
+
+        try:
+            mgr = self.ds_manager
+            result: FetchResult = mgr._try_fetch(method, *args, **kwargs)
+            if result.success and result.data is not None and not result.data.empty:
+                logger.info(f"  ✓ 使用 {result.source_name} 获取数据")
+                return result.data, result.source_name
+            # 降级到免费源的信号
+            if result.source_name == "free":
+                return None, "降级到免费源"
+        except Exception as e:
+            logger.debug(f"收费数据源尝试失败: {e}")
+
+        return None, ""
+
+    def _is_source_available(self, label: str) -> bool:
+        """检查数据源是否可用（冷却期自动过期）"""
+        if label not in self._unavailable_sources:
+            return True
+        blocked_until = self._unavailable_sources[label]
+        if time.time() > blocked_until:
+            # 冷却期已过，自动恢复
+            del self._unavailable_sources[label]
+            logger.info(f"  ♻ 数据源 '{label}' 冷却期已过，恢复重试")
+            return True
+        remaining = int(blocked_until - time.time())
+        logger.debug(f"  数据源 '{label}' 冷却中（剩余 {remaining} 秒）")
+        return False
+
+    def _mark_source_unavailable(self, label: str, error_type: str = ""):
+        """标记数据源为暂时不可用，进入冷却期"""
+        blocked_until = time.time() + self.SOURCE_COOLDOWN_SECONDS
+        self._unavailable_sources[label] = blocked_until
+        cooldown_min = self.SOURCE_COOLDOWN_SECONDS / 60
+        logger.warning(f"  数据源 [{label}] 不可用({error_type})，冷却 {cooldown_min:.0f} 分钟")
 
     # ═══ 私有网络请求方法（异常传播到 retry 装饰器） ═══
 
@@ -328,8 +409,7 @@ class DataFetcher:
         """东方财富日K线（主数据源）"""
         ak = _ensure_akshare()
         _rate_limit()
-        return ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date,
-                                  end_date=end_date, adjust=adjust)
+        return ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust=adjust)
 
     @retry_on_network_error(max_retries=3, base_delay=2.0)
     def _fetch_sina_kline(self, code: str, start_date: str, end_date: str, adjust: str):
@@ -343,8 +423,14 @@ class DataFetcher:
             df["股票代码"] = code
             # 统一列名
             rename_map = {}
-            for src, dst in [("date", "日期"), ("open", "开盘"), ("high", "最高"),
-                              ("low", "最低"), ("close", "收盘"), ("volume", "成交量")]:
+            for src, dst in [
+                ("date", "日期"),
+                ("open", "开盘"),
+                ("high", "最高"),
+                ("low", "最低"),
+                ("close", "收盘"),
+                ("volume", "成交量"),
+            ]:
                 if src in df.columns:
                     rename_map[src] = dst
             if rename_map:
@@ -362,12 +448,17 @@ class DataFetcher:
         ak = _ensure_akshare()
         prefix = "sh" if code.startswith(("6", "9")) else "sz"
         _rate_limit()
-        df = ak.stock_zh_a_hist_tx(symbol=f"{prefix}{code}", start_date=start_date,
-                                    end_date=end_date, adjust=adjust)
+        df = ak.stock_zh_a_hist_tx(symbol=f"{prefix}{code}", start_date=start_date, end_date=end_date, adjust=adjust)
         if df is not None and not df.empty:
             df["股票代码"] = code
-            col_map = {"date": "日期", "open": "开盘", "close": "收盘",
-                        "high": "最高", "low": "最低", "amount": "成交额"}
+            col_map = {
+                "date": "日期",
+                "open": "开盘",
+                "close": "收盘",
+                "high": "最高",
+                "low": "最低",
+                "amount": "成交额",
+            }
             if "volume" in df.columns:
                 col_map["volume"] = "成交量"
             df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
@@ -377,6 +468,7 @@ class DataFetcher:
     def _fetch_tencent_kline_direct(self, code: str, start_date: str, end_date: str, adjust: str):
         """腾讯财经日K线（直连 HTTP，不依赖 akshare）"""
         import json as _json
+
         _rate_limit()
         prefix = "sh" if code.startswith(("6", "9")) else "sz"
         symbol = f"{prefix}{code}"
@@ -399,17 +491,24 @@ class DataFetcher:
             date_str = str(row[0])
             if date_str < start_date or date_str > end_date:
                 continue
-            rows.append({
-                "日期": date_str, "开盘": float(row[1]), "收盘": float(row[2]),
-                "最高": float(row[3]), "最低": float(row[4]), "成交量": float(row[5]),
-                "股票代码": code,
-            })
+            rows.append(
+                {
+                    "日期": date_str,
+                    "开盘": float(row[1]),
+                    "收盘": float(row[2]),
+                    "最高": float(row[3]),
+                    "最低": float(row[4]),
+                    "成交量": float(row[5]),
+                    "股票代码": code,
+                }
+            )
         return pd.DataFrame(rows)
 
     @retry_on_network_error(max_retries=3, base_delay=1.5)
     def _fetch_sina_kline_direct(self, code: str, start_date: str, end_date: str, adjust: str):
         """新浪财经日K线（直连 HTTP，备选 URL）"""
         import json as _json
+
         _rate_limit()
         prefix = "sh" if code.startswith(("6", "9")) else "sz"
         symbol = f"{prefix}{code}"
@@ -427,13 +526,17 @@ class DataFetcher:
             date_str = item.get("day", "")
             if date_str < start_date or date_str > end_date:
                 continue
-            rows.append({
-                "日期": date_str,
-                "开盘": float(item["open"]), "收盘": float(item["close"]),
-                "最高": float(item["high"]), "最低": float(item["low"]),
-                "成交量": float(item["volume"]),
-                "股票代码": code,
-            })
+            rows.append(
+                {
+                    "日期": date_str,
+                    "开盘": float(item["open"]),
+                    "收盘": float(item["close"]),
+                    "最高": float(item["high"]),
+                    "最低": float(item["low"]),
+                    "成交量": float(item["volume"]),
+                    "股票代码": code,
+                }
+            )
         return pd.DataFrame(rows)
 
     @retry_on_network_error(max_retries=3, base_delay=2.0)
@@ -453,6 +556,7 @@ class DataFetcher:
     def _fetch_index_daily_direct(self, symbol: str):
         """腾讯财经指数日线（直连 HTTP）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
         url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,10000,"
@@ -463,15 +567,23 @@ class DataFetcher:
             return pd.DataFrame()
         rows = []
         for row in raw:
-            rows.append({"date": str(row[0]), "open": float(row[1]),
-                          "close": float(row[2]), "high": float(row[3]),
-                          "low": float(row[4]), "volume": float(row[5])})
+            rows.append(
+                {
+                    "date": str(row[0]),
+                    "open": float(row[1]),
+                    "close": float(row[2]),
+                    "high": float(row[3]),
+                    "low": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
         return pd.DataFrame(rows)
 
     @retry_on_network_error(max_retries=3, base_delay=2.0)
     def _fetch_stock_list_direct(self):
         """东方财富股票列表（直连 HTTP，不依赖 akshare）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
         url = (
@@ -494,12 +606,10 @@ class DataFetcher:
     def _fetch_stock_list_tencent_direct(self):
         """腾讯财经股票列表（直连 HTTP，第三级回退）"""
         import re
+
         _rate_limit()
         session = _get_http_session()
-        url = (
-            "http://smartbox.gtimg.cn/s3/"
-            "?q=stock&t=all&c=0&o=1&p=1&ps=6000"
-        )
+        url = "http://smartbox.gtimg.cn/s3/?q=stock&t=all&c=0&o=1&p=1&ps=6000"
         r = session.get(url, timeout=15)
         text = r.text
         # 格式: v_hint="...^股票代码~股票名称^..."
@@ -518,27 +628,24 @@ class DataFetcher:
                             rows.append({"code": code, "name": name})
         except Exception:
             pass
-        
+
         if not rows:
             # 备选：尝试另一种腾讯接口格式
             try:
-                url2 = (
-                    "http://smartbox.gtimg.cn/s3/"
-                    "?q=stock&t=all&c=0&o=1&p=1&ps=6000&v=2"
-                )
+                url2 = "http://smartbox.gtimg.cn/s3/?q=stock&t=all&c=0&o=1&p=1&ps=6000&v=2"
                 r2 = session.get(url2, timeout=15)
                 text2 = r2.text
                 hint_match2 = re.search(r'"(s[hz]\d{6}~[^~]+)"', text2)
                 if hint_match2:
                     # 格式: sh600519~贵州茅台
-                    for m in re.finditer(r'(s[hz]\d{6})~([^\^]+)', text2):
+                    for m in re.finditer(r"(s[hz]\d{6})~([^\^]+)", text2):
                         code = m.group(1)[2:]  # 去掉 sh/sz 前缀
                         name = m.group(2).strip()
                         if code.isdigit() and len(code) == 6:
                             rows.append({"code": code, "name": name})
             except Exception:
                 pass
-        
+
         df = pd.DataFrame(rows)
         if not df.empty:
             df = df.rename(columns={"code": "股票代码", "name": "股票简称"})
@@ -560,16 +667,17 @@ class DataFetcher:
     @retry_on_network_error(max_retries=3, base_delay=2.0)
     def _fetch_financial_eastmoney_direct(self, code: str):
         """东方财富 HTTP 直连获取财务指标（PE/PB/ROE/市值等）
-        
+
         使用东方财富个股基本面数据接口，不依赖 akshare。
         """
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
         prefix = "SH" if code.startswith(("6", "9")) else "SZ"
-        secid = f"1.{code}" if prefix == "SZ" else f"1.{code}"
-        market_type = 0 if prefix == "SZ" else 1
-        
+        # 深市 secid 为 0.{code}，沪市为 1.{code}
+        secid = f"0.{code}" if prefix == "SZ" else f"1.{code}"
+
         # 东方财富个股基本面接口
         url = (
             f"https://emweb.securities.eastmoney.com/PC_HSF10/FinanceSummary/FinanceSummary"
@@ -580,43 +688,43 @@ class DataFetcher:
             r = session.get(url, timeout=10)
         except Exception:
             # 备选 URL 格式
-            url = (
-                f"http://emweb.securities.eastmoney.com/ProfitForecast/Index"
-                f"?type=web&code={prefix}{code}"
-            )
+            url = f"http://emweb.securities.eastmoney.com/ProfitForecast/Index?type=web&code={prefix}{code}"
             r = session.get(url, timeout=10)
-        
+
         # 解析 HTML 中内嵌的 JSON 数据
         text = r.text
         result = {}
-        
+
         # 尝试从页面中提取核心财务数据
         try:
             import re
+
             # 匹配 __NUXT__ 或 window.__INITIAL_STATE__ 等常见数据注入模式
-            match = re.search(r'window\.__NUXT__\s*=\s*({.*?});\s*</script>', text, re.DOTALL)
+            match = re.search(r"window\.__NUXT__\s*=\s*({.*?});\s*</script>", text, re.DOTALL)
             if not match:
-                match = re.search(r'__NUXT__\s*=\s*({.*?});\s*</script>', text, re.DOTALL)
+                match = re.search(r"__NUXT__\s*=\s*({.*?});\s*</script>", text, re.DOTALL)
             if not match:
-                match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>', text, re.DOTALL)
+                match = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>", text, re.DOTALL)
             if match:
                 data = _json.loads(match.group(1))
+
                 # 递归查找财务数据
                 def _find_fin_data(d, depth=0):
                     if depth > 8:
                         return
                     if isinstance(d, dict):
-                        for key in ['finance', 'financial', 'f10', 'quotation', 'quote', 'stock']:
+                        for key in ["finance", "financial", "f10", "quotation", "quote", "stock"]:
                             if key in d:
                                 _find_fin_data(d[key], depth + 1)
-                        if any(k in d for k in ['pe', 'PB', 'ROE', '总市值']):
+                        if any(k in d for k in ["pe", "PB", "ROE", "总市值"]):
                             result.update(d)
                     elif isinstance(d, list) and d:
                         _find_fin_data(d[0], depth + 1)
+
                 _find_fin_data(data)
         except Exception:
             pass
-        
+
         # 如果 HTML 解析失败，使用备选 API 接口
         if not result:
             try:
@@ -629,26 +737,26 @@ class DataFetcher:
                 qt_data = _json.loads(r2.text).get("data", {})
                 if qt_data:
                     result = {
-                        "市盈率": qt_data.get("f9"),       # PE(TTM)
-                        "市净率": qt_data.get("f23"),      # PB
-                        "总市值": qt_data.get("f20"),      # 总市值
-                        "流通市值": qt_data.get("f21"),    # 流通市值
-                        "营业收入": qt_data.get("f44"),    # 总营收
-                        "净利润": qt_data.get("f45"),      # 净利润
-                        "roe": qt_data.get("f37"),         # ROE(%)
-                        "毛利率": qt_data.get("f49"),      # 毛利率
-                        "净利率": qt_data.get("f50"),      # 净利率
+                        "市盈率": qt_data.get("f9"),  # PE(TTM)
+                        "市净率": qt_data.get("f23"),  # PB
+                        "总市值": qt_data.get("f20"),  # 总市值
+                        "流通市值": qt_data.get("f21"),  # 流通市值
+                        "营业收入": qt_data.get("f44"),  # 总营收
+                        "净利润": qt_data.get("f45"),  # 净利润
+                        "roe": qt_data.get("f37"),  # ROE(%)
+                        "毛利率": qt_data.get("f49"),  # 毛利率
+                        "净利率": qt_data.get("f50"),  # 净利率
                         "资产负债率": qt_data.get("f46"),  # 负债率
-                        "净利润增长率": qt_data.get("f43"),# 净利润同比
-                        "营业收入增长率": qt_data.get("f41"),# 营收同比
-                        "股息率": qt_data.get("f57"),      # 股息率
+                        "净利润增长率": qt_data.get("f43"),  # 净利润同比
+                        "营业收入增长率": qt_data.get("f41"),  # 营收同比
+                        "股息率": qt_data.get("f57"),  # 股息率
                     }
             except Exception:
                 pass
-        
+
         if not result:
             return pd.DataFrame()
-        
+
         # 构造 DataFrame（与 AKShare 格式兼容）
         row = {k: v for k, v in result.items() if v is not None and v != "-" and v != ""}
         if not row:
@@ -688,16 +796,16 @@ class DataFetcher:
     @retry_on_network_error(max_retries=3, base_delay=1.5)
     def _fetch_money_flow_direct(self, code: str):
         """东方财富 HTTP 直连获取资金流向数据
-        
+
         使用东方财富个股资金流向接口，返回主力净流入等数据。
         """
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
         prefix = "SH" if code.startswith(("6", "9")) else "SZ"
         secid = f"0.{code}" if prefix == "SZ" else f"1.{code}"
-        market = 0 if prefix == "SZ" else 1
-        
+
         # 东方财富资金流向接口
         url = (
             f"http://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
@@ -709,55 +817,61 @@ class DataFetcher:
         )
         r = session.get(url, timeout=8)
         data = _json.loads(r.text)
-        
+
         klines = data.get("data", {}).get("klines", [])
         if not klines:
             return pd.DataFrame()
-        
+
         rows = []
         for line in klines:
             parts = line.split(",")
             if len(parts) >= 12:
-                rows.append({
-                    "日期": parts[0],
-                    "主力净流入": float(parts[1]) if parts[1] != "-" else 0,
-                    "小单净流入": float(parts[2]) if parts[2] != "-" else 0,
-                    "中单净流入": float(parts[3]) if parts[3] != "-" else 0,
-                    "大单净流入": float(parts[4]) if parts[4] != "-" else 0,
-                    "超大单净流入": float(parts[5]) if parts[5] != "-" else 0,
-                })
-        
+                rows.append(
+                    {
+                        "日期": parts[0],
+                        "主力净流入": float(parts[1]) if parts[1] != "-" else 0,
+                        "小单净流入": float(parts[2]) if parts[2] != "-" else 0,
+                        "中单净流入": float(parts[3]) if parts[3] != "-" else 0,
+                        "大单净流入": float(parts[4]) if parts[4] != "-" else 0,
+                        "超大单净流入": float(parts[5]) if parts[5] != "-" else 0,
+                    }
+                )
+
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     @retry_on_network_error(max_retries=2, base_delay=1.0)
     def _fetch_money_flow_sina_direct(self, code: str):
         """新浪财经 HTTP 直连获取资金流向（备选）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
         prefix = "sh" if code.startswith(("6", "9")) else "sz"
         symbol = f"{prefix}{code}"
-        
+
         url = f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zijinliuliang?daima={symbol}"
         try:
             r = session.get(url, timeout=8)
             raw = _json.loads(r.text)
             if not raw or not isinstance(raw, list) or len(raw) < 2:
                 return pd.DataFrame()
-            
+
             # 取最近5天的数据
             rows = []
             for item in raw[-10:]:
                 try:
                     date_str = item.get("opendate", item.get("date", ""))
-                    rows.append({
-                        "日期": date_str.replace("-", ""),
-                        "主力净流入": float(item.get("superlarge_order", 0) or 0) + float(item.get("large_order", 0) or 0),
-                        "小单净流入": float(item.get("small_order", 0) or 0),
-                        "中单净流入": float(item.get("medium_order", 0) or 0),
-                        "大单净流入": float(item.get("large_order", 0) or 0),
-                        "超大单净流入": float(item.get("superlarge_order", 0) or 0),
-                    })
+                    rows.append(
+                        {
+                            "日期": date_str.replace("-", ""),
+                            "主力净流入": float(item.get("superlarge_order", 0) or 0)
+                            + float(item.get("large_order", 0) or 0),
+                            "小单净流入": float(item.get("small_order", 0) or 0),
+                            "中单净流入": float(item.get("medium_order", 0) or 0),
+                            "大单净流入": float(item.get("large_order", 0) or 0),
+                            "超大单净流入": float(item.get("superlarge_order", 0) or 0),
+                        }
+                    )
                 except (ValueError, TypeError):
                     continue
             return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -767,25 +881,24 @@ class DataFetcher:
     @retry_on_network_error(max_retries=3, base_delay=1.0)
     def _fetch_realtime_quote_sina(self, codes: list[str]):
         """新浪财经实时行情 API（批量获取）
-        
+
         Args:
             codes: 股票代码列表, 如 ['sh600519', 'sz000001']
-        
+
         Returns:
             DataFrame with columns: 代码, 名称, 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, ...
         """
-        import json as _json
         _rate_limit()
         session = _get_http_session()
-        
+
         # 新浪批量行情接口
         codes_str = ",".join(codes)
         url = f"https://hq.sinajs.cn/list={codes_str}"
         session.headers["Referer"] = "https://finance.sina.com.cn"
-        
+
         r = session.get(url, timeout=8)
         text = r.text
-        
+
         rows = []
         for line in text.strip().split("\n"):
             if not line.strip():
@@ -797,48 +910,51 @@ class DataFetcher:
                     continue
                 hq_str = parts[0].split("_str_")[-1] if "_str_" in parts[0] else parts[0].split("=")[0].strip()
                 code = hq_str.replace("var hq_str_", "").strip()
-                
+
                 data_str = parts[1]
                 fields = data_str.split(",")
                 if len(fields) < 32:
                     continue
-                
-                rows.append({
-                    "代码": code[2:],  # 去掉 sh/sz 前缀
-                    "名称": fields[0],
-                    "今开": float(fields[1]) if fields[1] else 0,
-                    "昨收": float(fields[2]) if fields[2] else 0,
-                    "最新价": float(fields[3]) if fields[3] else 0,
-                    "最高": float(fields[4]) if fields[4] else 0,
-                    "最低": float(fields[5]) if fields[5] else 0,
-                    "成交量": float(fields[8]) if fields[8] else 0,
-                    "成交额": float(fields[9]) if fields[9] else 0,
-                    "涨跌额": float(fields[3]) - float(fields[2]) if fields[3] and fields[2] else 0,
-                    "涨跌幅": round((float(fields[3]) - float(fields[2])) / float(fields[2]) * 100, 2) if fields[3] and fields[2] and float(fields[2]) != 0 else 0,
-                })
+
+                rows.append(
+                    {
+                        "代码": code[2:],  # 去掉 sh/sz 前缀
+                        "名称": fields[0],
+                        "今开": float(fields[1]) if fields[1] else 0,
+                        "昨收": float(fields[2]) if fields[2] else 0,
+                        "最新价": float(fields[3]) if fields[3] else 0,
+                        "最高": float(fields[4]) if fields[4] else 0,
+                        "最低": float(fields[5]) if fields[5] else 0,
+                        "成交量": float(fields[8]) if fields[8] else 0,
+                        "成交额": float(fields[9]) if fields[9] else 0,
+                        "涨跌额": float(fields[3]) - float(fields[2]) if fields[3] and fields[2] else 0,
+                        "涨跌幅": round((float(fields[3]) - float(fields[2])) / float(fields[2]) * 100, 2)
+                        if fields[3] and fields[2] and float(fields[2]) != 0
+                        else 0,
+                    }
+                )
             except (IndexError, ValueError, ZeroDivisionError):
                 continue
-        
+
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     @retry_on_network_error(max_retries=3, base_delay=1.0)
     def _fetch_realtime_quote_tencent(self, codes: list[str]):
         """腾讯财经实时行情 API（批量获取）
-        
+
         Args:
             codes: 股票代码列表, 如 ['sh600519', 'sz000001']
         """
-        import json as _json
         _rate_limit()
         session = _get_http_session()
-        
+
         codes_str = ",".join(codes)
         url = f"http://qt.gtimg.cn/q={codes_str}"
         session.headers["Referer"] = "https://gu.qq.com"
-        
+
         r = session.get(url, timeout=8)
         text = r.text
-        
+
         rows = []
         for line in text.strip().split("\n"):
             if not line.strip() or "=" not in line:
@@ -852,36 +968,39 @@ class DataFetcher:
                 fields = data_str.split("~")
                 if len(fields) < 45:
                     continue
-                
-                rows.append({
-                    "代码": fields[2] if len(fields) > 2 else "",
-                    "名称": fields[1] if len(fields) > 1 else "",
-                    "最新价": float(fields[3]) if fields[3] else 0,
-                    "昨收": float(fields[4]) if fields[4] else 0,
-                    "今开": float(fields[5]) if fields[5] else 0,
-                    "成交量": float(fields[6]) if fields[6] else 0,  # 手
-                    "成交额": float(fields[37]) if len(fields) > 37 and fields[37] else 0,  # 万
-                    "最高": float(fields[33]) if len(fields) > 33 and fields[33] else 0,
-                    "最低": float(fields[34]) if len(fields) > 34 and fields[34] else 0,
-                    "涨跌额": float(fields[31]) if len(fields) > 31 and fields[31] else 0,
-                    "涨跌幅": float(fields[32]) if len(fields) > 32 and fields[32] else 0,
-                    "换手率": float(fields[38]) if len(fields) > 38 and fields[38] else 0,
-                    "市盈率": float(fields[39]) if len(fields) > 39 and fields[39] else 0,
-                    "总市值": float(fields[45]) if len(fields) > 45 and fields[45] else 0,  # 亿
-                    "量比": float(fields[49]) if len(fields) > 49 and fields[49] else 0,
-                })
+
+                rows.append(
+                    {
+                        "代码": fields[2] if len(fields) > 2 else "",
+                        "名称": fields[1] if len(fields) > 1 else "",
+                        "最新价": float(fields[3]) if fields[3] else 0,
+                        "昨收": float(fields[4]) if fields[4] else 0,
+                        "今开": float(fields[5]) if fields[5] else 0,
+                        "成交量": float(fields[6]) if fields[6] else 0,  # 手
+                        "成交额": float(fields[37]) if len(fields) > 37 and fields[37] else 0,  # 万
+                        "最高": float(fields[33]) if len(fields) > 33 and fields[33] else 0,
+                        "最低": float(fields[34]) if len(fields) > 34 and fields[34] else 0,
+                        "涨跌额": float(fields[31]) if len(fields) > 31 and fields[31] else 0,
+                        "涨跌幅": float(fields[32]) if len(fields) > 32 and fields[32] else 0,
+                        "换手率": float(fields[38]) if len(fields) > 38 and fields[38] else 0,
+                        "市盈率": float(fields[39]) if len(fields) > 39 and fields[39] else 0,
+                        "总市值": float(fields[45]) if len(fields) > 45 and fields[45] else 0,  # 亿
+                        "量比": float(fields[49]) if len(fields) > 49 and fields[49] else 0,
+                    }
+                )
             except (IndexError, ValueError):
                 continue
-        
+
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     @retry_on_network_error(max_retries=3, base_delay=1.5)
     def _fetch_market_breadth_direct(self):
         """东方财富 HTTP 直连获取全市场涨跌家数等数据（备选）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         url = (
             "http://push2.eastmoney.com/api/qt/clist/get"
             "?pn=1&pz=1&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
@@ -891,7 +1010,7 @@ class DataFetcher:
         )
         r = session.get(url, timeout=10)
         total = _json.loads(r.text).get("data", {}).get("total", 0)
-        
+
         if total > 0:
             # 获取全量数据用于统计涨跌
             url2 = (
@@ -903,11 +1022,11 @@ class DataFetcher:
             )
             r2 = session.get(url2, timeout=10)
             items = _json.loads(r2.text).get("data", {}).get("diff", [])
-            
+
             up_count = sum(1 for i in items if float(i.get("f3", 0) or 0) > 0)
             down_count = sum(1 for i in items if float(i.get("f3", 0) or 0) < 0)
             flat_count = len(items) - up_count - down_count
-            
+
             return {
                 "上涨": up_count,
                 "下跌": down_count,
@@ -926,6 +1045,7 @@ class DataFetcher:
     def _fetch_limit_up_direct(self, date: str):
         """东方财富 HTTP 直连获取涨停池数据（备选回退）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
         # 东方财富涨停板接口
@@ -942,36 +1062,38 @@ class DataFetcher:
             items = data.get("data", {}).get("pool", [])
             if not items:
                 return pd.DataFrame()
-            
+
             rows = []
             for item in items:
-                rows.append({
-                    "代码": str(item.get("c", "")),
-                    "名称": str(item.get("n", "")),
-                    "最新价": float(item.get("p", 0) or 0),
-                    "涨跌幅": float(item.get("zdf", 0) or 0),
-                    "涨停价": float(item.get("zt", 0) or 0),
-                    "成交额": float(item.get("amount", 0) or 0),
-                    "流通市值": float(item.get("ltsz", 0) or 0),
-                    "总市值": float(item.get("zsz", 0) or 0),
-                    "换手率": float(item.get("lbl", 0) or 0),
-                    "连板数": int(item.get("days", 0) or 0),
-                    "封单资金": float(item.get("fba", 0) or 0),
-                    "首次封板时间": str(item.get("ft", "")),
-                    "最后封板时间": str(item.get("lt", "")),
-                    "涨停统计": str(item.get("reason", item.get("hybk", ""))),
-                    "所属行业": str(item.get("hybk", "")),
-                })
+                rows.append(
+                    {
+                        "代码": str(item.get("c", "")),
+                        "名称": str(item.get("n", "")),
+                        "最新价": float(item.get("p", 0) or 0),
+                        "涨跌幅": float(item.get("zdf", 0) or 0),
+                        "涨停价": float(item.get("zt", 0) or 0),
+                        "成交额": float(item.get("amount", 0) or 0),
+                        "流通市值": float(item.get("ltsz", 0) or 0),
+                        "总市值": float(item.get("zsz", 0) or 0),
+                        "换手率": float(item.get("lbl", 0) or 0),
+                        "连板数": int(item.get("days", 0) or 0),
+                        "封单资金": float(item.get("fba", 0) or 0),
+                        "首次封板时间": str(item.get("ft", "")),
+                        "最后封板时间": str(item.get("lt", "")),
+                        "涨停统计": str(item.get("reason", item.get("hybk", ""))),
+                        "所属行业": str(item.get("hybk", "")),
+                    }
+                )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
             # 备选 URL 格式（push2.eastmoney.com）
             try:
                 url2 = (
-                    f"http://push2.eastmoney.com/api/qt/clist/get"
-                    f"?pn=1&pz=200&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-                    f"&fltt=2&invt=2&fid=f3"
-                    f"&fs=b:KDJ%2Bb:BK0518"
-                    f"&fields=f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21"
+                    "http://push2.eastmoney.com/api/qt/clist/get"
+                    "?pn=1&pz=200&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                    "&fltt=2&invt=2&fid=f3"
+                    "&fs=b:KDJ%2Bb:BK0518"
+                    "&fields=f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21"
                 )
                 r2 = session.get(url2, timeout=10)
                 data2 = _json.loads(r2.text)
@@ -979,22 +1101,24 @@ class DataFetcher:
                 if items2:
                     rows2 = []
                     for item in items2:
-                        rows2.append({
-                            "代码": str(item.get("f12", "")),
-                            "名称": str(item.get("f14", "")),
-                            "最新价": float(item.get("f2", 0) or 0),
-                            "涨跌幅": float(item.get("f3", 0) or 0),
-                            "涨跌额": float(item.get("f4", 0) or 0),
-                            "成交量": float(item.get("f5", 0) or 0),
-                            "成交额": float(item.get("f6", 0) or 0),
-                            "换手率": float(item.get("f8", 0) or 0),
-                            "市盈率-动态": float(item.get("f9", 0) or 0),
-                            "总市值": float(item.get("f20", 0) or 0),
-                            "流通市值": float(item.get("f21", 0) or 0),
-                            "连板数": 0,
-                            "涨停统计": "",
-                            "所属行业": "",
-                        })
+                        rows2.append(
+                            {
+                                "代码": str(item.get("f12", "")),
+                                "名称": str(item.get("f14", "")),
+                                "最新价": float(item.get("f2", 0) or 0),
+                                "涨跌幅": float(item.get("f3", 0) or 0),
+                                "涨跌额": float(item.get("f4", 0) or 0),
+                                "成交量": float(item.get("f5", 0) or 0),
+                                "成交额": float(item.get("f6", 0) or 0),
+                                "换手率": float(item.get("f8", 0) or 0),
+                                "市盈率-动态": float(item.get("f9", 0) or 0),
+                                "总市值": float(item.get("f20", 0) or 0),
+                                "流通市值": float(item.get("f21", 0) or 0),
+                                "连板数": 0,
+                                "涨停统计": "",
+                                "所属行业": "",
+                            }
+                        )
                     return pd.DataFrame(rows2)
             except Exception:
                 pass
@@ -1004,15 +1128,16 @@ class DataFetcher:
     def _fetch_limit_down_direct(self, date: str):
         """东方财富 HTTP 直连获取跌停池数据（备选回退）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         # 使用东方财富跌幅榜数据近似跌停池
         url = (
             "http://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn=1&pz=200&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-            f"&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-            f"&fields=f2,f3,f4,f5,f6,f8,f12,f14,f20,f21"
+            "?pn=1&pz=200&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            "&fields=f2,f3,f4,f5,f6,f8,f12,f14,f20,f21"
         )
         try:
             r = session.get(url, timeout=10)
@@ -1020,22 +1145,24 @@ class DataFetcher:
             items = data.get("data", {}).get("diff", [])
             if not items:
                 return pd.DataFrame()
-            
+
             # 筛选接近跌停的股票（跌幅 < -9.5%）
             rows = []
             for item in items:
                 zdf = float(item.get("f3", 0) or 0)
                 if zdf <= -9.5:
-                    rows.append({
-                        "代码": str(item.get("f12", "")),
-                        "名称": str(item.get("f14", "")),
-                        "最新价": float(item.get("f2", 0) or 0),
-                        "涨跌幅": zdf,
-                        "成交额": float(item.get("f6", 0) or 0),
-                        "换手率": float(item.get("f8", 0) or 0),
-                        "总市值": float(item.get("f20", 0) or 0),
-                        "流通市值": float(item.get("f21", 0) or 0),
-                    })
+                    rows.append(
+                        {
+                            "代码": str(item.get("f12", "")),
+                            "名称": str(item.get("f14", "")),
+                            "最新价": float(item.get("f2", 0) or 0),
+                            "涨跌幅": zdf,
+                            "成交额": float(item.get("f6", 0) or 0),
+                            "换手率": float(item.get("f8", 0) or 0),
+                            "总市值": float(item.get("f20", 0) or 0),
+                            "流通市值": float(item.get("f21", 0) or 0),
+                        }
+                    )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
             return pd.DataFrame()
@@ -1044,9 +1171,10 @@ class DataFetcher:
     def _fetch_continuous_limit_direct(self, date: str):
         """东方财富 HTTP 直连获取连板池数据（备选回退）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         # 使用涨停池数据，筛选连板 >= 2 的股票
         url = (
             "http://push2ex.eastmoney.com/getTopicZTPool"
@@ -1061,27 +1189,29 @@ class DataFetcher:
             items = data.get("data", {}).get("pool", [])
             if not items:
                 return pd.DataFrame()
-            
+
             rows = []
             for item in items:
                 days = int(item.get("days", 0) or 0)
                 if days >= 2:  # 只取连板股
-                    rows.append({
-                        "代码": str(item.get("c", "")),
-                        "名称": str(item.get("n", "")),
-                        "最新价": float(item.get("p", 0) or 0),
-                        "涨跌幅": float(item.get("zdf", 0) or 0),
-                        "涨停价": float(item.get("zt", 0) or 0),
-                        "成交额": float(item.get("amount", 0) or 0),
-                        "换手率": float(item.get("lbl", 0) or 0),
-                        "流通市值": float(item.get("ltsz", 0) or 0),
-                        "总市值": float(item.get("zsz", 0) or 0),
-                        "连板数": days,
-                        "封单资金": float(item.get("fba", 0) or 0),
-                        "首次封板时间": str(item.get("ft", "")),
-                        "最后封板时间": str(item.get("lt", "")),
-                        "所属行业": str(item.get("hybk", "")),
-                    })
+                    rows.append(
+                        {
+                            "代码": str(item.get("c", "")),
+                            "名称": str(item.get("n", "")),
+                            "最新价": float(item.get("p", 0) or 0),
+                            "涨跌幅": float(item.get("zdf", 0) or 0),
+                            "涨停价": float(item.get("zt", 0) or 0),
+                            "成交额": float(item.get("amount", 0) or 0),
+                            "换手率": float(item.get("lbl", 0) or 0),
+                            "流通市值": float(item.get("ltsz", 0) or 0),
+                            "总市值": float(item.get("zsz", 0) or 0),
+                            "连板数": days,
+                            "封单资金": float(item.get("fba", 0) or 0),
+                            "首次封板时间": str(item.get("ft", "")),
+                            "最后封板时间": str(item.get("lt", "")),
+                            "所属行业": str(item.get("hybk", "")),
+                        }
+                    )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
             return pd.DataFrame()
@@ -1090,9 +1220,10 @@ class DataFetcher:
     def _fetch_market_breadth_full(self):
         """东方财富 HTTP 直连获取全市场涨跌家数（带板块细分）"""
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         # 使用全市场统计接口
         url = (
             "http://push2.eastmoney.com/api/qt/clist/get"
@@ -1107,15 +1238,15 @@ class DataFetcher:
             items = data.get("data", {}).get("diff", [])
             if not items:
                 return {}
-            
+
             up_count = sum(1 for i in items if float(i.get("f3", 0) or 0) > 0)
             down_count = sum(1 for i in items if float(i.get("f3", 0) or 0) < 0)
             flat_count = len(items) - up_count - down_count
-            
+
             # 统计涨停/跌停（涨跌幅 >= 9.5% 或 <= -9.5%）
             limit_up = sum(1 for i in items if float(i.get("f3", 0) or 0) >= 9.5)
             limit_down = sum(1 for i in items if float(i.get("f3", 0) or 0) <= -9.5)
-            
+
             return {
                 "上涨": up_count,
                 "下跌": down_count,
@@ -1145,11 +1276,17 @@ class DataFetcher:
     # ═══ 公共方法：缓存 + 降级 ═══
 
     def fetch_stock_list(self, force_refresh: bool = False) -> pd.DataFrame:
-        """获取股票列表，回退链: akshare → 东财直连HTTP → 腾讯直连HTTP"""
+        """获取股票列表，优先级: 收费源 → 免费源: akshare → 东财直连HTTP → 腾讯直连HTTP"""
         if not force_refresh:
             cached = self.cache.get("stock_list", max_age_hours=24)
             if cached is not None:
                 return cached
+
+        # ── 优先尝试收费数据源 ──
+        df_premium, _ = self._try_premium_datasource("fetch_stock_list")
+        if df_premium is not None and not df_premium.empty:
+            self.cache.set("stock_list", df_premium)
+            return df_premium
 
         # 优先 akshare，失败则直连
         sources = [
@@ -1159,7 +1296,7 @@ class DataFetcher:
         ]
 
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1171,15 +1308,15 @@ class DataFetcher:
                     self.cache.set("stock_list", df)
                     return df
             except Exception as e:
-                logger.warning(f"  股票列表 [{label}] 不可用({type(e).__name__})，标记跳过")
-                self._unavailable_sources.add(label)
+                self._mark_source_unavailable(label, type(e).__name__)
 
         logger.error("获取股票列表失败（所有数据源均不可达）")
         return pd.DataFrame()
 
-    def fetch_daily_kline(self, code: str, start_date: str = "20200101",
-                          end_date: str | None = None, adjust: str = "qfq") -> pd.DataFrame:
-        """获取日K线，5级回退链:
+    def fetch_daily_kline(
+        self, code: str, start_date: str = "20200101", end_date: str | None = None, adjust: str = "qfq"
+    ) -> pd.DataFrame:
+        """获取日K线，优先级: 收费源(TuShare > Choice > IBKR) → 免费源5级回退链:
         东方财富(akshare) → 新浪(akshare) → 腾讯(akshare) → 腾讯(直连) → 新浪(直连) → 本地DB
         """
         if end_date is None:
@@ -1189,6 +1326,14 @@ class DataFetcher:
         if cached is not None:
             return cached
 
+        # ── 优先尝试收费数据源 ──
+        df_premium, _ = self._try_premium_datasource("fetch_daily_kline", code, start_date, end_date, adjust)
+        if df_premium is not None and not df_premium.empty:
+            self.db.save_daily(df_premium)
+            self.cache.set(cache_key, df_premium, start_date=start_date, end_date=end_date)
+            return df_premium
+
+        # ── 免费源降级 ──
         # 尝试各数据源，成功后写缓存/DB 并返回
         sources = [
             ("东方财富", lambda: self._fetch_eastmoney_kline(code, start_date, end_date, adjust)),
@@ -1199,7 +1344,7 @@ class DataFetcher:
         ]
 
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue  # 已知失效，跳过
             try:
                 df = fetcher()
@@ -1210,8 +1355,7 @@ class DataFetcher:
                     self.cache.set(cache_key, df, start_date=start_date, end_date=end_date)
                     return df
             except Exception as e:
-                logger.warning(f"  {label} 数据源不可用({type(e).__name__})，标记跳过")
-                self._unavailable_sources.add(label)
+                self._mark_source_unavailable(label, type(e).__name__)
 
         # 所有远程源都失败 → 降级到本地 SQLite
         logger.error(f"获取 {code} K线失败（所有数据源均不可达）")
@@ -1221,15 +1365,21 @@ class DataFetcher:
             return db_data
         return pd.DataFrame()
 
-    def fetch_index_daily(self, index_code: str = "000001",
-                          start_date: str = "20200101", end_date: str | None = None) -> pd.DataFrame:
-        """获取指数日线，3级回退链: 东方财富 → 腾讯(akshare) → 腾讯(直连)"""
+    def fetch_index_daily(
+        self, index_code: str = "000001", start_date: str = "20200101", end_date: str | None = None
+    ) -> pd.DataFrame:
+        """获取指数日线，优先级: 收费源 → 免费源3级回退: 东方财富 → 腾讯(akshare) → 腾讯(直连)"""
         if end_date is None:
             end_date = datetime.now().strftime("%Y%m%d")
-        cached = self.cache.get(f"index_{index_code}", max_age_hours=6,
-                                start_date=start_date, end_date=end_date)
+        cached = self.cache.get(f"index_{index_code}", max_age_hours=6, start_date=start_date, end_date=end_date)
         if cached is not None:
             return cached
+
+        # ── 优先尝试收费数据源 ──
+        df_premium, _ = self._try_premium_datasource("fetch_index_daily", index_code, start_date, end_date)
+        if df_premium is not None and not df_premium.empty:
+            self.cache.set(f"index_{index_code}", df_premium, start_date=start_date, end_date=end_date)
+            return df_premium
 
         prefix = "sz" if index_code.startswith("3") else "sh"
         symbol = f"{prefix}{index_code}"
@@ -1241,7 +1391,7 @@ class DataFetcher:
         ]
 
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1255,19 +1405,24 @@ class DataFetcher:
                     self.cache.set(f"index_{index_code}", df, start_date=start_date, end_date=end_date)
                     return df
             except Exception as e:
-                logger.warning(f"  指数 {index_code} [{label}] 不可用({type(e).__name__})，标记跳过")
-                self._unavailable_sources.add(label)
+                self._mark_source_unavailable(label, type(e).__name__)
 
         logger.error(f"获取指数 {index_code} 数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
     def fetch_financial_data(self, code: str) -> pd.DataFrame:
-        """获取财务数据，三级回退链:
+        """获取财务数据，优先级: 收费源(TuShare > Choice > IBKR) → 免费源三级回退链:
         AKShare(财务分析指标) → AKShare(财务摘要) → 东方财富HTTP直连
         """
         cached = self.cache.get(f"finance_{code}", max_age_hours=168)
         if cached is not None:
             return cached
+
+        # ── 优先尝试收费数据源 ──
+        df_premium, _ = self._try_premium_datasource("fetch_financial_data", code)
+        if df_premium is not None and not df_premium.empty:
+            self.cache.set(f"finance_{code}", df_premium)
+            return df_premium
 
         sources = [
             ("AKShare财务指标", lambda: self._fetch_financial_raw(code)),
@@ -1276,7 +1431,7 @@ class DataFetcher:
         ]
 
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1286,32 +1441,33 @@ class DataFetcher:
                     self.cache.set(f"finance_{code}", df)
                     return df
             except Exception as e:
-                logger.warning(f"  财务数据 [{label}] 不可用({type(e).__name__})，标记跳过")
-                self._unavailable_sources.add(label)
+                self._mark_source_unavailable(label, type(e).__name__)
 
         logger.error(f"获取 {code} 财务数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
     def fetch_industry_stocks(self, industry: str, board_code: str = "") -> pd.DataFrame:
         from . import sector_fallback as _sf
+
         return _sf.fetch_stocks(self.cache, industry, board_code)
 
     def fetch_industry_list(self, force_refresh: bool = False) -> pd.DataFrame:
         from . import sector_fallback as _sf
+
         return _sf.fetch_list(self.cache, force=force_refresh)
 
     def fetch_limit_up_pool(self, date: str | None = None) -> pd.DataFrame:
         """获取涨停板股票池，两级回退: AKShare → 东财HTTP直连"""
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        
+
         sources = [
             ("AKShare涨停池", lambda: self._fetch_limit_up_raw(date)),
             ("东方财富涨停池直连", lambda: self._fetch_limit_up_direct(date)),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1320,9 +1476,8 @@ class DataFetcher:
                         logger.info(f"  → 涨停池使用 {label} 数据源")
                     return df
             except Exception as e:
-                logger.warning(f"  涨停池 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         logger.error("获取涨停板数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
@@ -1330,14 +1485,14 @@ class DataFetcher:
         """获取连板股票池，两级回退: AKShare → 东财HTTP直连"""
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        
+
         sources = [
             ("AKShare连板池", lambda: self._fetch_continuous_limit_raw(date)),
             ("东方财富连板池直连", lambda: self._fetch_continuous_limit_direct(date)),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1346,16 +1501,20 @@ class DataFetcher:
                         logger.info(f"  → 连板池使用 {label} 数据源")
                     return df
             except Exception as e:
-                logger.warning(f"  连板池 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         logger.error("获取连板数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
     def fetch_money_flow(self, code: str) -> pd.DataFrame:
-        """获取资金流向，三级回退链:
+        """获取资金流向，优先级: 收费源 → 免费源三级回退链:
         AKShare(个股资金流向) → 东方财富HTTP直连 → 新浪HTTP直连
         """
+        # ── 优先尝试收费数据源 ──
+        df_premium, _ = self._try_premium_datasource("fetch_money_flow", code)
+        if df_premium is not None and not df_premium.empty:
+            return df_premium
+
         sources = [
             ("AKShare资金流向", lambda: self._fetch_money_flow_raw(code, "sh" if code.startswith("6") else "sz")),
             ("东方财富资金流向直连", lambda: self._fetch_money_flow_direct(code)),
@@ -1363,7 +1522,7 @@ class DataFetcher:
         ]
 
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1372,8 +1531,7 @@ class DataFetcher:
                         logger.info(f"  → '{code}' 资金流向使用 {label} 数据源")
                     return df
             except Exception as e:
-                logger.warning(f"  资金流向 [{label}] 不可用({type(e).__name__})，标记跳过")
-                self._unavailable_sources.add(label)
+                self._mark_source_unavailable(label, type(e).__name__)
 
         logger.error(f"获取 {code} 资金流向失败（所有数据源均不可达）")
         return pd.DataFrame()
@@ -1382,14 +1540,14 @@ class DataFetcher:
         """获取跌停板股票池，两级回退: AKShare → 东财HTTP直连"""
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        
+
         sources = [
             ("AKShare跌停池", lambda: self._fetch_limit_down_raw(date)),
             ("东方财富跌停池直连", lambda: self._fetch_limit_down_direct(date)),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1398,9 +1556,8 @@ class DataFetcher:
                         logger.info(f"  → 跌停池使用 {label} 数据源")
                     return df
             except Exception as e:
-                logger.warning(f"  跌停池 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         logger.error("获取跌停板数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
@@ -1413,7 +1570,7 @@ class DataFetcher:
 
     def fetch_market_activity(self) -> dict[str, float]:
         """获取全市场活跃度概览（涨跌停数、涨跌家数、成交量等），三级回退
-        
+
         Returns:
             dict: {上涨, 下跌, 平盘, 涨停, 真实涨停, 跌停, 真实跌停, 总市值, 成交量, ...}
         """
@@ -1430,11 +1587,10 @@ class DataFetcher:
                             result[key] = float(val)
                         except (ValueError, TypeError):
                             result[key] = val
-                    self._unavailable_sources.discard("AKShare乐股")
+                    self._unavailable_sources.pop("AKShare乐股", None)  # 恢复可用
                     return result
             except Exception as e:
-                logger.warning(f"AKShare市场活跃度获取失败: {e}，标记跳过")
-                self._unavailable_sources.add("AKShare乐股")
+                self._mark_source_unavailable("AKShare乐股", type(e).__name__)
 
         # 二级: 东方财富 HTTP 直连获取涨跌家数（采样100只）
         try:
@@ -1467,13 +1623,14 @@ class DataFetcher:
     @retry_on_network_error(max_retries=3, base_delay=1.5)
     def _fetch_northbound_flow_direct(self, days: int = 30):
         """东方财富 HTTP 直连获取北向资金（沪深港通）日流向
-        
+
         使用东方财富北向资金 K 线接口，返回每日净流入数据。
         """
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         # 北向资金总计（沪股通+深股通）日线
         url = (
             "http://push2his.eastmoney.com/api/qt/kamt.kline/get"
@@ -1489,18 +1646,20 @@ class DataFetcher:
             klines = data.get("data", {}).get("klines", [])
             if not klines:
                 return pd.DataFrame()
-            
+
             rows = []
             for line in klines:
                 parts = line.split(",")
                 if len(parts) >= 4:
-                    rows.append({
-                        "日期": parts[0].replace("-", ""),
-                        "当日净流入": round(float(parts[1]) / 1e8, 2) if parts[1] != "-" else 0,  # 亿
-                        "沪股通净流入": round(float(parts[2]) / 1e8, 2) if parts[2] != "-" else 0,
-                        "深股通净流入": round(float(parts[3]) / 1e8, 2) if parts[3] != "-" else 0,
-                        "当日余额": round(float(parts[4]) / 1e8, 2) if len(parts) > 4 and parts[4] != "-" else 0,
-                    })
+                    rows.append(
+                        {
+                            "日期": parts[0].replace("-", ""),
+                            "当日净流入": round(float(parts[1]) / 1e8, 2) if parts[1] != "-" else 0,  # 亿
+                            "沪股通净流入": round(float(parts[2]) / 1e8, 2) if parts[2] != "-" else 0,
+                            "深股通净流入": round(float(parts[3]) / 1e8, 2) if parts[3] != "-" else 0,
+                            "当日余额": round(float(parts[4]) / 1e8, 2) if len(parts) > 4 and parts[4] != "-" else 0,
+                        }
+                    )
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
             return pd.DataFrame()
@@ -1515,24 +1674,24 @@ class DataFetcher:
 
     def fetch_northbound_flow(self, days: int = 30) -> pd.DataFrame:
         """获取北向资金（沪深港通）流向，两级回退: 东财直连 → AKShare
-        
+
         Args:
             days: 获取最近多少天的数据
-        
+
         Returns:
             DataFrame with columns: 日期, 当日净流入, 沪股通净流入, 深股通净流入, ...
         """
         cached = self.cache.get("northbound_flow", max_age_hours=6)
         if cached is not None:
             return cached
-        
+
         sources = [
             ("东方财富北向资金直连", lambda: self._fetch_northbound_flow_direct(days)),
             ("AKShare北向资金", lambda: self._fetch_northbound_flow_akshare()),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1542,9 +1701,8 @@ class DataFetcher:
                     self.cache.set("northbound_flow", df)
                     return df
             except Exception as e:
-                logger.warning(f"  北向资金 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         logger.error("获取北向资金数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
@@ -1553,21 +1711,22 @@ class DataFetcher:
     @retry_on_network_error(max_retries=3, base_delay=1.5)
     def _fetch_lhb_direct(self, date: str | None = None):
         """东方财富 HTTP 直连获取龙虎榜数据
-        
+
         使用 push2.eastmoney.com 个股龙虎榜接口。
         """
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        
+
         # 使用东方财富龙虎榜个股接口
-        date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        f"{date[:4]}-{date[4:6]}-{date[6:]}"
         url = (
             "http://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn=1&pz=200&po=1&np=1"
+            "?pn=1&pz=200&po=1&np=1"
             "&ut=bd1d9ddb04089700cf9c27f6f7426281"
             "&fltt=2&invt=2&fid=f3"
             "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
@@ -1579,23 +1738,25 @@ class DataFetcher:
             items = data.get("data", {}).get("diff", [])
             if not items:
                 return pd.DataFrame()
-            
+
             # 筛选有龙虎榜数据的股票（f184 字段 = 龙虎榜标记）
             rows = []
             for item in items:
                 # f184 可能是龙虎榜相关字段
                 lhb_flag = item.get("f184", "")
                 if lhb_flag:
-                    rows.append({
-                        "股票代码": str(item.get("f12", "")),
-                        "股票名称": str(item.get("f14", "")),
-                        "最新价": float(item.get("f2", 0) or 0),
-                        "涨跌幅": float(item.get("f3", 0) or 0),
-                        "成交额": round(float(item.get("f6", 0) or 0) / 1e8, 2),
-                        "总市值": round(float(item.get("f20", 0) or 0) / 1e8, 2) if item.get("f20") else 0,
-                        "流通市值": round(float(item.get("f21", 0) or 0) / 1e8, 2) if item.get("f21") else 0,
-                        "上榜原因": str(item.get("f184", "")),
-                    })
+                    rows.append(
+                        {
+                            "股票代码": str(item.get("f12", "")),
+                            "股票名称": str(item.get("f14", "")),
+                            "最新价": float(item.get("f2", 0) or 0),
+                            "涨跌幅": float(item.get("f3", 0) or 0),
+                            "成交额": round(float(item.get("f6", 0) or 0) / 1e8, 2),
+                            "总市值": round(float(item.get("f20", 0) or 0) / 1e8, 2) if item.get("f20") else 0,
+                            "流通市值": round(float(item.get("f21", 0) or 0) / 1e8, 2) if item.get("f21") else 0,
+                            "上榜原因": str(item.get("f184", "")),
+                        }
+                    )
             # 如果 push2 方式拿不到，返回空（让 akshare 回退处理）
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
@@ -1605,6 +1766,7 @@ class DataFetcher:
     def _fetch_lhb_akshare(self, date: str | None = None):
         """AKShare 龙虎榜数据（备选）- 多接口尝试"""
         import datetime as _dt
+
         ak = _ensure_akshare()
         _rate_limit()
         if date is None:
@@ -1625,24 +1787,24 @@ class DataFetcher:
 
     def fetch_lhb_detail(self, date: str | None = None) -> pd.DataFrame:
         """获取龙虎榜详情，两级回退: 东财直连 → AKShare
-        
+
         Returns:
             DataFrame with columns: 股票代码, 股票名称, 涨跌幅, 龙虎榜净买额, 上榜原因, ...
         """
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
-        
+
         cached = self.cache.get(f"lhb_{date}", max_age_hours=24)
         if cached is not None:
             return cached
-        
+
         sources = [
             ("东方财富龙虎榜直连", lambda: self._fetch_lhb_direct(date)),
             ("AKShare龙虎榜", lambda: self._fetch_lhb_akshare(date)),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1652,9 +1814,8 @@ class DataFetcher:
                     self.cache.set(f"lhb_{date}", df)
                     return df
             except Exception as e:
-                logger.warning(f"  龙虎榜 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         logger.error("获取龙虎榜数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
@@ -1663,13 +1824,14 @@ class DataFetcher:
     @retry_on_network_error(max_retries=3, base_delay=1.5)
     def _fetch_margin_trading_direct(self):
         """东方财富 HTTP 直连获取融资融券余额（全市场汇总）
-        
+
         使用 push2.eastmoney.com 融资融券数据接口。
         """
         import json as _json
+
         _rate_limit()
         session = _get_http_session()
-        
+
         # 沪深两市融资融券汇总数据
         url = (
             "http://push2.eastmoney.com/api/qt/clist/get"
@@ -1685,22 +1847,24 @@ class DataFetcher:
             items = data.get("data", {}).get("diff", [])
             if not items:
                 return pd.DataFrame()
-            
+
             # 汇总个股融资余额
             total_margin = 0.0
             total_sc = 0.0
             for item in items:
                 margin_val = float(item.get("f62", 0) or 0)  # 融资余额近似
-                sc_val = float(item.get("f66", 0) or 0)      # 融券余额近似
+                sc_val = float(item.get("f66", 0) or 0)  # 融券余额近似
                 total_margin += margin_val
                 total_sc += sc_val
-            
-            rows = [{
-                "日期": datetime.now().strftime("%Y%m%d"),
-                "融资余额": round(total_margin / 1e8, 2),
-                "融券余额": round(total_sc / 1e8, 2),
-                "融资融券余额": round((total_margin + total_sc) / 1e8, 2),
-            }]
+
+            rows = [
+                {
+                    "日期": datetime.now().strftime("%Y%m%d"),
+                    "融资余额": round(total_margin / 1e8, 2),
+                    "融券余额": round(total_sc / 1e8, 2),
+                    "融资融券余额": round((total_margin + total_sc) / 1e8, 2),
+                }
+            ]
             return pd.DataFrame(rows) if rows else pd.DataFrame()
         except Exception:
             return pd.DataFrame()
@@ -1711,13 +1875,19 @@ class DataFetcher:
         ak = _ensure_akshare()
         _rate_limit()
         import datetime as _dt
+
         today = _dt.datetime.now()
         # 尝试多种接口
         for fn_name, fn_args in [
             ("stock_margin_detail_szse", {"date": today.strftime("%Y-%m-%d")}),
             ("stock_margin_detail_szse", {"date": today.strftime("%Y%m%d")}),
-            ("stock_margin_sse", {"start_date": (today - _dt.timedelta(days=30)).strftime("%Y%m%d"),
-                                  "end_date": today.strftime("%Y%m%d")}),
+            (
+                "stock_margin_sse",
+                {
+                    "start_date": (today - _dt.timedelta(days=30)).strftime("%Y%m%d"),
+                    "end_date": today.strftime("%Y%m%d"),
+                },
+            ),
             ("stock_margin_sse", {}),
         ]:
             try:
@@ -1730,21 +1900,21 @@ class DataFetcher:
 
     def fetch_margin_trading(self) -> pd.DataFrame:
         """获取融资融券余额数据，两级回退: 东财直连 → AKShare
-        
+
         Returns:
             DataFrame with columns: 日期, 融资余额, 融资买入额, 融券余额, 融资融券余额, ...
         """
         cached = self.cache.get("margin_trading", max_age_hours=6)
         if cached is not None:
             return cached
-        
+
         sources = [
             ("东方财富融资融券直连", lambda: self._fetch_margin_trading_direct()),
             ("AKShare融资融券", lambda: self._fetch_margin_trading_akshare()),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1754,34 +1924,33 @@ class DataFetcher:
                     self.cache.set("margin_trading", df)
                     return df
             except Exception as e:
-                logger.warning(f"  融资融券 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         logger.error("获取融资融券数据失败（所有数据源均不可达）")
         return pd.DataFrame()
 
     def fetch_realtime_quote(self, codes: list[str]) -> pd.DataFrame:
         """获取实时行情（批量），两级回退: 新浪 → 腾讯
-        
+
         Args:
             codes: 股票代码列表, 如 ['600519', '000001']（不含市场前缀）
-        
+
         Returns:
             DataFrame with columns: 代码, 名称, 最新价, 涨跌幅, 成交量, 成交额, 换手率, 量比, 市盈率
         """
         if not codes:
             return pd.DataFrame()
-        
+
         # 构造带市场前缀的代码
         sina_codes = [f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}" for code in codes]
-        
+
         sources = [
             ("新浪实时行情", lambda: self._fetch_realtime_quote_sina(sina_codes)),
             ("腾讯实时行情", lambda: self._fetch_realtime_quote_tencent(sina_codes)),
         ]
-        
+
         for label, fetcher in sources:
-            if label in self._unavailable_sources:
+            if not self._is_source_available(label):
                 continue
             try:
                 df = fetcher()
@@ -1790,9 +1959,8 @@ class DataFetcher:
                         logger.info(f"  → 实时行情使用 {label} 数据源")
                     return df
             except Exception as e:
-                logger.warning(f"  实时行情 [{label}] 不可用({type(e).__name__})")
-                self._unavailable_sources.add(label)
-        
+                self._mark_source_unavailable(label, type(e).__name__)
+
         return pd.DataFrame()
 
     def reset_unavailable_sources(self):
@@ -1800,17 +1968,18 @@ class DataFetcher:
         count = len(self._unavailable_sources)
         if count > 0:
             self._unavailable_sources.clear()
-            logger.info(f"已重置 {count} 个不可用数据源标记")
-        
+            logger.info(f"已重置 {count} 个不可用数据源标记（强制恢复重试）")
+
         # 同时重置 sector_fallback 模块的不可用标记
         try:
             from . import sector_fallback as _sf
+
             _sf.reset()
         except Exception:
             pass
-    
+
     def get_data_source_health(self) -> dict[str, object]:
-        """获取数据源健康状态"""
+        """获取数据源健康状态（含收费源）"""
         all_sources = {
             "股票列表": ["akshare", "东财直连", "腾讯直连"],
             "K线": ["东方财富", "新浪", "腾讯", "腾讯直连", "新浪直连"],
@@ -1827,7 +1996,7 @@ class DataFetcher:
             "龙虎榜": ["东方财富龙虎榜直连", "AKShare龙虎榜"],
             "融资融券": ["东方财富融资融券直连", "AKShare融资融券"],
         }
-        
+
         health = {}
         for category, sources in all_sources.items():
             available = [s for s in sources if s not in self._unavailable_sources]
@@ -1838,7 +2007,32 @@ class DataFetcher:
                 "total": len(sources),
                 "healthy": len(available) == len(sources),
             }
-        
+
+        # 添加收费数据源状态
+        try:
+            from .datasource.manager import _read_apikeys
+
+            apikeys = _read_apikeys()
+            premium_status = []
+            premium_sources = {
+                "tushare": "TuShare Pro",
+                "choice": "Choice",
+                "ibkr": "IBKR",
+            }
+            for src_id, src_name in premium_sources.items():
+                cfg = apikeys.get(src_id, {})
+                premium_status.append(
+                    {
+                        "id": src_id,
+                        "name": src_name,
+                        "configured": bool(cfg.get("api_key") if isinstance(cfg, dict) else cfg),
+                        "status": "已配置" if (cfg.get("api_key") if isinstance(cfg, dict) else cfg) else "未配置",
+                    }
+                )
+            health["_premium"] = premium_status
+        except Exception:
+            health["_premium"] = []
+
         return health
 
     def fetch_market_total_volume(self) -> dict[str, object]:
@@ -1860,7 +2054,7 @@ class DataFetcher:
             # 上交所总览（总市值、PE）
             sh = self._fetch_sse_summary_raw()
             if sh is not None and not sh.empty:
-                items = dict(zip(sh["项目"], sh["股票"]))
+                items = dict(zip(sh["项目"], sh["股票"], strict=False))
                 result["sh_total_mv"] = float(items.get("总市值", 0)) * 1e8  # 亿→元
                 result["sh_pe"] = float(items.get("平均市盈率", 0))
 
@@ -1892,8 +2086,8 @@ class DataFetcher:
         Returns:
             {code: gain_pct} 字典
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         import json as _json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         result: dict[str, float] = {}
         if not codes:
@@ -1941,9 +2135,9 @@ class DataFetcher:
                     try:
                         ak = _ensure_akshare()
                         _rate_limit()
-                        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                                start_date=start_str, end_date=today_str,
-                                                adjust="qfq")
+                        df = ak.stock_zh_a_hist(
+                            symbol=code, period="daily", start_date=start_str, end_date=today_str, adjust="qfq"
+                        )
                         if df is not None and not df.empty and len(df) >= 6:
                             col_map = {"日期": "date", "收盘": "close"}
                             df2 = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
@@ -1982,32 +2176,42 @@ class DataFetcher:
 
         return result
 
-    def build_stock_pool(self, market: str = "全部", filter_st: bool = True,
-                         filter_new: bool = True, min_days: int = 60) -> list[str]:
+    def build_stock_pool(
+        self, market: str = "全部", filter_st: bool = True, filter_new: bool = True, min_days: int = 60
+    ) -> list[str]:
         stock_list = self.fetch_stock_list()
         if stock_list.empty:
             return []
         codes = stock_list["股票代码"].tolist()
         names = stock_list["股票简称"].tolist()
         filtered = []
-        for code, name in zip(codes, names):
+        for code, name in zip(codes, names, strict=False):
             if filter_st and ("ST" in str(name) or "退" in str(name)):
                 continue
             filtered.append(code)
         return filtered
 
-    def prepare_akquant_data(self, codes: list[str], start_date: str,
-                             end_date: str | None = None) -> dict[str, pd.DataFrame]:
+    def prepare_akquant_data(
+        self, codes: list[str], start_date: str, end_date: str | None = None
+    ) -> dict[str, pd.DataFrame]:
         """准备 AKQuant 格式的多标的数据字典
 
         返回: {symbol: DataFrame[date, open, high, low, close, volume, symbol]}
         """
         import pandas as _pd
+
         if end_date is None:
             end_date = datetime.now().strftime("%Y%m%d")
 
-        col_map = {"日期": "date", "开盘": "open", "收盘": "close",
-                    "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount"}
+        col_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+        }
         required = ["date", "open", "high", "low", "close", "volume"]
         data = {}
 
@@ -2019,12 +2223,12 @@ class DataFetcher:
                 df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
                 if not all(c in df.columns for c in required):
                     continue
-                df = df[required + ["amount"] if "amount" in df.columns else required].copy()
+                df = df[[*required, "amount"] if "amount" in df.columns else required].copy()
                 df["date"] = _pd.to_datetime(df["date"], errors="coerce")
                 df = df.dropna(subset=["date"]).sort_values("date")
                 df["symbol"] = str(code)
                 if len(df) >= 20:
-                    data[str(code)] = df[required + ["symbol"]]
+                    data[str(code)] = df[[*required, "symbol"]]
             except Exception as e:
                 logger.debug(f"准备 {code} AKQ数据失败: {e}")
                 continue

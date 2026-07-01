@@ -4,6 +4,7 @@
 """
 
 import numpy as np
+
 from .base import CloudKnightStrategy
 
 
@@ -11,11 +12,15 @@ class DragonHeadStrategy(CloudKnightStrategy):
     name = "dragon_head"
     description = "龙头战法 - 追踪市场最强龙头股"
 
-    def __init__(self, params: dict = None):
+    def __init__(self, params: dict | None = None):
         default = {
-            "max_position_pct": 0.30, "stop_loss_pct": 0.07, "stop_profit_pct": 0.20,
-            "min_limit_up_days": 2, "volume_ratio_min": 1.5,
-            "turnover_rate_min": 5, "turnover_rate_max": 30,
+            "max_position_pct": 0.30,
+            "stop_loss_pct": 0.07,
+            "stop_profit_pct": 0.20,
+            "min_limit_up_days": 2,
+            "volume_ratio_min": 1.5,
+            "turnover_rate_min": 5,
+            "turnover_rate_max": 30,
         }
         default.update(params or {})
         super().__init__(default)
@@ -33,8 +38,8 @@ class DragonHeadStrategy(CloudKnightStrategy):
         # 计算涨跌幅序列（近似，实际由数据提供更准确）
         pct_changes = self.get_pct_changes(symbol, 20)
         volumes = self.get_history_volumes(symbol, 21)
-        highs = self.get_history_highs(symbol, 5)
-        lows = self.get_history_lows(symbol, 5)
+        self.get_history_highs(symbol, 5)
+        self.get_history_lows(symbol, 5)
 
         # 连板天数
         limit_days = 0
@@ -58,10 +63,14 @@ class DragonHeadStrategy(CloudKnightStrategy):
 
         if not has_pos:
             # 建仓条件：涨停且连板 >= min_limit_up_days
-            if is_limit_up and limit_days >= self._params["min_limit_up_days"]:
-                if vol_ratio >= self._params["volume_ratio_min"]:
-                    self.enter_long(symbol, self._params["max_position_pct"],
-                                    f"龙头建仓: 连板{limit_days}天 量比{vol_ratio:.1f}")
+            if (
+                is_limit_up
+                and limit_days >= self._params["min_limit_up_days"]
+                and vol_ratio >= self._params["volume_ratio_min"]
+            ):
+                self.enter_long(
+                    symbol, self._params["max_position_pct"], f"龙头建仓: 连板{limit_days}天 量比{vol_ratio:.1f}"
+                )
         else:
             pnl_pct = self.position_pnl_pct(symbol)
 
@@ -77,7 +86,6 @@ class DragonHeadStrategy(CloudKnightStrategy):
 
             # 炸板/冲高回落 减持
             high_today = self.high
-            low_today = self.low
             if high_today > self.close * 1.05 and self.close < self.open:
                 self.reduce_position(symbol, 0.5, "龙头减持: 炸板/冲高回落")
 
@@ -93,3 +101,92 @@ class DragonHeadStrategy(CloudKnightStrategy):
             # 缩量加速加仓
             if is_limit_up and vol_ratio < 0.7 and limit_days <= 5:
                 self.add_position(symbol, 0.15, "龙头加仓: 缩量加速")
+
+    # ── 诊股接口 ──────────────────────────────────────
+    @staticmethod
+    def diagnose(closes, highs, lows, volumes, opens, indicators, fund=None, cap=None) -> dict:
+        """龙头战法诊股评分：连板、量比、换手率"""
+        reasons, warnings = [], []
+        score = 30
+
+        pcts = indicators.get("pcts", [])
+        vol_ratio = indicators.get("vol_ratio", 1)
+
+        # 连板天数
+        limit_days = 0
+        for p in pcts:
+            if p >= 9.5:
+                limit_days += 1
+            else:
+                break
+        if limit_days > 0:
+            score += min(limit_days * 10, 30)
+            reasons.append(f"已{limit_days}连板")
+        else:
+            warnings.append("无涨停连板")
+
+        # 涨停强度
+        pct_today = indicators.get("pct_today", 0)
+        if pct_today >= 9.5:
+            score += 15
+            reasons.append("今日涨停")
+        elif pct_today >= 5:
+            score += 5
+            reasons.append("今日大幅上涨")
+        elif pct_today <= -9.5:
+            score -= 20
+            warnings.append("今日跌停")
+
+        # 量比
+        if 1.5 <= vol_ratio <= 3:
+            score += 15
+            reasons.append(f"量比{vol_ratio:.1f}适中")
+        elif vol_ratio > 3:
+            score += 8
+            reasons.append(f"量比{vol_ratio:.1f}偏大")
+        elif vol_ratio >= 1:
+            score += 3
+        else:
+            score -= 5
+            warnings.append(f"量比{vol_ratio:.1f}偏小")
+
+        # 换手率
+        turnover = cap.turnover_rate if cap else None
+        if turnover is not None:
+            if 5 <= turnover <= 30:
+                score += 10
+                reasons.append(f"换手率{turnover:.1f}%活跃")
+            elif 2 <= turnover < 5:
+                score += 5
+                reasons.append(f"换手率{turnover:.1f}%")
+            elif turnover > 30:
+                score -= 5
+                warnings.append(f"换手率{turnover:.1f}%过高")
+            else:
+                warnings.append(f"换手率{turnover:.1f}%偏低")
+
+        score = max(0, min(100, score))
+        match = len(reasons)
+        total = 4
+
+        if score >= 70:
+            signal, rating = "buy", "强烈推荐"
+        elif score >= 55:
+            signal, rating = "buy", "关注"
+        elif score >= 40:
+            signal, rating = "hold", "观望"
+        else:
+            signal, rating = "sell", "不适用"
+
+        return {
+            "name": "龙头战法",
+            "key": "dragon_head",
+            "score": score,
+            "signal": signal,
+            "rating": rating,
+            "match_count": match,
+            "total_conditions": total,
+            "reasons": reasons,
+            "warnings": warnings,
+            "auto_add_threshold": 70,
+        }

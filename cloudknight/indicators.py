@@ -2,13 +2,13 @@
 技术指标分析模块 - MACD、KDJ、RSI、均线、量价关系等
 """
 
-import pandas as pd
-import numpy as np
-from typing import Tuple, Dict, Any
 from dataclasses import dataclass
+from typing import Any
 
-from .config import (MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-                     KDJ_N, KDJ_M1, KDJ_M2, RSI_PERIOD, MA_PERIODS)
+import numpy as np
+import pandas as pd
+
+from .config import KDJ_M1, KDJ_M2, KDJ_N, MA_PERIODS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, RSI_PERIOD
 
 
 @dataclass
@@ -16,10 +16,10 @@ class IndicatorResult:
     trend: str
     signal: str
     strength: float
-    details: Dict[str, Any]
+    details: dict[str, Any]
 
 
-def calc_ma(df: pd.DataFrame, periods: list = None) -> pd.DataFrame:
+def calc_ma(df: pd.DataFrame, periods: list | None = None) -> pd.DataFrame:
     if periods is None:
         periods = MA_PERIODS
     df = df.copy()
@@ -33,8 +33,9 @@ def calc_ema(df: pd.DataFrame, period: int, col: str = "close") -> pd.Series:
     return df[col].ewm(span=period, adjust=False).mean()
 
 
-def calc_macd(df: pd.DataFrame, fast: int = MACD_FAST,
-              slow: int = MACD_SLOW, signal: int = MACD_SIGNAL) -> pd.DataFrame:
+def calc_macd(
+    df: pd.DataFrame, fast: int = MACD_FAST, slow: int = MACD_SLOW, signal: int = MACD_SIGNAL
+) -> pd.DataFrame:
     df = df.copy()
     df["EMA_fast"] = calc_ema(df, fast)
     df["EMA_slow"] = calc_ema(df, slow)
@@ -62,10 +63,18 @@ def analyze_macd(df: pd.DataFrame) -> IndicatorResult:
         trend = "neutral"
         strength = 50
     signal = "buy" if golden_cross else ("sell" if death_cross else "hold")
-    return IndicatorResult(trend=trend, signal=signal, strength=round(strength, 1),
-                           details={"DIF": round(latest["DIF"], 4), "DEA": round(latest["DEA"], 4),
-                                    "MACD": round(latest["MACD"], 4),
-                                    "golden_cross": golden_cross, "death_cross": death_cross})
+    return IndicatorResult(
+        trend=trend,
+        signal=signal,
+        strength=round(strength, 1),
+        details={
+            "DIF": round(latest["DIF"], 4),
+            "DEA": round(latest["DEA"], 4),
+            "MACD": round(latest["MACD"], 4),
+            "golden_cross": golden_cross,
+            "death_cross": death_cross,
+        },
+    )
 
 
 def calc_kdj(df: pd.DataFrame, n: int = KDJ_N, m1: int = KDJ_M1, m2: int = KDJ_M2) -> pd.DataFrame:
@@ -97,9 +106,18 @@ def analyze_kdj(df: pd.DataFrame) -> IndicatorResult:
         trend, signal, strength = "bullish", "buy" if golden_cross else "hold", 60
     else:
         trend, signal, strength = "bearish", "sell" if death_cross else "hold", 60
-    return IndicatorResult(trend=trend, signal=signal, strength=round(strength, 1),
-                           details={"K": round(k, 2), "D": round(d, 2), "J": round(j, 2),
-                                    "golden_cross": golden_cross, "death_cross": death_cross})
+    return IndicatorResult(
+        trend=trend,
+        signal=signal,
+        strength=round(strength, 1),
+        details={
+            "K": round(k, 2),
+            "D": round(d, 2),
+            "J": round(j, 2),
+            "golden_cross": golden_cross,
+            "death_cross": death_cross,
+        },
+    )
 
 
 def calc_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> pd.DataFrame:
@@ -168,35 +186,66 @@ def analyze_volume_price(df: pd.DataFrame) -> IndicatorResult:
     avg_vol_last = recent["volume"].iloc[-3:].mean()
     vol_change = (avg_vol_last - avg_vol_first) / avg_vol_first * 100 if avg_vol_first > 0 else 0
     if price_pct > 2 and vol_change > 20:
-        return IndicatorResult("bullish", "buy", 75, {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价涨量增-强势"})
+        return IndicatorResult(
+            "bullish",
+            "buy",
+            75,
+            {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价涨量增-强势"},
+        )
     elif price_pct > 2 and vol_change < -10:
-        return IndicatorResult("bullish_warning", "hold", 40, {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价涨量缩-背离"})
+        return IndicatorResult(
+            "bullish_warning",
+            "hold",
+            40,
+            {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价涨量缩-背离"},
+        )
     elif price_pct < -2 and vol_change > 20:
-        return IndicatorResult("bearish", "sell", 75, {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价跌量增-弱势"})
+        return IndicatorResult(
+            "bearish",
+            "sell",
+            75,
+            {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价跌量增-弱势"},
+        )
     elif price_pct < -2 and vol_change < -10:
-        return IndicatorResult("bearish_stop", "hold", 40, {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价跌量缩-止跌"})
+        return IndicatorResult(
+            "bearish_stop",
+            "hold",
+            40,
+            {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "价跌量缩-止跌"},
+        )
     else:
-        return IndicatorResult("neutral", "hold", 50, {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "量价正常"})
+        return IndicatorResult(
+            "neutral",
+            "hold",
+            50,
+            {"price_pct": round(price_pct, 2), "vol_pct": round(vol_change, 2), "pattern": "量价正常"},
+        )
 
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     df = df.copy()
-    df["tr"] = np.maximum(df["high"] - df["low"],
-                           np.maximum(abs(df["high"] - df["close"].shift(1)),
-                                      abs(df["low"] - df["close"].shift(1))))
+    df["tr"] = np.maximum(
+        df["high"] - df["low"],
+        np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1))),
+    )
     return df["tr"].ewm(span=period, adjust=False).mean()
 
 
-def calc_breakout(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series]:
+def calc_breakout(df: pd.DataFrame, period: int = 20) -> tuple[pd.Series, pd.Series]:
     return df["high"].rolling(period).max(), df["low"].rolling(period).min()
 
 
-def comprehensive_analysis(df: pd.DataFrame) -> Dict[str, IndicatorResult]:
-    return {"MACD": analyze_macd(df), "KDJ": analyze_kdj(df), "RSI": analyze_rsi(df),
-            "Bollinger": analyze_bollinger(df), "VolumePrice": analyze_volume_price(df)}
+def comprehensive_analysis(df: pd.DataFrame) -> dict[str, IndicatorResult]:
+    return {
+        "MACD": analyze_macd(df),
+        "KDJ": analyze_kdj(df),
+        "RSI": analyze_rsi(df),
+        "Bollinger": analyze_bollinger(df),
+        "VolumePrice": analyze_volume_price(df),
+    }
 
 
-def trend_score(df: pd.DataFrame) -> Dict[str, Any]:
+def trend_score(df: pd.DataFrame) -> dict[str, Any]:
     results = comprehensive_analysis(df)
     score = 50.0
     weights = {"MACD": 0.15, "KDJ": 0.15, "RSI": 0.10, "Bollinger": 0.10, "VolumePrice": 0.10}
@@ -207,10 +256,14 @@ def trend_score(df: pd.DataFrame) -> Dict[str, Any]:
         elif r.signal == "sell":
             score -= (100 - r.strength) * w
     score = max(0, min(100, score))
-    if score >= 70: rating = "强势看多"
-    elif score >= 55: rating = "偏多"
-    elif score >= 45: rating = "震荡"
-    elif score >= 30: rating = "偏空"
-    else: rating = "弱势看空"
-    return {"score": round(score, 1), "rating": rating,
-            "details": {k: v.signal for k, v in results.items()}}
+    if score >= 70:
+        rating = "强势看多"
+    elif score >= 55:
+        rating = "偏多"
+    elif score >= 45:
+        rating = "震荡"
+    elif score >= 30:
+        rating = "偏空"
+    else:
+        rating = "弱势看空"
+    return {"score": round(score, 1), "rating": rating, "details": {k: v.signal for k, v in results.items()}}

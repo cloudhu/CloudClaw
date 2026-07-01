@@ -5,38 +5,42 @@ CloudKnight 数据驱动仪表盘 - Web 服务
   系统状态、策略赛马、持仓明细、股票池、交割单、收盘总结
 """
 
-import json
-import os
 import glob
+import json
 import logging
+import os
 import time as _time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
-from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+from .config import (  # noqa: E402
+    DATA_DIR,
+    DEFAULT_CAPITAL,
+    LIVE_LOG_DIR,
+    LIVE_TRADE_DIR,
+)
 
 # Web API 超时配置
 _WEB_KLINE_FETCH_TIMEOUT = 8  # 单只股票K线数据获取超时（秒）
 _WEB_POOL_INJECT_MAX_TIME = 30  # 整个池涨幅注入的最大总时间（秒）
 
 try:
-    from fastapi import FastAPI, Query, HTTPException
-    from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
     import uvicorn
+    from fastapi import Body, FastAPI, HTTPException, Query
+    from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+    from fastapi.staticfiles import StaticFiles
+
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
 
 
-from .config import (
-    DATA_DIR, LIVE_LOG_DIR, LIVE_TRADE_DIR,
-    DEFAULT_CAPITAL, STRATEGIES,
-)
-from .stock_pool import POOL_DIR, TIER_FOCUS, TIER_WATCH, TIER_BROAD, TIER_LABELS, TIER_THRESHOLDS
-from .ops_monitor import ops_collector, SystemMonitor, EngineStateReader, HAS_PSUTIL
-from .stock_diagnose import get_diagnoser, StockDiagnosis
+from .ops_monitor import HAS_PSUTIL, EngineStateReader, SystemMonitor, ops_collector  # noqa: E402
+from .stock_diagnose import StockDiagnosis, get_diagnoser  # noqa: E402
+from .stock_pool import POOL_DIR, TIER_BROAD, TIER_FOCUS, TIER_WATCH  # noqa: E402
 
 # ─── 常量和路径 ─────────────────────────────────────────────
 
@@ -45,21 +49,39 @@ DASHBOARD_HTML = os.path.join(STATIC_DIR, "dashboard.html")
 
 SNAPSHOT_FILE = os.path.join(DATA_DIR, "paper_race.json")
 
-STRATEGY_KEYS = ["dragon", "sparrow", "turtle", "value"]
+STRATEGY_KEYS = [
+    "dragon",
+    "sparrow",
+    "turtle",
+    "value",
+    "grid",
+    "ma_cross",
+    "bollinger",
+    "volume_breakout",
+    "trend_accel",
+]
 STRATEGY_LABELS = {
-    "dragon": "龙头战法", "sparrow": "麻雀战法",
-    "turtle": "海龟战法", "value": "价值投资",
+    "dragon": "龙头战法",
+    "sparrow": "麻雀战法",
+    "turtle": "海龟战法",
+    "value": "价值投资",
+    "grid": "网格交易",
+    "ma_cross": "均线交叉",
+    "bollinger": "布林带回归",
+    "volume_breakout": "量价突破",
+    "trend_accel": "趋势加速",
 }
 
 
 # ─── 数据读取辅助 ───────────────────────────────────────────
+
 
 def _read_json(path: str, default=None):
     """安全读取 JSON 文件"""
     if not os.path.exists(path):
         return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -67,10 +89,12 @@ def _read_json(path: str, default=None):
 
 def _diagnosis_to_dict(d: StockDiagnosis) -> dict:
     """将 StockDiagnosis 序列化为 JSON 兼容字典"""
+
     def _json_safe(val):
         """转换 numpy 类型为 Python 原生类型"""
         try:
             import numpy as np
+
             if isinstance(val, (np.integer,)):
                 return int(val)
             if isinstance(val, (np.floating,)):
@@ -92,8 +116,12 @@ def _diagnosis_to_dict(d: StockDiagnosis) -> dict:
     def ir_to_dict(ir):
         if ir is None:
             return None
-        return {"trend": ir.trend, "signal": ir.signal,
-                "strength": _json_safe(ir.strength), "details": _dict_safe(ir.details)}
+        return {
+            "trend": ir.trend,
+            "signal": ir.signal,
+            "strength": _json_safe(ir.strength),
+            "details": _dict_safe(ir.details),
+        }
 
     return {
         "code": d.code,
@@ -158,6 +186,8 @@ def _diagnosis_to_dict(d: StockDiagnosis) -> dict:
         "summary": d.summary,
         "detail_scores": d.detail_scores,
         "data_quality": d.data_quality,
+        "pool_status": d.pool_status,
+        "auto_add_results": getattr(d, "auto_add_results", {}),
         "strategy_diagnoses": [
             {
                 "name": s.name,
@@ -175,7 +205,7 @@ def _diagnosis_to_dict(d: StockDiagnosis) -> dict:
     }
 
 
-def _list_summary_files() -> List[str]:
+def _list_summary_files() -> list[str]:
     """列出所有收盘总结文件，按日期排序"""
     pattern = os.path.join(LIVE_LOG_DIR, "summary_*.json")
     files = glob.glob(pattern)
@@ -187,30 +217,36 @@ def _list_summary_files() -> List[str]:
     return dates
 
 
-def _inject_pool_gains(items: List[dict]) -> List[dict]:
+def _inject_pool_gains(items: list[dict]) -> list[dict]:
     """为股票池数据注入累计涨幅、当日涨幅、最大涨幅、层级
-    
-    VPN 兼容：每只股票的 K 线获取有超时保护（{_WEB_KLINE_FETCH_TIMEOUT}s），
-    单只超时则跳过继续处理下一只，确保整体 API 在 {_WEB_POOL_INJECT_MAX_TIME}s 内返回。
-    """.format(
-        _WEB_KLINE_FETCH_TIMEOUT=_WEB_KLINE_FETCH_TIMEOUT,
-        _WEB_POOL_INJECT_MAX_TIME=_WEB_POOL_INJECT_MAX_TIME,
-    )
+
+    VPN 兼容：每只股票的 K 线获取有超时保护，单只超时则跳过继续处理下一只。
+    """
     from .data_manager import DataFetcher
+
     if not items:
         return items
 
     fetcher = DataFetcher()
-    col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-               "最低": "low", "成交量": "volume", "涨跌幅": "pct_change"}
+    col_map = {
+        "日期": "date",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+        "涨跌幅": "pct_change",
+    }
 
     deadline = _time.time() + _WEB_POOL_INJECT_MAX_TIME
 
     for item in items:
         # 总时间超限则立即返回（剩余股票保留原始数据）
         if _time.time() > deadline:
-            logger.warning(f"股票池涨幅注入超总时限({_WEB_POOL_INJECT_MAX_TIME}s)，"
-                           f"已处理{items.index(item)}/{len(items)}只，剩余跳过")
+            logger.warning(
+                f"股票池涨幅注入超总时限({_WEB_POOL_INJECT_MAX_TIME}s)，"
+                f"已处理{items.index(item)}/{len(items)}只，剩余跳过"
+            )
             break
 
         code = item.get("code", "")
@@ -223,9 +259,7 @@ def _inject_pool_gains(items: List[dict]) -> List[dict]:
         try:
             # 带超时的 K 线获取（线程隔离，VPN 下不会无限挂起）
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    fetcher.fetch_daily_kline, str(code), start_date="20240101"
-                )
+                future = executor.submit(fetcher.fetch_daily_kline, str(code), start_date="20240101")
                 try:
                     df = future.result(timeout=_WEB_KLINE_FETCH_TIMEOUT)
                 except FutureTimeoutError:
@@ -308,7 +342,7 @@ def _set_default_gains(item: dict):
     item["max_gain_pct"] = None
 
 
-def _list_trade_files() -> List[str]:
+def _list_trade_files() -> list[str]:
     """列出所有交割单文件"""
     pattern = os.path.join(LIVE_TRADE_DIR, "*.json")
     files = glob.glob(pattern)
@@ -322,12 +356,11 @@ def _list_trade_files() -> List[str]:
 
 def _api_key_to_pool_key(api_key: str) -> str:
     """API 短键 → 池文件键映射"""
-    mapping = {"dragon": "dragon_head", "sparrow": "sparrow",
-               "turtle": "turtle", "value": "value_invest"}
+    mapping = {"dragon": "dragon_head", "sparrow": "sparrow", "turtle": "turtle", "value": "value_invest"}
     return mapping.get(api_key, api_key)
 
 
-def _read_pool(strategy_key: str) -> Optional[dict]:
+def _read_pool(strategy_key: str) -> dict | None:
     """读取策略股票池"""
     pool_files = {
         "dragon": "dragon_head.json",
@@ -340,7 +373,7 @@ def _read_pool(strategy_key: str) -> Optional[dict]:
     return _read_json(path)
 
 
-def _read_trades(limit: int = 200) -> List[dict]:
+def _read_trades(limit: int = 200) -> list[dict]:
     """读取交割单记录（优先从交易目录读取，其次从赛马快照）"""
     trades = []
 
@@ -376,7 +409,7 @@ def _read_trades(limit: int = 200) -> List[dict]:
     return trades[:limit]
 
 
-def _build_strategy_data(race_data: dict) -> List[dict]:
+def _build_strategy_data(race_data: dict) -> list[dict]:
     """从赛马数据构建策略账户摘要"""
     strategies = []
     accounts = race_data.get("accounts", {})
@@ -407,29 +440,28 @@ def _build_strategy_data(race_data: dict) -> List[dict]:
             cummax = [values[0]]
             for v in values[1:]:
                 cummax.append(max(cummax[-1], v))
-            dd = max(abs((v - cm) / cm * 100) for v, cm in zip(values, cummax) if cm > 0)
+            dd = max(abs((v - cm) / cm * 100) for v, cm in zip(values, cummax, strict=False) if cm > 0)
             max_dd = round(dd, 2)
 
         # 权益曲线
-        equity_curve = [
-            {"date": s.get("date", ""), "equity": round(s.get("equity", 0), 2)}
-            for s in snapshots
-        ]
+        equity_curve = [{"date": s.get("date", ""), "equity": round(s.get("equity", 0), 2)} for s in snapshots]
 
-        strategies.append({
-            "key": key,
-            "label": label,
-            "initial_capital": initial_cap,
-            "cash": round(acc.get("cash", initial_cap), 2),
-            "equity": round(equity, 2),
-            "total_return_pct": total_return,
-            "daily_return_pct": daily_return,
-            "position_count": latest.get("positions", 0),
-            "max_drawdown": max_dd,
-            "status": acc.get("status", "idle"),
-            "equity_curve": equity_curve,
-            "trade_count": len(acc.get("trades", [])),
-        })
+        strategies.append(
+            {
+                "key": key,
+                "label": label,
+                "initial_capital": initial_cap,
+                "cash": round(acc.get("cash", initial_cap), 2),
+                "equity": round(equity, 2),
+                "total_return_pct": total_return,
+                "daily_return_pct": daily_return,
+                "position_count": latest.get("positions", 0),
+                "max_drawdown": max_dd,
+                "status": acc.get("status", "idle"),
+                "equity_curve": equity_curve,
+                "trade_count": len(acc.get("trades", [])),
+            }
+        )
 
     # 按收益率排序
     strategies.sort(key=lambda s: s["total_return_pct"], reverse=True)
@@ -440,6 +472,7 @@ def _build_strategy_data(race_data: dict) -> List[dict]:
 
 
 # ─── 应用工厂 ────────────────────────────────────────────────
+
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -496,31 +529,35 @@ def create_app() -> FastAPI:
         acc = race.get("accounts", {}).get(key, {})
         positions_list = []
         for code, pos in acc.get("positions", {}).items():
-            positions_list.append({
-                "code": code,
-                "name": pos.get("name", ""),
-                "cost": pos.get("cost", 0),
-                "volume": pos.get("volume", 0),
-                "current_price": pos.get("current_price", 0),
-                "market_value": pos.get("market_value", 0),
-                "profit_pct": round(pos.get("profit_pct", 0), 2),
-                "hold_days": pos.get("hold_days", 0),
-            })
+            positions_list.append(
+                {
+                    "code": code,
+                    "name": pos.get("name", ""),
+                    "cost": pos.get("cost", 0),
+                    "volume": pos.get("volume", 0),
+                    "current_price": pos.get("current_price", 0),
+                    "market_value": pos.get("market_value", 0),
+                    "profit_pct": round(pos.get("profit_pct", 0), 2),
+                    "hold_days": pos.get("hold_days", 0),
+                }
+            )
 
         # 附加交易记录
         trades_list = []
         for t in acc.get("trades", []):
-            trades_list.append({
-                "date": t.get("date", ""),
-                "code": t.get("code", ""),
-                "name": t.get("name", ""),
-                "action": t.get("action", ""),
-                "price": t.get("price", 0),
-                "volume": t.get("volume", 0),
-                "amount": t.get("amount", 0),
-                "reason": t.get("reason", ""),
-                "pnl": t.get("pnl", 0),
-            })
+            trades_list.append(
+                {
+                    "date": t.get("date", ""),
+                    "code": t.get("code", ""),
+                    "name": t.get("name", ""),
+                    "action": t.get("action", ""),
+                    "price": t.get("price", 0),
+                    "volume": t.get("volume", 0),
+                    "amount": t.get("amount", 0),
+                    "reason": t.get("reason", ""),
+                    "pnl": t.get("pnl", 0),
+                }
+            )
 
         target["positions"] = positions_list
         target["trades"] = trades_list
@@ -537,18 +574,20 @@ def create_app() -> FastAPI:
             label = STRATEGY_LABELS[key]
             acc = race.get("accounts", {}).get(key, {})
             for code, pos in acc.get("positions", {}).items():
-                all_positions.append({
-                    "strategy": key,
-                    "strategy_label": label,
-                    "code": code,
-                    "name": pos.get("name", ""),
-                    "cost": pos.get("cost", 0),
-                    "volume": pos.get("volume", 0),
-                    "current_price": pos.get("current_price", 0),
-                    "market_value": round(pos.get("market_value", 0), 2),
-                    "profit_pct": round(pos.get("profit_pct", 0), 2),
-                    "hold_days": pos.get("hold_days", 0),
-                })
+                all_positions.append(
+                    {
+                        "strategy": key,
+                        "strategy_label": label,
+                        "code": code,
+                        "name": pos.get("name", ""),
+                        "cost": pos.get("cost", 0),
+                        "volume": pos.get("volume", 0),
+                        "current_price": pos.get("current_price", 0),
+                        "market_value": round(pos.get("market_value", 0), 2),
+                        "profit_pct": round(pos.get("profit_pct", 0), 2),
+                        "hold_days": pos.get("hold_days", 0),
+                    }
+                )
         return all_positions
 
     # ── API: 股票池 ──────────────────────────────────────
@@ -585,8 +624,12 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"未知策略: {key}")
         data = _read_pool(key)
         if not data:
-            return {"label": STRATEGY_LABELS[key], "last_screened": None, "items": [],
-                    "tier_counts": {"focus": 0, "watch": 0, "broad": 0}}
+            return {
+                "label": STRATEGY_LABELS[key],
+                "last_screened": None,
+                "items": [],
+                "tier_counts": {"focus": 0, "watch": 0, "broad": 0},
+            }
         items = _inject_pool_gains(data.get("items", []))
         active_items = [it for it in items if it.get("status") == "active"]
         tier_counts = {"focus": 0, "watch": 0, "broad": 0}
@@ -609,6 +652,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"未知策略: {key}")
         try:
             from .stock_pool import PoolManager
+
             pm = PoolManager()
             pool = pm.get_pool(_api_key_to_pool_key(key))
             if pool is None:
@@ -625,6 +669,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"未知策略: {key}")
         try:
             from .stock_pool import PoolManager
+
             pm = PoolManager()
             result = pm.maintenance_one(_api_key_to_pool_key(key), verbose=False)
             return {"success": True, **result}
@@ -634,7 +679,7 @@ def create_app() -> FastAPI:
     # ── API: 交易记录（交割单） ───────────────────────────
     @app.get("/api/trades")
     async def get_trades(
-        strategy: Optional[str] = Query(None),
+        strategy: str | None = Query(None),
         limit: int = Query(200, ge=10, le=1000),
     ):
         """获取交割单记录，可按策略筛选"""
@@ -694,8 +739,7 @@ def create_app() -> FastAPI:
         """获取系统健康数据（CPU/内存/磁盘/进程）"""
         try:
             monitor = SystemMonitor()
-            return {"success": True, "system": monitor.collect().to_dict(),
-                    "has_psutil": HAS_PSUTIL}
+            return {"success": True, "system": monitor.collect().to_dict(), "has_psutil": HAS_PSUTIL}
         except Exception as e:
             return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
@@ -765,6 +809,50 @@ def create_app() -> FastAPI:
         """快速诊股 — 仅技术面+市场面，响应更快"""
         return await diagnose_stock(code, quick=True)
 
+    @app.post("/api/diagnose/{code}/add-to-pool")
+    async def add_diagnosed_to_pool(code: str, strategy: str = Query(..., min_length=1)):
+        """将诊断股票加入指定策略池并生成交易计划
+
+        - code: 6位股票代码
+        - strategy: 策略key (dragon_head/sparrow/turtle/value_invest)
+        """
+        try:
+            from .stock_diagnose import get_diagnoser
+
+            code = str(code).zfill(6)
+            diagnoser = get_diagnoser()
+
+            # 先用快速诊断获取评分和价格
+            diag = diagnoser.quick_diagnose(code)
+
+            # 找到对应策略的评分
+            strategy_score = 0
+            for s in diag.strategy_diagnoses:
+                if s.key == strategy:
+                    strategy_score = s.score
+                    break
+
+            # 加入策略池
+            result = diagnoser.add_diagnosed_to_pool(
+                code=code,
+                name=diag.name,
+                strategy_key=strategy,
+                score=strategy_score,
+                price=diag.technical.current_price,
+            )
+
+            if result is None:
+                return JSONResponse(
+                    {"success": False, "error": f"策略 {strategy} 不存在"},
+                    status_code=400,
+                )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"加入策略池异常: {e}")
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
     # 诊股页面 → 重定向到仪表盘
     @app.get("/diagnose")
     async def diagnose_page():
@@ -776,6 +864,7 @@ def create_app() -> FastAPI:
         """获取数据源健康状态（各数据渠道可用性）"""
         try:
             from .data_manager import DataFetcher
+
             fetcher = DataFetcher()
             health = fetcher.get_data_source_health()
             return {"success": True, "data": health}
@@ -787,9 +876,93 @@ def create_app() -> FastAPI:
         """重置不可用数据源标记，强制下次请求重新尝试所有数据源"""
         try:
             from .data_manager import DataFetcher
+
             fetcher = DataFetcher()
             fetcher.reset_unavailable_sources()
             return {"success": True, "message": "不可用数据源标记已重置，下次请求将重新尝试"}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    # ── API: 数据源设置（API Key 管理） ──────────────
+
+    @app.get("/api/settings/datasources")
+    async def get_datasource_settings():
+        """获取所有数据源配置状态"""
+        try:
+            from .datasource.manager import DataSourceManager
+
+            mgr = DataSourceManager()
+            statuses = mgr.get_all_status()
+            return {"success": True, "data": statuses}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.put("/api/settings/apikey/{source}")
+    async def update_apikey(
+        source: str,
+        api_key: str = Body(""),
+        ibkr_host: str = Body("127.0.0.1"),
+        ibkr_port: int = Body(7497),
+        ibkr_client_id: int = Body(1),
+        ibkr_enabled: bool = Body(False),
+        choice_url: str = Body("http://127.0.0.1:8089"),
+        choice_use_cloud: bool = Body(False),
+    ):
+        """更新数据源 API Key"""
+        try:
+            from .datasource.manager import DataSourceManager
+
+            mgr = DataSourceManager()
+            extra = {}
+            if source == "ibkr":
+                extra = {
+                    "host": ibkr_host,
+                    "port": ibkr_port,
+                    "client_id": ibkr_client_id,
+                    "enabled": ibkr_enabled,
+                }
+            elif source == "choice":
+                extra = {"url": choice_url, "use_cloud": choice_use_cloud}
+
+            result = mgr.update_api_key(source, api_key, **extra)
+            return {"success": True, **result}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.delete("/api/settings/apikey/{source}")
+    async def delete_apikey(source: str):
+        """删除数据源 API Key"""
+        try:
+            from .datasource.manager import DataSourceManager
+
+            mgr = DataSourceManager()
+            result = mgr.delete_api_key(source)
+            return {"success": True, **result}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.post("/api/settings/apikey/{source}/test")
+    async def test_apikey(source: str):
+        """测试数据源连接"""
+        try:
+            from .datasource.manager import DataSourceManager
+
+            mgr = DataSourceManager()
+            result = mgr._test_connection(source)
+            return {"success": True, **result}
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    @app.get("/api/settings/datasources/status")
+    async def get_premium_source_status():
+        """获取收费数据源实时状态（含额度信息）"""
+        try:
+            from .datasource import get_manager
+
+            mgr = get_manager()
+            mgr.initialize()
+            statuses = mgr.get_all_status()
+            return {"success": True, "data": statuses}
         except Exception as e:
             return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
@@ -797,6 +970,7 @@ def create_app() -> FastAPI:
 
 
 # ─── 启动入口 ────────────────────────────────────────────────
+
 
 def _ensure_echarts_local():
     """下载 ECharts 到本地 static 目录，确保不依赖外网 CDN"""
@@ -807,6 +981,7 @@ def _ensure_echarts_local():
     print("[setup] 正在下载 ECharts 到本地（首次启动需要，后续直接使用本地副本）...")
     try:
         import urllib.request
+
         # 国内 CDN 镜像（比 jsdelivr 在国内更稳定）+ 国际 CDN 回落
         urls = [
             "https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js",
@@ -814,9 +989,9 @@ def _ensure_echarts_local():
         ]
         for url in urls:
             try:
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
-                })
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
+                )
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = resp.read()
                     if len(data) > 100_000:
@@ -830,7 +1005,6 @@ def _ensure_echarts_local():
         print("[setup] ⚠ ECharts 下载失败，将回退到 CDN 加载")
     except Exception as e:
         print(f"[setup] ⚠ ECharts 下载异常: {e}，将回退到 CDN 加载")
-
 
 
 def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = False):
@@ -854,7 +1028,7 @@ def start_dashboard(host: str = "0.0.0.0", port: int = 8080, reload: bool = Fals
   仪表盘地址: http://0.0.0.0:{port}
   API 文档:   http://0.0.0.0:{port}/docs
 
-  提示: 也可使用 http://localhost:{port} 。VPN 环境下若 localhost 不可用，请用 0.0.0.0
+  提示: 也可使用 http://127.0.0.1:{port} 。VPN 环境下若 127.0.0.1 不可用，请用 0.0.0.0
   按 Ctrl+C 停止服务
 """)
 
@@ -871,7 +1045,7 @@ def _ensure_dashboard_html():
 
 def _build_dashboard_html() -> str:
     """生成仪表盘 HTML（内联，不依赖外部文件）"""
-    return '''<!DOCTYPE html>
+    return """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -1179,6 +1353,7 @@ body {
   <button data-tab="summary">收盘总结</button>
   <button data-tab="ops">运维监控</button>
   <button data-tab="diagnose">个股诊断</button>
+  <button data-tab="settings">设置</button>
 </div>
 
 <div class="content">
@@ -1406,6 +1581,17 @@ body {
     </div>
     <div class="diag-loading" id="diagLoading"><div class="diag-spinner"></div></div>
   </div>
+
+  <!-- ═══ 设置/数据源管理 ═══ -->
+  <div class="tab-panel" id="tab-settings">
+    <div class="diag-panel">
+      <div class="diag-panel-header"><h3>⚙️ 数据源设置</h3><span style="font-size:12px;color:var(--text-dim)">绑定收费数据源 API Key，优先使用直到额度用完</span></div>
+      <div class="diag-panel-body">
+        <div id="settings-source-list"></div>
+        <div id="settings-message" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1433,6 +1619,9 @@ $$('.tabs button').forEach(b => b.addEventListener('click', function() {
   const tab = this.dataset.tab;
   $$('.tab-panel').forEach(p => p.classList.remove('active'));
   $('#tab-'+tab).classList.add('active');
+  // 切换到设置标签时加载设置
+  if (tab === 'settings') loadSettings();
+
   loadTab(tab);
   // 重绘图表
   setTimeout(resizeAllCharts, 200);
@@ -2496,12 +2685,22 @@ function renderDiagStrategies(d) {
 
   const emojiMap = {dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💰'};
   const sigMap = {buy:'✅ 看多', hold:'⟳ 观望', sell:'⚠ 看空'};
-  const matchColorMap = [null,'stg-match-low','stg-match-low','stg-match-neutral','stg-match-good','stg-match-strong'];
+  const poolStatus = d.pool_status || {};
 
   grid.innerHTML = strategies.map(s => {
     const pct = s.total_conditions > 0 ? Math.round(s.match_count / Math.max(4, s.total_conditions) * 100) : 0;
     const matchClass = s.score >= 70 ? 'stg-match-strong' : s.score >= 55 ? 'stg-match-good' : s.score >= 40 ? 'stg-match-neutral' : 'stg-match-low';
     const sigClass = 'stg-sig-' + s.signal;
+    const ps = poolStatus[s.key] || {in_pool:false};
+    let poolBadge = '';
+    if (ps.in_pool) {
+      const tierMap = {focus:'\u7cbe\u9009', watch:'\u89c2\u5bdf', broad:'\u5907\u9009'};
+      const tierLabel = tierMap[ps.tier] || '';
+      poolBadge = '<div class="pool-badge" style="margin-top:6px;font-size:12px;color:#2ecc71;">📌 \u5df2\u5728\u7b56\u7565\u6c60' + (tierLabel ? '\uff08'+tierLabel+'\u5c42\uff0c\u8bc4\u5206'+ps.score+'\uff09' : '') + '</div>';
+    } else if (s.score >= 55) {
+      const safeName = (d.name || '').replace(/'/g, "\\'");
+      poolBadge = `<button class="btn btn-sm btn-outline" onclick="addToPool('${d.code}','${safeName}','${s.key}',${s.score},${d.technical.current_price})" style="margin-top:6px;font-size:12px;padding:3px 10px;">📥 \u52a0\u5165\u7b56\u7565\u6c60</button>`;
+    }
     return `<div class="strategy-card">
       <div class="strategy-card-header">
         <h4>${(emojiMap[s.key]||'')} ${s.name}</h4>
@@ -2511,8 +2710,72 @@ function renderDiagStrategies(d) {
       <ul class="stg-reasons">${(s.reasons||[]).map(r => '<li>\u2714 ' + r + '</li>').join('')}</ul>
       ${(s.warnings||[]).length ? '<ul class="stg-warnings">' + s.warnings.map(w => '<li>\u26a0 ' + w + '</li>').join('') + '</ul>' : ''}
       <div class="stg-match-bar"><div class="stg-match-fill ${matchClass}" style="width:${pct}%"></div></div>
+      ${poolBadge}
     </div>`;
   }).join('');
+}
+
+async function addToPool(code, name, strategyKey, score, price) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '\u52a0\u5165\u4e2d...';
+  try {
+    const resp = await fetch('/api/diagnose/' + code + '/add-to-pool?strategy=' + strategyKey, {method:'POST'});
+    const data = await resp.json();
+    if (data.success) {
+      showTradePlanModal(data.plan, code, name, strategyKey);
+      btn.style.display = 'none';
+      const card = btn.closest('.strategy-card');
+      if (card) {
+        const badge = document.createElement('div');
+        badge.className = 'pool-badge';
+        badge.style.cssText = 'margin-top:6px;font-size:12px;color:#2ecc71;';
+        badge.textContent = '📌 \u5df2\u52a0\u5165\u7b56\u7565\u6c60';
+        card.appendChild(badge);
+      }
+    } else {
+      alert(data.error || '\u52a0\u5165\u5931\u8d25');
+    }
+  } catch(e) {
+    alert('\u64cd\u4f5c\u5931\u8d25: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📥 \u52a0\u5165\u7b56\u7565\u6c60';
+  }
+}
+
+function showTradePlanModal(plan, code, name, strategyKey) {
+  const emojiMap = {dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💰'};
+  const labelMap = {dragon_head:'\u9f99\u5934\u6218\u6cd5', sparrow:'\u9ebb\u96c0\u6218\u6cd5', turtle:'\u6d77\u9f9f\u6218\u6cd5', value_invest:'\u4ef7\u503c\u6295\u8d44'};
+  const nameLabel = labelMap[strategyKey] || strategyKey;
+  const overlay = document.createElement('div');
+  overlay.id = 'trade-plan-overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
+  overlay.innerHTML = `<div class="trade-plan-modal" style="background:var(--panel);border-radius:12px;padding:28px;max-width:520px;width:90%;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.4);">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3 style="margin:0;font-size:20px;">${emojiMap[strategyKey]||'📊'} ${nameLabel} \u4ea4\u6613\u8ba1\u5212</h3>
+      <button onclick="document.getElementById('trade-plan-overlay').remove()" style="background:none;border:none;color:var(--text-dim);font-size:24px;cursor:pointer;line-height:1;">&times;</button>
+    </div>
+    <div style="margin-bottom:20px;padding:12px;background:rgba(52,152,219,.1);border-radius:8px;font-size:14px;">
+      <strong>${name} (${code})</strong> | \u5f53\u524d\u4ef7 ${plan.entry_price} | ${plan.entry_type}
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:16px;">
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">🛑 \u6b62\u635f\u4ef7</td><td style="padding:8px 0;text-align:right;color:#e74c3c;font-weight:bold;">${plan.stop_loss} <span style="font-size:12px;">(${plan.stop_loss_pct}%)</span></td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">🎯 \u6b62\u76c8\u4e00</td><td style="padding:8px 0;text-align:right;color:#2ecc71;font-weight:bold;">${plan.take_profit_1} <span style="font-size:12px;">(+${plan.take_profit_1_pct}%)</span></td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">🎯 \u6b62\u76c8\u4e8c</td><td style="padding:8px 0;text-align:right;color:#2ecc71;font-weight:bold;">${plan.take_profit_2} <span style="font-size:12px;">(+${plan.take_profit_2_pct}%)</span></td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">💰 \u5efa\u8bae\u4ed3\u4f4d</td><td style="padding:8px 0;text-align:right;font-weight:bold;">${plan.position_pct}% \u603b\u8d44\u91d1</td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">📐 \u98ce\u9669\u6536\u76ca\u6bd4</td><td style="padding:8px 0;text-align:right;font-weight:bold;">1:${plan.risk_reward_ratio}</td></tr>
+      <tr><td style="padding:8px 0;color:var(--text-dim);">📅 \u5efa\u8bae\u6301\u6709</td><td style="padding:8px 0;text-align:right;font-weight:bold;">${plan.hold_days} \u4e2a\u4ea4\u6613\u65e5</td></tr>
+    </table>
+    <div style="margin-bottom:12px;"><div style="color:#2ecc71;font-weight:bold;margin-bottom:6px;">✅ \u4ea4\u6613\u7406\u7531</div>${plan.reasons.map(r => '<div style="font-size:13px;color:var(--text);padding:2px 0;">• ' + r + '</div>').join('')}</div>
+    <div style="background:rgba(231,76,60,.08);border-left:3px solid #e74c3c;padding:10px 14px;border-radius:4px;">
+      <div style="color:#e74c3c;font-weight:bold;margin-bottom:4px;">⚠ \u98ce\u9669\u63d0\u793a</div>
+      ${plan.warnings.map(w => '<div style="font-size:12px;color:var(--text-dim);padding:2px 0;">• ' + w + '</div>').join('')}
+    </div>
+    <div style="margin-top:16px;font-size:11px;color:var(--text-dim);text-align:right;">\u521b\u5efa\u65f6\u95f4: ${plan.created_at}</div>
+  </div>`;
+  document.body.appendChild(overlay);
 }
 
 function renderDiagTechChart(d) {
@@ -2551,12 +2814,154 @@ function renderDiagTechChart(d) {
   });
 }
 
+// ═══ 数据源设置 ═══════════════════════════════════════════════
+
+let settingsData = null;
+
+async function loadSettings() {
+  const el = document.getElementById('settings-source-list');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">\u52a0\u8f7d\u4e2d...</div>';
+  const resp = await API('/settings/datasources');
+  if (!resp || !resp.success) {
+    el.innerHTML = '<div class="empty">\u65e0\u6cd5\u52a0\u8f7d\u6570\u636e\u6e90\u8bbe\u7f6e</div>';
+    return;
+  }
+  settingsData = resp.data;
+  renderSettings(settingsData);
+}
+
+function renderSettings(sources) {
+  const el = document.getElementById('settings-source-list');
+  if (!el) return;
+
+  const priorityNames = ['\u6700\u9ad8\u4f18\u5148', '\u7b2c\u4e8c\u4f18\u5148', '\u7b2c\u4e09\u4f18\u5148', '\u6700\u4f4e\u4f18\u5148'];
+
+  el.innerHTML = sources.map((s, i) => {
+    const statusIcon = s.configured ? (s.connected ? '\u2705' : '\u26a0') : '\u274c';
+    const statusText = s.configured ? (s.connected ? '\u5df2\u8fde\u63a5' : '\u5df2\u914d\u7f6e(\u672a\u8fde\u63a5)') : '\u672a\u914d\u7f6e';
+    const quotaText = s.quota.daily_limit > 0
+      ? `\u989d\u5ea6: ${s.quota.daily_used}/${s.quota.daily_limit}`
+      : '\u65e0\u9650\u989d\u5ea6';
+
+    const markets = (s.markets || ['A']).join('/');
+
+    const hasExtra = s.extra_config && s.id !== 'free';
+    let extraHtml = '';
+    if (hasExtra) {
+      extraHtml = '<div class="stg-reasons" style="margin-top:8px;font-size:11px;">';
+      Object.entries(s.extra_config).forEach(([k, v]) => {
+        extraHtml += `<span style="display:inline-block;margin-right:12px;color:var(--text-dim)">${k}: ${v}</span>`;
+      });
+      extraHtml += '</div>';
+    }
+
+    let formHtml = '';
+    if (s.id !== 'free') {
+      formHtml = `
+        <div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          ${s.id === 'tushare'
+            ? '<input type="text" id="input-' + s.id + '" placeholder="Token" style="flex:1;min-width:200px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;">'
+            : ''
+          }
+          ${s.id === 'choice'
+            ? '<input type="text" id="input-choice-url" placeholder="http://127.0.0.1:8089" value="' + (hasExtra ? s.extra_config.url : 'http://127.0.0.1:8089') + '" style="flex:1;min-width:180px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;"><input type="text" id="input-choice-key" placeholder="API Key (\u53ef\u9009)" style="flex:1;min-width:200px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;">'
+            : ''
+          }
+          ${s.id === 'ibkr'
+            ? '<input type="text" id="input-ibkr-host" placeholder="127.0.0.1" value="' + (hasExtra ? s.extra_config.host : '127.0.0.1') + '" style="width:120px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;"><input type="number" id="input-ibkr-port" placeholder="7497" value="' + (hasExtra ? s.extra_config.port : 7497) + '" style="width:80px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;"><label style="color:var(--text-dim);font-size:12px;display:flex;align-items:center;gap:4px;"><input type="checkbox" id="input-ibkr-enabled" ' + (hasExtra && s.extra_config.enabled ? 'checked' : '') + '> \u542f\u7528</label>'
+            : ''
+          }
+          <button class="btn btn-primary" onclick="saveApiKey(\'${s.id}\')" style="font-size:12px;padding:6px 14px;">\u4fdd\u5b58\u5e76\u6d4b\u8bd5</button>
+          ${s.configured ? '<button class="btn btn-outline" onclick="deleteApiKey(\\'' + s.id + '\\')" style="font-size:12px;padding:6px 14px;color:#e74c3c;">\u5220\u9664</button>' : ''}
+        </div>`;
+    }
+
+    return `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:10px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:20px;">${s.icon}</span>
+          <div>
+            <div style="font-weight:600;font-size:14px;">${s.name}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${priorityNames[i] || ''} \u00b7 ${markets} \u00b7 ${quotaText} \u00b7 ${statusIcon} ${statusText}</div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">${s.setup_guide}</div>
+          </div>
+        </div>
+      </div>
+      ${extraHtml}
+      ${formHtml}
+    </div>`;
+  }).join('');
+
+  // 消息显示
+  const msgEl = document.getElementById('settings-message');
+  if (msgEl) msgEl.innerHTML = '';
+}
+
+async function saveApiKey(source) {
+  const msgEl = document.getElementById('settings-message');
+  if (!msgEl) return;
+
+  let body = { api_key: '' };
+
+  if (source === 'tushare') {
+    body.api_key = document.getElementById('input-tushare')?.value.trim() || '';
+  } else if (source === 'choice') {
+    body.api_key = document.getElementById('input-choice-key')?.value.trim() || '';
+    body.choice_url = document.getElementById('input-choice-url')?.value.trim() || 'http://127.0.0.1:8089';
+    body.choice_use_cloud = !!body.api_key;
+  } else if (source === 'ibkr') {
+    body.ibkr_host = document.getElementById('input-ibkr-host')?.value.trim() || '127.0.0.1';
+    body.ibkr_port = parseInt(document.getElementById('input-ibkr-port')?.value) || 7497;
+    body.ibkr_client_id = 1;
+    body.ibkr_enabled = document.getElementById('input-ibkr-enabled')?.checked || false;
+  }
+
+  msgEl.innerHTML = '<div class="loading">\u4fdd\u5b58\u5e76\u6d4b\u8bd5\u4e2d...</div>';
+
+  try {
+    const resp = await fetch('/api/settings/apikey/' + source, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+
+    if (resp.success) {
+      if (resp.tested) {
+        msgEl.innerHTML = '<div style="color:#27ae60;padding:8px;background:#eafaf1;border-radius:4px;">\u2705 ' + source + ' \u8fde\u63a5\u6d4b\u8bd5\u6210\u529f!</div>';
+      } else {
+        msgEl.innerHTML = '<div style="color:#f39c12;padding:8px;background:#fef9e7;border-radius:4px;">\u26a0 ' + source + ' \u5df2\u4fdd\u5b58\uff0c\u4f46\u8fde\u63a5\u6d4b\u8bd5\u5931\u8d25: ' + (resp.error || '\u8bf7\u68c0\u67e5\u914d\u7f6e') + '</div>';
+      }
+    } else {
+      msgEl.innerHTML = '<div style="color:#e74c3c;padding:8px;background:#fdedec;border-radius:4px;">\u274c \u4fdd\u5b58\u5931\u8d25: ' + (resp.error || '\u672a\u77e5\u9519\u8bef') + '</div>';
+    }
+
+    // 刷新设置列表
+    setTimeout(() => loadSettings(), 1000);
+  } catch (e) {
+    msgEl.innerHTML = '<div style="color:#e74c3c;padding:8px;background:#fdedec;border-radius:4px;">\u274c \u7f51\u7edc\u9519\u8bef: ' + e.message + '</div>';
+  }
+}
+
+async function deleteApiKey(source) {
+  const msgEl = document.getElementById('settings-message');
+  try {
+    const resp = await fetch('/api/settings/apikey/' + source, { method: 'DELETE' }).then(r => r.json());
+    if (resp.success) {
+      if (msgEl) msgEl.innerHTML = '<div style="color:#27ae60;padding:8px;background:#eafaf1;border-radius:4px;">\u2705 ' + source + ' \u5df2\u5220\u9664</div>';
+    }
+    setTimeout(() => loadSettings(), 500);
+  } catch (e) {
+    if (msgEl) msgEl.innerHTML = '<div style="color:#e74c3c;padding:8px;background:#fdedec;border-radius:4px;">\u274c \u5220\u9664\u5931\u8d25</div>';
+  }
+}
+
 // ═══ 启动 ═══════════════════════════════════════════════════
 loadOverview();
 </script>
 </body>
 </html>
-'''
+"""
 
 
 # ─── CLI 入口 ────────────────────────────────────────────────

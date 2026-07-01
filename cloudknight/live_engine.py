@@ -15,33 +15,40 @@
 非交易日: 全天 = 选股模式（所有策略筛选股票入池）
 """
 
-import logging
-import time
+import contextlib
 import json
+import logging
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from threading import Thread, Event, Lock
 from enum import Enum
-from typing import Callable
+from threading import Event, Lock, Thread
 
-from .config import (STRATEGIES, DEFAULT_CAPITAL, LIVE_ENGINE_CHECK_INTERVAL,
-                     LIVE_ENGINE_SCAN_INTERVAL, LIVE_LOG_DIR,
-                     POOL_MAX_SIZE)
-from .trading_calendar import (TradingCalendar, TradingPhase,
-                               get_phase_label)
-from .market_analyzer import (MarketAnalyzer, MarketSnapshot)
-from .auction_analyzer import (AuctionAnalyzer, AuctionSnapshot)
-from .signal_hunter import (SignalHunter, SignalResult, TradingPlan)
-from .stock_pool import PoolManager
+from .auction_analyzer import AuctionAnalyzer, AuctionSnapshot
+from .config import (
+    DEFAULT_CAPITAL,
+    LIVE_ENGINE_CHECK_INTERVAL,
+    LIVE_ENGINE_SCAN_INTERVAL,
+    LIVE_LOG_DIR,
+    POOL_MAX_SIZE,
+    STRATEGIES,
+)
 from .data_manager import DataFetcher
-from .paper_trader import PaperTrader, SNAPSHOT_FILE as PAPER_SNAPSHOT_FILE
+from .market_analyzer import MarketAnalyzer, MarketSnapshot
+from .paper_trader import SNAPSHOT_FILE as PAPER_SNAPSHOT_FILE
+from .paper_trader import PaperTrader
+from .signal_hunter import SignalHunter, SignalResult, TradingPlan
+from .stock_pool import PoolManager
+from .trading_calendar import TradingCalendar, TradingPhase, get_phase_label
 
 logger = logging.getLogger(__name__)
 
 
 class EngineState(Enum):
     """引擎运行状态"""
+
     STOPPED = "stopped"
     STARTING = "starting"
     RUNNING = "running"
@@ -52,6 +59,7 @@ class EngineState(Enum):
 @dataclass
 class EngineLog:
     """引擎日志条目"""
+
     timestamp: datetime
     phase: TradingPhase
     event: str
@@ -256,8 +264,7 @@ class LiveTradingEngine:
             for key, items in results.items():
                 label = STRATEGIES.get(key, key)
                 top_score = items[0].score if items else 0
-                self._log(TradingPhase.CLOSED,
-                          f"  [{label}] 筛选 {len(items)} 只 → 最高评分: {top_score}")
+                self._log(TradingPhase.CLOSED, f"  [{label}] 筛选 {len(items)} 只 → 最高评分: {top_score}")
 
             # 保存股票池
             self.pool_mgr.save_all()
@@ -288,31 +295,34 @@ class LiveTradingEngine:
         indices = self.market.analyze_indices(days=60)
         for idx in indices.values():
             arrow = "▲" if idx.pct_change >= 0 else "▼"
-            self._log(TradingPhase.PRE_MARKET,
-                      f"  {arrow} {idx.name}: {idx.close:.2f} ({idx.pct_change:+.2f}%) "
-                      + f"MACD:{idx.macd_signal} KDJ:{idx.kdj_signal} "
-                      f"RSI:{idx.rsi_value}")
+            self._log(
+                TradingPhase.PRE_MARKET,
+                f"  {arrow} {idx.name}: {idx.close:.2f} ({idx.pct_change:+.2f}%) "
+                + f"MACD:{idx.macd_signal} KDJ:{idx.kdj_signal} "
+                f"RSI:{idx.rsi_value}",
+            )
 
         # 4. 板块热度分析
         self._log(TradingPhase.PRE_MARKET, "正在分析板块热度...")
         sectors = self.market.analyze_sectors(top_n=10)
         for s in sectors[:5]:
-            self._log(TradingPhase.PRE_MARKET,
-                      f"  {s.strength_rank}. {s.name}: {s.pct_change:+.2f}%")
+            self._log(TradingPhase.PRE_MARKET, f"  {s.strength_rank}. {s.name}: {s.pct_change:+.2f}%")
 
         # 5. 市场情绪评估
         sentiment = self.market.get_market_sentiment()
-        self._log(TradingPhase.PRE_MARKET,
-                  f"市场情绪: {sentiment['sentiment'].upper()} (评分:{sentiment['score']})")
+        self._log(TradingPhase.PRE_MARKET, f"市场情绪: {sentiment['sentiment'].upper()} (评分:{sentiment['score']})")
 
         # 6. 生成市场快照
         self._latest_snapshot = MarketSnapshot(
-            timestamp=now, is_trading_day=True,
-            indices=indices, hot_sectors=sectors,
+            timestamp=now,
+            is_trading_day=True,
+            indices=indices,
+            hot_sectors=sectors,
             market_sentiment=sentiment["sentiment"],
             sentiment_score=sentiment["score"],
-            buy_signals=0, sell_signals=0,
-            capital_flow_summary="盘前"
+            buy_signals=0,
+            sell_signals=0,
+            capital_flow_summary="盘前",
         )
 
         # 7. 盘前股票池信号扫描
@@ -343,28 +353,24 @@ class LiveTradingEngine:
             self._log(TradingPhase.AUCTION_RESULT, "无关注标的，跳过竞价分析")
             return
 
-        self._log(TradingPhase.AUCTION_RESULT,
-                  f"竞价分析 {len(watch_codes)} 只关注标的...")
+        self._log(TradingPhase.AUCTION_RESULT, f"竞价分析 {len(watch_codes)} 只关注标的...")
 
         # 竞价分析
-        self._latest_auction = self.auction.analyze_auction(
-            list(watch_codes), verbose=True
-        )
+        self._latest_auction = self.auction.analyze_auction(list(watch_codes), verbose=True)
 
         auc = self._latest_auction
-        self._log(TradingPhase.AUCTION_RESULT,
-                  f"竞价结果: 强势{auc.strong_auction_count} 只, "
-                  + f"弱势{auc.weak_auction_count} 只, "
-                  f"偏{bias_cn(auc.market_bias)}")
+        self._log(
+            TradingPhase.AUCTION_RESULT,
+            f"竞价结果: 强势{auc.strong_auction_count} 只, " + f"弱势{auc.weak_auction_count} 只, "
+            f"偏{bias_cn(auc.market_bias)}",
+        )
 
         # 开盘交易决策
         watch_by_strategy = {}
         for strategy_name in STRATEGIES:
             pool = self.pool_mgr.get_pool(strategy_name)
             if pool:
-                watch_by_strategy[strategy_name] = [
-                    item.code for item in pool.ranked()[:10]
-                ]
+                watch_by_strategy[strategy_name] = [item.code for item in pool.ranked()[:10]]
 
         decisions = self.auction.make_open_trade_decision(auc, watch_by_strategy)
 
@@ -373,34 +379,28 @@ class LiveTradingEngine:
             label = STRATEGIES.get(strategy, strategy)
             for d in dec_list:
                 self._todays_decisions.append(d)
-                self._log(TradingPhase.AUCTION_RESULT,
-                          f"  [{label}] {d['code']} → {d['action']}: "
-                          + f"{d['reason']} (置信度:{d['confidence']})")
+                self._log(
+                    TradingPhase.AUCTION_RESULT,
+                    f"  [{label}] {d['code']} → {d['action']}: " + f"{d['reason']} (置信度:{d['confidence']})",
+                )
 
-        self._log(TradingPhase.AUCTION_RESULT,
-                  f"开盘决策: {len(self._todays_decisions)} 条")
+        self._log(TradingPhase.AUCTION_RESULT, f"开盘决策: {len(self._todays_decisions)} 条")
 
     def _action_morning(self, now: datetime):
         """早盘交易 09:30-11:30"""
         if not self._phase_completed_full("morning"):
-            self._log(TradingPhase.MORNING,
-                      "早盘开盘! 开始分时走势跟踪与信号扫描")
+            self._log(TradingPhase.MORNING, "早盘开盘! 开始分时走势跟踪与信号扫描")
 
             # 输出开盘决策摘要
             if self._todays_decisions:
-                buy_dec = [d for d in self._todays_decisions
-                           if d["action"] in ("buy_at_open", "buy")]
-                sell_dec = [d for d in self._todays_decisions
-                            if d["action"] == "sell_at_open"]
+                buy_dec = [d for d in self._todays_decisions if d["action"] in ("buy_at_open", "buy")]
+                sell_dec = [d for d in self._todays_decisions if d["action"] == "sell_at_open"]
                 if buy_dec:
-                    self._log(TradingPhase.MORNING,
-                              f"竞价买入决策: {len(buy_dec)} 条")
+                    self._log(TradingPhase.MORNING, f"竞价买入决策: {len(buy_dec)} 条")
                     for d in buy_dec[:3]:
-                        self._log(TradingPhase.MORNING,
-                                  f"  → {d['code']} @ {d.get('price', 0):.2f}")
+                        self._log(TradingPhase.MORNING, f"  → {d['code']} @ {d.get('price', 0):.2f}")
                 if sell_dec:
-                    self._log(TradingPhase.MORNING,
-                              f"竞价卖出决策: {len(sell_dec)} 条")
+                    self._log(TradingPhase.MORNING, f"竞价卖出决策: {len(sell_dec)} 条")
 
         # 定期信号扫描（每扫描间隔执行一次）
         if self._should_scan(now, "morning_scan"):
@@ -432,13 +432,9 @@ class LiveTradingEngine:
             self._log(TradingPhase.AFTERNOON, "午盘开盘! 继续分时跟踪")
 
             if self._trading_plan and self._trading_plan.signals:
-                pm_sigs = [
-                    s for s in self._trading_plan.signals
-                    if s.signal_type in ("buy", "sell")
-                ]
+                pm_sigs = [s for s in self._trading_plan.signals if s.signal_type in ("buy", "sell")]
                 if pm_sigs:
-                    self._log(TradingPhase.AFTERNOON,
-                              f"下午待执行信号: {len(pm_sigs)} 条")
+                    self._log(TradingPhase.AFTERNOON, f"下午待执行信号: {len(pm_sigs)} 条")
 
         # 定期信号扫描
         if self._should_scan(now, "afternoon_scan"):
@@ -469,11 +465,8 @@ class LiveTradingEngine:
         for key, items in results.items():
             label = STRATEGIES.get(key, key)
             top_items = items[:5]
-            top_str = ", ".join(
-                f"{i.code}({i.score})" for i in top_items
-            )
-            self._log(TradingPhase.POST_MARKET,
-                      f"  [{label}] {len(items)} 只 → Top5: {top_str}")
+            top_str = ", ".join(f"{i.code}({i.score})" for i in top_items)
+            self._log(TradingPhase.POST_MARKET, f"  [{label}] {len(items)} 只 → Top5: {top_str}")
 
         # 4. 保存股票池
         self.pool_mgr.save_all()
@@ -488,8 +481,7 @@ class LiveTradingEngine:
     # 辅助方法
     # ═══════════════════════════════════════════
 
-    def _scan_pool_signals(self, now: datetime,
-                           sentiment: str = "neutral"):
+    def _scan_pool_signals(self, now: datetime, sentiment: str = "neutral"):
         """扫描各策略股票池的交易信号"""
         stock_pool_map = {}
         for strategy_name in STRATEGIES:
@@ -503,14 +495,10 @@ class LiveTradingEngine:
             self._log(self._current_phase, "股票池为空，跳过信号扫描")
             return
 
-        self._latest_signals = self.hunter.scan_all_strategies(
-            stock_pool_map, days=120, verbose=False
-        )
+        self._latest_signals = self.hunter.scan_all_strategies(stock_pool_map, days=120, verbose=False)
 
         # 生成交易计划
-        self._trading_plan = self.hunter.build_trading_plan(
-            self._latest_signals, sentiment
-        )
+        self._trading_plan = self.hunter.build_trading_plan(self._latest_signals, sentiment)
 
     def _analyze_15min_kline(self, now: datetime):
         """15分钟K线技术分析（午间复盘用）"""
@@ -526,10 +514,9 @@ class LiveTradingEngine:
         if not focus_codes:
             return
 
-        self._log(TradingPhase.LUNCH,
-                  f"15分K线分析 {len(focus_codes[:5])} 只重点标的...")
+        self._log(TradingPhase.LUNCH, f"15分K线分析 {len(focus_codes[:5])} 只重点标的...")
 
-        from .indicators import calc_macd, calc_kdj
+        from .indicators import calc_kdj, calc_macd
 
         for code in focus_codes[:5]:
             try:
@@ -539,10 +526,15 @@ class LiveTradingEngine:
                     continue
 
                 # 标准15分K不可直接获取，用日线MACD/KDJ做近似
-                col_map = {"日期": "date", "开盘": "open", "收盘": "close",
-                           "最高": "high", "最低": "low", "成交量": "volume"}
-                df = df.rename(columns={k: v for k, v in col_map.items()
-                                        if k in df.columns})
+                col_map = {
+                    "日期": "date",
+                    "开盘": "open",
+                    "收盘": "close",
+                    "最高": "high",
+                    "最低": "low",
+                    "成交量": "volume",
+                }
+                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
                 close = df["close"].iloc[-1]
                 prev = df["close"].iloc[-2] if len(df) > 1 else close
@@ -564,9 +556,7 @@ class LiveTradingEngine:
 
                 am_swing = "强势" if pct > 1 else ("弱势" if pct < -1 else "震荡")
 
-                self._log(TradingPhase.LUNCH,
-                          f"  {code}: {pct:+.2f}% [{am_swing}] "
-                          + f"MACD:{macd_sig} KDJ:{kdj_sig}")
+                self._log(TradingPhase.LUNCH, f"  {code}: {pct:+.2f}% [{am_swing}] " + f"MACD:{macd_sig} KDJ:{kdj_sig}")
 
             except Exception as e:
                 logger.debug(f"15分K分析 {code}: {e}")
@@ -585,8 +575,7 @@ class LiveTradingEngine:
                     # 中午重新确认买入信号
                     adjusted_actions += 1
 
-        self._log(TradingPhase.LUNCH,
-                  f"下午计划: 关注 {adjusted_actions} 个信号执行")
+        self._log(TradingPhase.LUNCH, f"下午计划: 关注 {adjusted_actions} 个信号执行")
 
     def _make_next_day_plan(self, now: datetime):
         """制定次日交易计划"""
@@ -598,24 +587,21 @@ class LiveTradingEngine:
                 pool_summary[strategy_name] = {
                     "label": STRATEGIES.get(strategy_name, strategy_name),
                     "count": len(ranked),
-                    "top5": [(item.code, item.name, item.score)
-                             for item in ranked[:5]]
+                    "top5": [(item.code, item.name, item.score) for item in ranked[:5]],
                 }
 
         self._log(TradingPhase.POST_MARKET, "次日交易计划概要:")
-        for key, info in pool_summary.items():
-            self._log(TradingPhase.POST_MARKET,
-                      f"  [{info['label']}] 关注 {info['count']} 只")
+        for _key, info in pool_summary.items():
+            self._log(TradingPhase.POST_MARKET, f"  [{info['label']}] 关注 {info['count']} 只")
 
     def _report_current_signals(self):
         """输出当前信号摘要"""
         if not self._latest_signals:
             return
 
-        for strategy_name, result in self._latest_signals.items():
+        for _strategy_name, result in self._latest_signals.items():
             if result.error:
-                self._log(self._current_phase,
-                          f"  [{result.strategy_label}] 扫描异常: {result.error}")
+                self._log(self._current_phase, f"  [{result.strategy_label}] 扫描异常: {result.error}")
                 continue
 
             sigs = result.signals
@@ -623,13 +609,15 @@ class LiveTradingEngine:
                 buys = [s for s in sigs if s.signal_type in ("buy", "add")]
                 sells = [s for s in sigs if s.signal_type in ("sell", "reduce", "close")]
                 for s in buys[:3]:
-                    self._log(self._current_phase,
-                              f"  [买] {s.code} {s.name} @ ~{s.price:.2f} "
-                              f"[{s.confidence}] {s.reason[:40]}")
+                    self._log(
+                        self._current_phase,
+                        f"  [买] {s.code} {s.name} @ ~{s.price:.2f} [{s.confidence}] {s.reason[:40]}",
+                    )
                 for s in sells[:3]:
-                    self._log(self._current_phase,
-                              f"  [卖] {s.code} {s.name} @ ~{s.price:.2f} "
-                              + f"[{s.confidence}] {s.reason[:40]}")
+                    self._log(
+                        self._current_phase,
+                        f"  [卖] {s.code} {s.name} @ ~{s.price:.2f} " + f"[{s.confidence}] {s.reason[:40]}",
+                    )
 
     def _should_scan(self, now: datetime, key: str) -> bool:
         """判断是否应该执行扫描"""
@@ -675,7 +663,7 @@ class LiveTradingEngine:
         # 已存在完整总结则跳过（检查 generated_at 是否在 15:00 之后）
         if os.path.exists(filepath) and not force:
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
+                with open(filepath, encoding="utf-8") as f:
                     existing = json.load(f)
                 gen_at = existing.get("generated_at", "")
                 if gen_at:
@@ -734,16 +722,11 @@ class LiveTradingEngine:
             "limit_up_details": limit_up_details,
             "next_day_plan": next_day_plan,
             "phase_logs": [
-                {"time": l.timestamp.isoformat(),
-                 "phase": l.phase.value,
-                 "event": l.event,
-                 "detail": l.detail}
-                for l in self._logs[-100:]
+                {"time": log.timestamp.isoformat(), "phase": log.phase.value, "event": log.event, "detail": log.detail}
+                for log in self._logs[-100:]
             ],
             "decisions": self._todays_decisions[:50],
-            "signal_count": sum(
-                len(r.signals) for r in self._latest_signals.values()
-            ),
+            "signal_count": sum(len(r.signals) for r in self._latest_signals.values()),
         }
 
         try:
@@ -794,21 +777,30 @@ class LiveTradingEngine:
         result = {}
         try:
             key_codes = {
-                "000001": "上证指数", "399001": "深证成指",
-                "399006": "创业板指", "000300": "沪深300",
+                "000001": "上证指数",
+                "399001": "深证成指",
+                "399006": "创业板指",
+                "000300": "沪深300",
             }
             for code, name in key_codes.items():
                 df = self.fetcher.fetch_index_daily(code)
                 if df is None or df.empty:
                     continue
-                col_map = {"日期": "date", "收盘": "close", "开盘": "open",
-                           "最高": "high", "最低": "low", "成交量": "volume"}
+                col_map = {
+                    "日期": "date",
+                    "收盘": "close",
+                    "开盘": "open",
+                    "最高": "high",
+                    "最低": "low",
+                    "成交量": "volume",
+                }
                 df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
                 required = ["close", "high", "low"]
                 if not all(c in df.columns for c in required):
                     continue
 
-                from .indicators import analyze_macd, analyze_kdj, analyze_rsi
+                from .indicators import analyze_kdj, analyze_macd, analyze_rsi
+
                 m = analyze_macd(df.tail(60))
                 k = analyze_kdj(df.tail(60))
                 r = analyze_rsi(df.tail(60))
@@ -877,7 +869,14 @@ class LiveTradingEngine:
             }
         except Exception as e:
             logger.warning(f"构建情绪评估失败: {e}")
-            return {"assessment": "neutral", "score": 50, "emotion": "未知", "emotion_icon": "❓", "market_heat": "未知", "factors": {}}
+            return {
+                "assessment": "neutral",
+                "score": 50,
+                "emotion": "未知",
+                "emotion_icon": "❓",
+                "market_heat": "未知",
+                "factors": {},
+            }
 
     def _build_market_trend(self) -> dict:
         """构建牛熊行情研判"""
@@ -892,10 +891,15 @@ class LiveTradingEngine:
         import pandas as pd
 
         stats = {
-            "limit_up": 0, "limit_down": 0,
-            "limit_up_real": 0, "limit_down_real": 0,
-            "up_count": 0, "down_count": 0, "flat_count": 0,
-            "max_consecutive": 0, "first_board_count": 0,
+            "limit_up": 0,
+            "limit_down": 0,
+            "limit_up_real": 0,
+            "limit_down_real": 0,
+            "up_count": 0,
+            "down_count": 0,
+            "flat_count": 0,
+            "max_consecutive": 0,
+            "first_board_count": 0,
             "consecutive_boards": [],
             "top_limit_up_sectors": [],
         }
@@ -931,20 +935,21 @@ class LiveTradingEngine:
                 if "连板数" in zt_df.columns and "名称" in zt_df.columns:
                     lb_boards = zt_df[pd.to_numeric(zt_df["连板数"], errors="coerce") >= 2]
                     for _, row in lb_boards.iterrows():
-                        stats["consecutive_boards"].append({
-                            "code": str(row.get("代码", "")),
-                            "name": str(row.get("名称", "")),
-                            "consecutive": int(row["连板数"]),
-                            "reason": str(row.get("涨停统计", "")),
-                        })
+                        stats["consecutive_boards"].append(
+                            {
+                                "code": str(row.get("代码", "")),
+                                "name": str(row.get("名称", "")),
+                                "consecutive": int(row["连板数"]),
+                                "reason": str(row.get("涨停统计", "")),
+                            }
+                        )
                     stats["consecutive_boards"] = stats["consecutive_boards"][:20]
 
                 # 涨停行业分布
                 if "所属行业" in zt_df.columns:
                     sector_counts = zt_df["所属行业"].value_counts().head(5)
                     stats["top_limit_up_sectors"] = [
-                        {"sector": str(k), "count": int(v)}
-                        for k, v in sector_counts.items()
+                        {"sector": str(k), "count": int(v)} for k, v in sector_counts.items()
                     ]
 
         except Exception as e:
@@ -955,19 +960,23 @@ class LiveTradingEngine:
     def _collect_strategy_pnl(self) -> dict:
         """收集各策略当日盈亏（从 PaperTrader 赛马数据读取）"""
         result = {}
-        strategy_keys = ["dragon", "sparrow", "turtle", "value"]
-        strategy_labels = {
-            "dragon": "龙头战法", "sparrow": "麻雀战法",
-            "turtle": "海龟战法", "value": "价值投资",
-        }
+
+        # 动态从 STRATEGIES 获取所有策略 key/label
+        strategy_map = dict(STRATEGIES)
+        strategy_keys = list(strategy_map.keys())
 
         try:
             # 优先从 PaperTrader 内存读取
             if self.paper_trader and self.paper_trader.accounts:
                 rankings = self.paper_trader.get_rankings()
                 for r in rankings:
-                    key = next((k for k, v in strategy_labels.items()
-                               if v == r.strategy_label), None)
+                    key = next((k for k, v in strategy_map.items() if v == r.strategy_label), None)
+                    if not key:
+                        # 也尝试别名匹配
+                        for k in strategy_keys:
+                            if strategy_map.get(k, "") == r.strategy_label:
+                                key = k
+                                break
                     if key:
                         result[key] = {
                             "label": r.strategy_label,
@@ -982,11 +991,11 @@ class LiveTradingEngine:
 
             # 若内存为空，尝试从保存文件读取历史数据
             if not result and os.path.exists(PAPER_SNAPSHOT_FILE):
-                with open(PAPER_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                with open(PAPER_SNAPSHOT_FILE, encoding="utf-8") as f:
                     race_data = json.load(f)
                 accounts = race_data.get("accounts", {})
                 for key, acc in accounts.items():
-                    label = strategy_labels.get(key, key)
+                    label = strategy_map.get(key, key)
                     snapshots = acc.get("daily_snapshots", [])
                     latest = snapshots[-1] if snapshots else {}
                     result[key] = {
@@ -994,8 +1003,13 @@ class LiveTradingEngine:
                         "rank": 0,
                         "total_equity": latest.get("equity", acc.get("initial_capital", DEFAULT_CAPITAL)),
                         "total_return_pct": round(
-                            (latest.get("equity", acc.get("initial_capital", DEFAULT_CAPITAL))
-                             / acc.get("initial_capital", DEFAULT_CAPITAL) - 1) * 100, 2
+                            (
+                                latest.get("equity", acc.get("initial_capital", DEFAULT_CAPITAL))
+                                / acc.get("initial_capital", DEFAULT_CAPITAL)
+                                - 1
+                            )
+                            * 100,
+                            2,
                         ),
                         "daily_return_pct": 0,
                         "position_count": latest.get("positions", 0),
@@ -1009,10 +1023,14 @@ class LiveTradingEngine:
         for key in strategy_keys:
             if key not in result:
                 result[key] = {
-                    "label": strategy_labels.get(key, key),
-                    "rank": 0, "total_equity": DEFAULT_CAPITAL,
-                    "total_return_pct": 0, "daily_return_pct": 0,
-                    "position_count": 0, "max_drawdown": 0, "trades": 0,
+                    "label": strategy_map.get(key, key),
+                    "rank": 0,
+                    "total_equity": DEFAULT_CAPITAL,
+                    "total_return_pct": 0,
+                    "daily_return_pct": 0,
+                    "position_count": 0,
+                    "max_drawdown": 0,
+                    "trades": 0,
                 }
 
         return result
@@ -1038,19 +1056,21 @@ class LiveTradingEngine:
                     sec = str(row.get("所属行业", ""))
                     if sec not in zt_by_sector:
                         zt_by_sector[sec] = []
-                    zt_by_sector[sec].append({
-                        "code": str(row.get("代码", "")),
-                        "name": str(row.get("名称", "")),
-                        "price": round(float(row.get("最新价", 0) or 0), 2),
-                        "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
-                        "consecutive": int(pd.to_numeric(row.get("连板数", 0), errors="coerce").__float__() or 0),
-                        "first_time": str(row.get("首次封板时间", "")),
-                        "last_time": str(row.get("最后封板时间", "")),
-                        "turnover": round(float(row.get("换手率", 0) or 0), 2),
-                        "volume_amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
-                        "float_mv": round(float(row.get("流通市值", 0) or 0) / 1e8, 2),
-                        "reason": str(row.get("涨停统计", row.get("涨停原因", ""))),
-                    })
+                    zt_by_sector[sec].append(
+                        {
+                            "code": str(row.get("代码", "")),
+                            "name": str(row.get("名称", "")),
+                            "price": round(float(row.get("最新价", 0) or 0), 2),
+                            "pct_change": round(float(row.get("涨跌幅", 0) or 0), 2),
+                            "consecutive": int(pd.to_numeric(row.get("连板数", 0), errors="coerce").__float__() or 0),
+                            "first_time": str(row.get("首次封板时间", "")),
+                            "last_time": str(row.get("最后封板时间", "")),
+                            "turnover": round(float(row.get("换手率", 0) or 0), 2),
+                            "volume_amount": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
+                            "float_mv": round(float(row.get("流通市值", 0) or 0) / 1e8, 2),
+                            "reason": str(row.get("涨停统计", row.get("涨停原因", ""))),
+                        }
+                    )
 
             # 2. 获取板块分析结果（已按涨停家数排名，包含五日涨幅Top10成分股）
             sectors = self.market.analyze_sectors(top_n=10)
@@ -1071,18 +1091,15 @@ class LiveTradingEngine:
                     "limit_up_count": zt_count,
                     "total_stocks": s.total_stocks,
                     "leading_stocks": s.leading_stocks,  # 领涨股 Top3（五日涨幅）
-                    "top_stocks": s.top_stocks,          # 板块内五日涨幅 Top10 详细数据
+                    "top_stocks": s.top_stocks,  # 板块内五日涨幅 Top10 详细数据
                     # 板块内涨停龙头（取当日涨幅最高的5只）
                     "limit_up_leaders": sorted(
-                        zt_by_sector.get(sec_name, []),
-                        key=lambda x: x["pct_change"], reverse=True
+                        zt_by_sector.get(sec_name, []), key=lambda x: x["pct_change"], reverse=True
                     )[:5],
                 }
                 result["top_sectors"].append(sector_data)
 
-            result["limit_up_by_sector"] = {
-                k: len(v) for k, v in zt_by_sector.items()
-            }
+            result["limit_up_by_sector"] = {k: len(v) for k, v in zt_by_sector.items()}
 
         except Exception as e:
             logger.warning(f"构建热门板块数据失败: {e}", exc_info=True)
@@ -1151,8 +1168,7 @@ class LiveTradingEngine:
             if not pool:
                 continue
             ranked = pool.ranked()
-            top5 = [{"code": item.code, "name": item.name, "score": item.score}
-                    for item in ranked[:5]]
+            top5 = [{"code": item.code, "name": item.name, "score": item.score} for item in ranked[:5]]
             plan[strategy_name] = {
                 "label": STRATEGIES.get(strategy_name, strategy_name),
                 "pool_size": len(ranked),
@@ -1165,20 +1181,15 @@ class LiveTradingEngine:
         detail = ""
         if "  " in event and not event.startswith("==="):
             detail = event
-        log_entry = EngineLog(
-            timestamp=datetime.now(), phase=phase,
-            event=event, detail=detail
-        )
+        log_entry = EngineLog(timestamp=datetime.now(), phase=phase, event=event, detail=detail)
         self._logs.append(log_entry)
         if len(self._logs) > self._max_logs:
-            self._logs = self._logs[-self._max_logs:]
+            self._logs = self._logs[-self._max_logs :]
 
         # 通知回调
         for cb in self._log_callbacks:
-            try:
+            with contextlib.suppress(Exception):
                 cb(log_entry)
-            except Exception:
-                pass
 
     def _log(self, phase: TradingPhase, event: str):
         """统一日志输出"""
@@ -1207,9 +1218,7 @@ class LiveTradingEngine:
             "phase_label": get_phase_label(self._current_phase),
             "is_trading_day": self.calendar.is_trading_day(),
             "pool_summary": self.pool_mgr.summary(),
-            "latest_signals": sum(
-                len(r.signals) for r in self._latest_signals.values()
-            ),
+            "latest_signals": sum(len(r.signals) for r in self._latest_signals.values()),
             "signal_details": {
                 name: {
                     "strategy": r.strategy_label,
@@ -1219,7 +1228,8 @@ class LiveTradingEngine:
                     "duration": r.scan_duration,
                     "raw_signals": [
                         {
-                            "code": s.code, "name": s.name,
+                            "code": s.code,
+                            "name": s.name,
                             "signal_type": s.signal_type,
                             "confidence": s.confidence,
                             "price": s.price,
@@ -1247,12 +1257,14 @@ class LiveTradingEngine:
             state["last_scan_time"] = now.strftime("%H:%M:%S")
             state["phase_logs"] = [
                 {
-                    "time": l.timestamp.strftime("%H:%M:%S") if hasattr(l.timestamp, 'strftime') else str(l.timestamp),
-                    "phase": l.phase.value if hasattr(l.phase, 'value') else str(l.phase),
-                    "event": l.event,
-                    "detail": getattr(l, 'detail', ''),
+                    "time": log.timestamp.strftime("%H:%M:%S")
+                    if hasattr(log.timestamp, "strftime")
+                    else str(log.timestamp),
+                    "phase": log.phase.value if hasattr(log.phase, "value") else str(log.phase),
+                    "event": log.event,
+                    "detail": getattr(log, "detail", ""),
                 }
-                for l in self._logs[-100:]
+                for log in self._logs[-100:]
             ]
             state["last_trade_summary"] = self._collect_strategy_pnl()
 

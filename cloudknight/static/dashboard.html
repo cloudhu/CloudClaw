@@ -306,6 +306,7 @@ body {
   <button data-tab="summary">收盘总结</button>
   <button data-tab="ops">运维监控</button>
   <button data-tab="diagnose">个股诊断</button>
+  <button data-tab="settings">设置</button>
 </div>
 
 <div class="content">
@@ -533,6 +534,17 @@ body {
     </div>
     <div class="diag-loading" id="diagLoading"><div class="diag-spinner"></div></div>
   </div>
+
+  <!-- ═══ 设置/数据源管理 ═══ -->
+  <div class="tab-panel" id="tab-settings">
+    <div class="diag-panel">
+      <div class="diag-panel-header"><h3>⚙️ 数据源设置</h3><span style="font-size:12px;color:var(--text-dim)">绑定收费数据源 API Key，优先使用直到额度用完</span></div>
+      <div class="diag-panel-body">
+        <div id="settings-source-list"></div>
+        <div id="settings-message" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -560,6 +572,9 @@ $$('.tabs button').forEach(b => b.addEventListener('click', function() {
   const tab = this.dataset.tab;
   $$('.tab-panel').forEach(p => p.classList.remove('active'));
   $('#tab-'+tab).classList.add('active');
+  // 切换到设置标签时加载设置
+  if (tab === 'settings') loadSettings();
+
   loadTab(tab);
   // 重绘图表
   setTimeout(resizeAllCharts, 200);
@@ -1623,12 +1638,22 @@ function renderDiagStrategies(d) {
 
   const emojiMap = {dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💰'};
   const sigMap = {buy:'✅ 看多', hold:'⟳ 观望', sell:'⚠ 看空'};
-  const matchColorMap = [null,'stg-match-low','stg-match-low','stg-match-neutral','stg-match-good','stg-match-strong'];
+  const poolStatus = d.pool_status || {};
 
   grid.innerHTML = strategies.map(s => {
     const pct = s.total_conditions > 0 ? Math.round(s.match_count / Math.max(4, s.total_conditions) * 100) : 0;
     const matchClass = s.score >= 70 ? 'stg-match-strong' : s.score >= 55 ? 'stg-match-good' : s.score >= 40 ? 'stg-match-neutral' : 'stg-match-low';
     const sigClass = 'stg-sig-' + s.signal;
+    const ps = poolStatus[s.key] || {in_pool:false};
+    let poolBadge = '';
+    if (ps.in_pool) {
+      const tierMap = {focus:'精选', watch:'观察', broad:'备选'};
+      const tierLabel = tierMap[ps.tier] || '';
+      poolBadge = '<div class="pool-badge" style="margin-top:6px;font-size:12px;color:#2ecc71;">📌 已在策略池' + (tierLabel ? '（'+tierLabel+'层，评分'+ps.score+'）' : '') + '</div>';
+    } else if (s.score >= 55) {
+      const safeName = (d.name || '').replace(/'/g, "\'");
+      poolBadge = `<button class="btn btn-sm btn-outline" onclick="addToPool('${d.code}','${safeName}','${s.key}',${s.score},${d.technical.current_price})" style="margin-top:6px;font-size:12px;padding:3px 10px;">📥 加入策略池</button>`;
+    }
     return `<div class="strategy-card">
       <div class="strategy-card-header">
         <h4>${(emojiMap[s.key]||'')} ${s.name}</h4>
@@ -1638,8 +1663,72 @@ function renderDiagStrategies(d) {
       <ul class="stg-reasons">${(s.reasons||[]).map(r => '<li>✔ ' + r + '</li>').join('')}</ul>
       ${(s.warnings||[]).length ? '<ul class="stg-warnings">' + s.warnings.map(w => '<li>⚠ ' + w + '</li>').join('') + '</ul>' : ''}
       <div class="stg-match-bar"><div class="stg-match-fill ${matchClass}" style="width:${pct}%"></div></div>
+      ${poolBadge}
     </div>`;
   }).join('');
+}
+
+async function addToPool(code, name, strategyKey, score, price) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '加入中...';
+  try {
+    const resp = await fetch('/api/diagnose/' + code + '/add-to-pool?strategy=' + strategyKey, {method:'POST'});
+    const data = await resp.json();
+    if (data.success) {
+      showTradePlanModal(data.plan, code, name, strategyKey);
+      btn.style.display = 'none';
+      const card = btn.closest('.strategy-card');
+      if (card) {
+        const badge = document.createElement('div');
+        badge.className = 'pool-badge';
+        badge.style.cssText = 'margin-top:6px;font-size:12px;color:#2ecc71;';
+        badge.textContent = '📌 已加入策略池';
+        card.appendChild(badge);
+      }
+    } else {
+      alert(data.error || '加入失败');
+    }
+  } catch(e) {
+    alert('操作失败: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📥 加入策略池';
+  }
+}
+
+function showTradePlanModal(plan, code, name, strategyKey) {
+  const emojiMap = {dragon_head:'🐲', sparrow:'🐦', turtle:'🐢', value_invest:'💰'};
+  const labelMap = {dragon_head:'龙头战法', sparrow:'麻雀战法', turtle:'海龟战法', value_invest:'价值投资'};
+  const nameLabel = labelMap[strategyKey] || strategyKey;
+  const overlay = document.createElement('div');
+  overlay.id = 'trade-plan-overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
+  overlay.innerHTML = `<div class="trade-plan-modal" style="background:var(--panel);border-radius:12px;padding:28px;max-width:520px;width:90%;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.4);">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3 style="margin:0;font-size:20px;">${emojiMap[strategyKey]||'📊'} ${nameLabel} 交易计划</h3>
+      <button onclick="document.getElementById('trade-plan-overlay').remove()" style="background:none;border:none;color:var(--text-dim);font-size:24px;cursor:pointer;line-height:1;">&times;</button>
+    </div>
+    <div style="margin-bottom:20px;padding:12px;background:rgba(52,152,219,.1);border-radius:8px;font-size:14px;">
+      <strong>${name} (${code})</strong> | 当前价 ${plan.entry_price} | ${plan.entry_type}
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:16px;">
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">🛑 止损价</td><td style="padding:8px 0;text-align:right;color:#e74c3c;font-weight:bold;">${plan.stop_loss} <span style="font-size:12px;">(${plan.stop_loss_pct}%)</span></td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">🎯 止盈一</td><td style="padding:8px 0;text-align:right;color:#2ecc71;font-weight:bold;">${plan.take_profit_1} <span style="font-size:12px;">(+${plan.take_profit_1_pct}%)</span></td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">🎯 止盈二</td><td style="padding:8px 0;text-align:right;color:#2ecc71;font-weight:bold;">${plan.take_profit_2} <span style="font-size:12px;">(+${plan.take_profit_2_pct}%)</span></td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">💰 建议仓位</td><td style="padding:8px 0;text-align:right;font-weight:bold;">${plan.position_pct}% 总资金</td></tr>
+      <tr style="border-bottom:1px solid var(--border);"><td style="padding:8px 0;color:var(--text-dim);">📐 风险收益比</td><td style="padding:8px 0;text-align:right;font-weight:bold;">1:${plan.risk_reward_ratio}</td></tr>
+      <tr><td style="padding:8px 0;color:var(--text-dim);">📅 建议持有</td><td style="padding:8px 0;text-align:right;font-weight:bold;">${plan.hold_days} 个交易日</td></tr>
+    </table>
+    <div style="margin-bottom:12px;"><div style="color:#2ecc71;font-weight:bold;margin-bottom:6px;">✅ 交易理由</div>${plan.reasons.map(r => '<div style="font-size:13px;color:var(--text);padding:2px 0;">• ' + r + '</div>').join('')}</div>
+    <div style="background:rgba(231,76,60,.08);border-left:3px solid #e74c3c;padding:10px 14px;border-radius:4px;">
+      <div style="color:#e74c3c;font-weight:bold;margin-bottom:4px;">⚠ 风险提示</div>
+      ${plan.warnings.map(w => '<div style="font-size:12px;color:var(--text-dim);padding:2px 0;">• ' + w + '</div>').join('')}
+    </div>
+    <div style="margin-top:16px;font-size:11px;color:var(--text-dim);text-align:right;">创建时间: ${plan.created_at}</div>
+  </div>`;
+  document.body.appendChild(overlay);
 }
 
 function renderDiagTechChart(d) {
@@ -1676,6 +1765,148 @@ function renderDiagTechChart(d) {
       itemStyle: {color:'#3498db'},
     }],
   });
+}
+
+// ═══ 数据源设置 ═══════════════════════════════════════════════
+
+let settingsData = null;
+
+async function loadSettings() {
+  const el = document.getElementById('settings-source-list');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">加载中...</div>';
+  const resp = await API('/settings/datasources');
+  if (!resp || !resp.success) {
+    el.innerHTML = '<div class="empty">无法加载数据源设置</div>';
+    return;
+  }
+  settingsData = resp.data;
+  renderSettings(settingsData);
+}
+
+function renderSettings(sources) {
+  const el = document.getElementById('settings-source-list');
+  if (!el) return;
+
+  const priorityNames = ['最高优先', '第二优先', '第三优先', '最低优先'];
+
+  el.innerHTML = sources.map((s, i) => {
+    const statusIcon = s.configured ? (s.connected ? '✅' : '⚠') : '❌';
+    const statusText = s.configured ? (s.connected ? '已连接' : '已配置(未连接)') : '未配置';
+    const quotaText = s.quota.daily_limit > 0
+      ? `额度: ${s.quota.daily_used}/${s.quota.daily_limit}`
+      : '无限额度';
+
+    const markets = (s.markets || ['A']).join('/');
+
+    const hasExtra = s.extra_config && s.id !== 'free';
+    let extraHtml = '';
+    if (hasExtra) {
+      extraHtml = '<div class="stg-reasons" style="margin-top:8px;font-size:11px;">';
+      Object.entries(s.extra_config).forEach(([k, v]) => {
+        extraHtml += `<span style="display:inline-block;margin-right:12px;color:var(--text-dim)">${k}: ${v}</span>`;
+      });
+      extraHtml += '</div>';
+    }
+
+    let formHtml = '';
+    if (s.id !== 'free') {
+      formHtml = `
+        <div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          ${s.id === 'tushare'
+            ? '<input type="text" id="input-' + s.id + '" placeholder="Token" style="flex:1;min-width:200px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;">'
+            : ''
+          }
+          ${s.id === 'choice'
+            ? '<input type="text" id="input-choice-url" placeholder="http://127.0.0.1:8089" value="' + (hasExtra ? s.extra_config.url : 'http://127.0.0.1:8089') + '" style="flex:1;min-width:180px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;"><input type="text" id="input-choice-key" placeholder="API Key (可选)" style="flex:1;min-width:200px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;">'
+            : ''
+          }
+          ${s.id === 'ibkr'
+            ? '<input type="text" id="input-ibkr-host" placeholder="127.0.0.1" value="' + (hasExtra ? s.extra_config.host : '127.0.0.1') + '" style="width:120px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;"><input type="number" id="input-ibkr-port" placeholder="7497" value="' + (hasExtra ? s.extra_config.port : 7497) + '" style="width:80px;background:var(--panel);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;"><label style="color:var(--text-dim);font-size:12px;display:flex;align-items:center;gap:4px;"><input type="checkbox" id="input-ibkr-enabled" ' + (hasExtra && s.extra_config.enabled ? 'checked' : '') + '> 启用</label>'
+            : ''
+          }
+          <button class="btn btn-primary" onclick="saveApiKey('${s.id}')" style="font-size:12px;padding:6px 14px;">保存并测试</button>
+          ${s.configured ? '<button class="btn btn-outline" onclick="deleteApiKey(\'' + s.id + '\')" style="font-size:12px;padding:6px 14px;color:#e74c3c;">删除</button>' : ''}
+        </div>`;
+    }
+
+    return `<div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:10px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:20px;">${s.icon}</span>
+          <div>
+            <div style="font-weight:600;font-size:14px;">${s.name}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${priorityNames[i] || ''} · ${markets} · ${quotaText} · ${statusIcon} ${statusText}</div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">${s.setup_guide}</div>
+          </div>
+        </div>
+      </div>
+      ${extraHtml}
+      ${formHtml}
+    </div>`;
+  }).join('');
+
+  // 消息显示
+  const msgEl = document.getElementById('settings-message');
+  if (msgEl) msgEl.innerHTML = '';
+}
+
+async function saveApiKey(source) {
+  const msgEl = document.getElementById('settings-message');
+  if (!msgEl) return;
+
+  let body = { api_key: '' };
+
+  if (source === 'tushare') {
+    body.api_key = document.getElementById('input-tushare')?.value.trim() || '';
+  } else if (source === 'choice') {
+    body.api_key = document.getElementById('input-choice-key')?.value.trim() || '';
+    body.choice_url = document.getElementById('input-choice-url')?.value.trim() || 'http://127.0.0.1:8089';
+    body.choice_use_cloud = !!body.api_key;
+  } else if (source === 'ibkr') {
+    body.ibkr_host = document.getElementById('input-ibkr-host')?.value.trim() || '127.0.0.1';
+    body.ibkr_port = parseInt(document.getElementById('input-ibkr-port')?.value) || 7497;
+    body.ibkr_client_id = 1;
+    body.ibkr_enabled = document.getElementById('input-ibkr-enabled')?.checked || false;
+  }
+
+  msgEl.innerHTML = '<div class="loading">保存并测试中...</div>';
+
+  try {
+    const resp = await fetch('/api/settings/apikey/' + source, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+
+    if (resp.success) {
+      if (resp.tested) {
+        msgEl.innerHTML = '<div style="color:#27ae60;padding:8px;background:#eafaf1;border-radius:4px;">✅ ' + source + ' 连接测试成功!</div>';
+      } else {
+        msgEl.innerHTML = '<div style="color:#f39c12;padding:8px;background:#fef9e7;border-radius:4px;">⚠ ' + source + ' 已保存，但连接测试失败: ' + (resp.error || '请检查配置') + '</div>';
+      }
+    } else {
+      msgEl.innerHTML = '<div style="color:#e74c3c;padding:8px;background:#fdedec;border-radius:4px;">❌ 保存失败: ' + (resp.error || '未知错误') + '</div>';
+    }
+
+    // 刷新设置列表
+    setTimeout(() => loadSettings(), 1000);
+  } catch (e) {
+    msgEl.innerHTML = '<div style="color:#e74c3c;padding:8px;background:#fdedec;border-radius:4px;">❌ 网络错误: ' + e.message + '</div>';
+  }
+}
+
+async function deleteApiKey(source) {
+  const msgEl = document.getElementById('settings-message');
+  try {
+    const resp = await fetch('/api/settings/apikey/' + source, { method: 'DELETE' }).then(r => r.json());
+    if (resp.success) {
+      if (msgEl) msgEl.innerHTML = '<div style="color:#27ae60;padding:8px;background:#eafaf1;border-radius:4px;">✅ ' + source + ' 已删除</div>';
+    }
+    setTimeout(() => loadSettings(), 500);
+  } catch (e) {
+    if (msgEl) msgEl.innerHTML = '<div style="color:#e74c3c;padding:8px;background:#fdedec;border-radius:4px;">❌ 删除失败</div>';
+  }
 }
 
 // ═══ 启动 ═══════════════════════════════════════════════════

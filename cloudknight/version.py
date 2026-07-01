@@ -12,8 +12,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-
-VERSION_STRING = "2.3.0"
+VERSION_STRING = "2.4.0"
 
 SEMVER_PATTERN = re.compile(
     r"^(?P<major>0|[1-9]\d*)"
@@ -28,11 +27,12 @@ SEMVER_PATTERN = re.compile(
 @dataclass
 class SemVer:
     """语义化版本号"""
+
     major: int
     minor: int
     patch: int
-    prerelease: Optional[str] = None
-    build: Optional[str] = None
+    prerelease: str | None = None
+    build: str | None = None
 
     def __str__(self) -> str:
         base = f"{self.major}.{self.minor}.{self.patch}"
@@ -128,4 +128,6 @@ def get_version() -> str:
 
 def get_semver() -> SemVer:
     """返回当前版本的 SemVer 对象"""
-    return SemVer.parse(VERSION_STRING)
+    result = SemVer.parse(VERSION_STRING)
+    assert result is not None, f"Invalid VERSION_STRING: {VERSION_STRING}"
+    return result

@@ -13,154 +13,168 @@
 
 import logging
 import time as _time
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
+from .config import MA_PERIODS
 from .indicators import (
-    IndicatorResult, comprehensive_analysis, trend_score,
-    calc_ma, calc_bollinger, calc_atr, calc_breakout,
+    IndicatorResult,
+    calc_atr,
+    calc_bollinger,
+    calc_breakout,
+    calc_ma,
+    trend_score,
 )
-from .config import MA_PERIODS, INDEX_CODES
 
 logger = logging.getLogger(__name__)
 
 # ─── 诊股超时配置 ─────────────────────────────────────────
-_DIAGNOSE_KLINE_TIMEOUT = 10       # K线获取超时（秒）
+_DIAGNOSE_KLINE_TIMEOUT = 10  # K线获取超时（秒）
 _DIAGNOSE_FUNDAMENTAL_TIMEOUT = 8  # 财务数据获取超时（秒）
-_DIAGNOSE_MONEYFLOW_TIMEOUT = 8    # 资金流向获取超时（秒）
-_DIAGNOSE_TOTAL_TIMEOUT = 25       # 全流程总超时（秒）
+_DIAGNOSE_MONEYFLOW_TIMEOUT = 8  # 资金流向获取超时（秒）
+_DIAGNOSE_TOTAL_TIMEOUT = 25  # 全流程总超时（秒）
 
 
 # ─── 数据模型 ─────────────────────────────────────────────
 
+
 @dataclass
 class TechDiagnosis:
     """技术面诊断结果"""
-    score: int                          # 技术面评分 0-100
-    rating: str                         # 评级
-    current_price: float                # 当前价格
-    pct_change_5d: Optional[float]      # 5日涨跌幅 %
-    pct_change_20d: Optional[float]     # 20日涨跌幅 %
-    amplitude_5d: Optional[float]       # 5日振幅 %
-    ma_alignment: str                   # 均线排列: 多头/空头/交叉/缠绕
-    ma_positions: Dict[str, float]      # 各均线当前值 {MA5: x, MA10: x, ...}
+
+    score: int  # 技术面评分 0-100
+    rating: str  # 评级
+    current_price: float  # 当前价格
+    pct_change_5d: float | None  # 5日涨跌幅 %
+    pct_change_20d: float | None  # 20日涨跌幅 %
+    amplitude_5d: float | None  # 5日振幅 %
+    ma_alignment: str  # 均线排列: 多头/空头/交叉/缠绕
+    ma_positions: dict[str, float]  # 各均线当前值 {MA5: x, MA10: x, ...}
     macd: IndicatorResult
     kdj: IndicatorResult
     rsi: IndicatorResult
     bollinger: IndicatorResult
     volume_price: IndicatorResult
-    atr: Optional[float]                # 平均真实波幅
-    support: float                      # 支撑位
-    resistance: float                   # 阻力位
-    stock_name: str = ""                # 股票名称
+    atr: float | None  # 平均真实波幅
+    support: float  # 支撑位
+    resistance: float  # 阻力位
+    stock_name: str = ""  # 股票名称
 
 
 @dataclass
 class FundamentalDiagnosis:
     """基本面诊断结果"""
-    score: int = 50                        # 基本面评分 0-100
-    rating: str = "未评估"                   # 评级
-    pe: Optional[float] = None             # 市盈率
-    pb: Optional[float] = None             # 市净率
-    roe: Optional[float] = None            # ROE %
-    revenue_growth: Optional[float] = None # 营收增长率 %
-    profit_growth: Optional[float] = None  # 净利润增长率 %
-    market_cap: Optional[float] = None     # 总市值（亿）
-    dividend_yield: Optional[float] = None # 股息率 %
-    debt_ratio: Optional[float] = None     # 资产负债率 %
-    gross_margin: Optional[float] = None   # 毛利率 %
-    net_margin: Optional[float] = None     # 净利率 %
-    industry_pe: Optional[float] = None    # 行业平均PE
-    data_available: bool = False           # 是否获取到财务数据
+
+    score: int = 50  # 基本面评分 0-100
+    rating: str = "未评估"  # 评级
+    pe: float | None = None  # 市盈率
+    pb: float | None = None  # 市净率
+    roe: float | None = None  # ROE %
+    revenue_growth: float | None = None  # 营收增长率 %
+    profit_growth: float | None = None  # 净利润增长率 %
+    market_cap: float | None = None  # 总市值（亿）
+    dividend_yield: float | None = None  # 股息率 %
+    debt_ratio: float | None = None  # 资产负债率 %
+    gross_margin: float | None = None  # 毛利率 %
+    net_margin: float | None = None  # 净利率 %
+    industry_pe: float | None = None  # 行业平均PE
+    data_available: bool = False  # 是否获取到财务数据
 
 
 @dataclass
 class CapitalDiagnosis:
     """资金面诊断结果"""
-    score: int = 50                          # 资金面评分 0-100
-    rating: str = "未评估"                    # 评级
-    main_force_direction: str = "unknown"    # 主力动向: inflow/outflow/neutral/unknown
-    main_force_5d_net: Optional[float] = None  # 近5日主力净流入（亿）
-    turnover_rate: Optional[float] = None     # 换手率 %
-    volume_ratio: Optional[float] = None      # 量比
+
+    score: int = 50  # 资金面评分 0-100
+    rating: str = "未评估"  # 评级
+    main_force_direction: str = "unknown"  # 主力动向: inflow/outflow/neutral/unknown
+    main_force_5d_net: float | None = None  # 近5日主力净流入（亿）
+    turnover_rate: float | None = None  # 换手率 %
+    volume_ratio: float | None = None  # 量比
     data_available: bool = False
 
 
 @dataclass
 class MarketContext:
     """市场面诊断结果"""
-    score: int = 50                          # 市场面评分 0-100
-    rating: str = "未评估"                    # 评级
-    sector_name: str = "未知板块"             # 所属板块
-    sector_rank: Optional[int] = None        # 板块强度排名
-    sector_pct: Optional[float] = None       # 板块涨跌幅 %
-    market_trend: str = "未知"               # 大盘趋势
-    market_sentiment: str = "未知"            # 市场情绪
-    limit_status: str = "正常"               # 涨跌停状态
+
+    score: int = 50  # 市场面评分 0-100
+    rating: str = "未评估"  # 评级
+    sector_name: str = "未知板块"  # 所属板块
+    sector_rank: int | None = None  # 板块强度排名
+    sector_pct: float | None = None  # 板块涨跌幅 %
+    market_trend: str = "未知"  # 大盘趋势
+    market_sentiment: str = "未知"  # 市场情绪
+    limit_status: str = "正常"  # 涨跌停状态
 
 
 @dataclass
 class StrategyDiagnosis:
     """单策略诊断结果"""
-    name: str                           # 策略名称
-    key: str                            # 策略 key
-    score: int                          # 策略评分 0-100
-    signal: str                         # 信号: buy/hold/sell
-    rating: str                         # 评级文字
-    match_count: int                    # 符合条件的项数
-    total_conditions: int               # 总条件数
-    reasons: List[str] = field(default_factory=list)  # 匹配原因
-    warnings: List[str] = field(default_factory=list) # 风险警示
+
+    name: str  # 策略名称
+    key: str  # 策略 key
+    score: int  # 策略评分 0-100
+    signal: str  # 信号: buy/hold/sell
+    rating: str  # 评级文字
+    match_count: int  # 符合条件的项数
+    total_conditions: int  # 总条件数
+    reasons: list[str] = field(default_factory=list)  # 匹配原因
+    warnings: list[str] = field(default_factory=list)  # 风险警示
 
 
 @dataclass
 class StockDiagnosis:
     """个股综合诊断报告"""
-    code: str                           # 股票代码
-    name: str                           # 股票名称
-    timestamp: str                      # 诊断时间
+
+    code: str  # 股票代码
+    name: str  # 股票名称
+    timestamp: str  # 诊断时间
     technical: TechDiagnosis
     fundamental: FundamentalDiagnosis
     capital: CapitalDiagnosis
     market: MarketContext
-    composite_score: int                # 综合评分 0-100
-    composite_rating: str               # 综合评级
-    recommendation: str                 # 操作建议
-    risk_level: str                     # 风险等级: 低/中/高/极高
-    summary: str                        # 一句话总结
-    detail_scores: Dict[str, int] = field(default_factory=dict)  # 各维度得分明细
-    strategy_diagnoses: List[StrategyDiagnosis] = field(default_factory=list)  # 各策略诊断
-    data_quality: str = "完整"           # 数据质量: 完整/部分缺失/严重缺失
+    composite_score: int  # 综合评分 0-100
+    composite_rating: str  # 综合评级
+    recommendation: str  # 操作建议
+    risk_level: str  # 风险等级: 低/中/高/极高
+    summary: str  # 一句话总结
+    detail_scores: dict[str, int] = field(default_factory=dict)  # 各维度得分明细
+    strategy_diagnoses: list[StrategyDiagnosis] = field(default_factory=list)  # 各策略诊断
+    data_quality: str = "完整"  # 数据质量: 完整/部分缺失/严重缺失
+    pool_status: dict[str, dict] = field(default_factory=dict)  # 各策略池中的状态 {key: {in_pool, tier, score, entry_price}}
 
 
 # ─── 诊股引擎 ─────────────────────────────────────────────
 
+
 class StockDiagnoser:
     """个股诊断器
-    
+
     使用现有 DataFetcher 获取数据，复用 indicators 模块做技术分析，
     每项数据获取有独立超时保护。
     """
 
     def __init__(self):
         from .data_manager import DataFetcher
+
         self._fetcher = DataFetcher()
 
     # ── 公开接口 ──────────────────────────────────────────
 
     def diagnose(self, code: str) -> StockDiagnosis:
         """对指定股票进行全面诊断
-        
+
         Args:
             code: 6位股票代码，如 '000001' 或 '600519'
-        
+
         Returns:
-            StockDiagnosis 综合诊断报告
+            StockDiagnosis 综合诊断报告（含自动入池结果）
         """
         code = str(code).zfill(6)
         deadline = _time.time() + _DIAGNOSE_TOTAL_TIMEOUT
@@ -178,21 +192,23 @@ class StockDiagnoser:
         # 市场面
         market = self._diagnose_market_context(code, tech.current_price, deadline)
 
-        # 策略诊断
+        # 策略诊断（动态遍历策略池）
         strategy_diags = self._diagnose_strategies(df_kline, tech, fund, cap)
+
+        # 自动入池：评分达标且未在池中的股票自动加入对应策略池
+        auto_add_results = self._auto_add_to_pools(code, tech.stock_name, tech.current_price, strategy_diags)
 
         # 数据质量评估
         data_quality = self._assess_data_quality(tech, fund, cap, market)
 
         # 综合评分（加入策略一致性）
-        composite, rating, rec, risk, summary = self._compute_composite(
-            tech, fund, cap, market, strategy_diags
-        )
+        composite, rating, rec, risk, summary = self._compute_composite(tech, fund, cap, market, strategy_diags)
 
         name = tech.stock_name or self._resolve_name(code)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        pool_status = self.check_pool_status(code)
 
-        return StockDiagnosis(
+        result = StockDiagnosis(
             code=code,
             name=name,
             timestamp=ts,
@@ -213,7 +229,11 @@ class StockDiagnoser:
                 "市场面": market.score,
             },
             data_quality=data_quality,
+            pool_status=pool_status,
         )
+        # 注入自动入池结果（非标准字段，仅供前端展示）
+        result.__dict__["auto_add_results"] = auto_add_results
+        return result
 
     def quick_diagnose(self, code: str) -> StockDiagnosis:
         """快速诊断 — 跳过低优先级数据，仅技术面+市场面"""
@@ -222,25 +242,37 @@ class StockDiagnoser:
         tech = self._diagnose_technical(code, df_kline)
         market = self._diagnose_market_context(code, tech.current_price, deadline=0)
         fund = FundamentalDiagnosis(score=50, rating="未评估", data_available=False)
-        cap = CapitalDiagnosis(score=50, rating="未评估", main_force_direction="unknown",
-                               data_available=False)
+        cap = CapitalDiagnosis(score=50, rating="未评估", main_force_direction="unknown", data_available=False)
         strategy_diags = self._diagnose_strategies(df_kline, tech, fund, cap)
-        composite, rating, rec, risk, summary = self._compute_composite(
-            tech, fund, cap, market, strategy_diags
-        )
+
+        # 自动入池
+        auto_add_results = self._auto_add_to_pools(code, tech.stock_name, tech.current_price, strategy_diags)
+
+        composite, rating, rec, risk, summary = self._compute_composite(tech, fund, cap, market, strategy_diags)
         name = tech.stock_name or self._resolve_name(code)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         data_quality = "部分缺失"  # 快速诊断必然缺失基本面和资金面
-        return StockDiagnosis(
-            code=code, name=name, timestamp=ts,
-            technical=tech, fundamental=fund, capital=cap, market=market,
+        pool_status = self.check_pool_status(code)
+        result = StockDiagnosis(
+            code=code,
+            name=name,
+            timestamp=ts,
+            technical=tech,
+            fundamental=fund,
+            capital=cap,
+            market=market,
             strategy_diagnoses=strategy_diags,
-            composite_score=composite, composite_rating=rating,
-            recommendation=rec, risk_level=risk, summary=summary,
-            detail_scores={"技术面": tech.score, "基本面": fund.score,
-                           "资金面": cap.score, "市场面": market.score},
+            composite_score=composite,
+            composite_rating=rating,
+            recommendation=rec,
+            risk_level=risk,
+            summary=summary,
+            detail_scores={"技术面": tech.score, "基本面": fund.score, "资金面": cap.score, "市场面": market.score},
             data_quality=data_quality,
+            pool_status=pool_status,
         )
+        result.__dict__["auto_add_results"] = auto_add_results
+        return result
 
     # ── 安全数据获取（带超时） ─────────────────────────────
 
@@ -277,20 +309,21 @@ class StockDiagnoser:
     def _diagnose_capital_safe(self, code: str, deadline: float) -> CapitalDiagnosis:
         """资金面诊断（带超时）"""
         if _time.time() > deadline:
-            return CapitalDiagnosis(score=50, rating="超时跳过", main_force_direction="unknown",
-                                    data_available=False)
+            return CapitalDiagnosis(score=50, rating="超时跳过", main_force_direction="unknown", data_available=False)
         with ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(self._diagnose_capital, code)
             try:
                 remaining = max(1, deadline - _time.time())
                 return fut.result(timeout=min(_DIAGNOSE_MONEYFLOW_TIMEOUT, remaining))
             except FutureTimeoutError:
-                return CapitalDiagnosis(score=50, rating="超时跳过", main_force_direction="unknown",
-                                        data_available=False)
+                return CapitalDiagnosis(
+                    score=50, rating="超时跳过", main_force_direction="unknown", data_available=False
+                )
             except Exception as e:
                 logger.warning(f"诊股: {code} 资金面异常: {e}")
-                return CapitalDiagnosis(score=50, rating="获取失败", main_force_direction="unknown",
-                                        data_available=False)
+                return CapitalDiagnosis(
+                    score=50, rating="获取失败", main_force_direction="unknown", data_available=False
+                )
 
     # ── 技术面诊断 ────────────────────────────────────────
 
@@ -301,8 +334,12 @@ class StockDiagnoser:
 
         # 标准化列名
         col_map = {
-            "日期": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume",
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
         }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
@@ -334,9 +371,7 @@ class StockDiagnoser:
         amp_5d = None
         if len(df) >= 5:
             recent_5 = df.tail(5)
-            amp_5d = round(
-                (float(recent_5["high"].max()) / float(recent_5["low"].min()) - 1) * 100, 2
-            )
+            amp_5d = round((float(recent_5["high"].max()) / float(recent_5["low"].min()) - 1) * 100, 2)
 
         # 均线计算与排列判断
         ma_values = {}
@@ -350,7 +385,7 @@ class StockDiagnoser:
                     ma_values[col] = round(float(val), 2)
 
         # 判断均线排列
-        sorted_mas = sorted(ma_values.items(), key=lambda x: x[1], reverse=True)
+        sorted(ma_values.items(), key=lambda x: x[1], reverse=True)
         ideal_multi = [f"MA{p}" for p in [5, 10, 20, 60, 120, 250] if f"MA{p}" in ma_values]
         is_bullish = all(
             ma_values.get(ideal_multi[i], 0) >= ma_values.get(ideal_multi[i + 1], 0)
@@ -366,7 +401,7 @@ class StockDiagnoser:
             ma_alignment = "空头排列"
         elif len(ma_values) >= 2:
             # 检查是否有交叉
-            first = list(ma_values.keys())[0]
+            first = next(iter(ma_values.keys()))
             last = list(ma_values.keys())[-1]
             if ma_values[first] > ma_values[last]:
                 ma_alignment = "偏多头"
@@ -420,12 +455,13 @@ class StockDiagnoser:
         """安全计算技术指标"""
         try:
             from . import indicators as ind
+
             fn = getattr(ind, func_name)
             return fn(df)
         except Exception:
             return IndicatorResult("neutral", "hold", 50, {})
 
-    def _calc_sr(self, df: pd.DataFrame, price: float) -> Tuple[float, float]:
+    def _calc_sr(self, df: pd.DataFrame, price: float) -> tuple[float, float]:
         """计算支撑位和阻力位"""
         support, resistance = price * 0.95, price * 1.05  # 默认 ±5%
         try:
@@ -465,15 +501,22 @@ class StockDiagnoser:
 
     def _empty_tech(self) -> TechDiagnosis:
         return TechDiagnosis(
-            score=50, rating="无数据", current_price=0,
-            pct_change_5d=None, pct_change_20d=None, amplitude_5d=None,
-            ma_alignment="无数据", ma_positions={},
+            score=50,
+            rating="无数据",
+            current_price=0,
+            pct_change_5d=None,
+            pct_change_20d=None,
+            amplitude_5d=None,
+            ma_alignment="无数据",
+            ma_positions={},
             macd=IndicatorResult("neutral", "hold", 50, {}),
             kdj=IndicatorResult("neutral", "hold", 50, {}),
             rsi=IndicatorResult("neutral", "hold", 50, {}),
             bollinger=IndicatorResult("neutral", "hold", 50, {}),
             volume_price=IndicatorResult("neutral", "hold", 50, {}),
-            atr=None, support=0, resistance=0,
+            atr=None,
+            support=0,
+            resistance=0,
         )
 
     # ── 基本面诊断 ────────────────────────────────────────
@@ -502,17 +545,11 @@ class StockDiagnoser:
             fund.pe = self._safe_float(latest.get("市盈率") or latest.get("PE"))
             fund.pb = self._safe_float(latest.get("市净率") or latest.get("PB"))
             fund.roe = self._safe_float(latest.get("净资产收益率") or latest.get("ROE"))
-            fund.revenue_growth = self._safe_float(
-                latest.get("营业收入增长率") or latest.get("营收增长率")
-            )
-            fund.profit_growth = self._safe_float(
-                latest.get("净利润增长率") or latest.get("利润增长率")
-            )
+            fund.revenue_growth = self._safe_float(latest.get("营业收入增长率") or latest.get("营收增长率"))
+            fund.profit_growth = self._safe_float(latest.get("净利润增长率") or latest.get("利润增长率"))
             fund.market_cap = self._safe_float(latest.get("总市值") or latest.get("市值"))
             fund.dividend_yield = self._safe_float(latest.get("股息率"))
-            fund.debt_ratio = self._safe_float(
-                latest.get("资产负债率") or latest.get("负债率")
-            )
+            fund.debt_ratio = self._safe_float(latest.get("资产负债率") or latest.get("负债率"))
             fund.gross_margin = self._safe_float(latest.get("毛利率"))
             fund.net_margin = self._safe_float(latest.get("净利率"))
 
@@ -534,7 +571,14 @@ class StockDiagnoser:
                 return FundamentalDiagnosis(score=50, rating=reason, data_available=False)
 
             # 标准化列名
-            col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low", "成交量": "volume"}
+            col_map = {
+                "日期": "date",
+                "开盘": "open",
+                "收盘": "close",
+                "最高": "high",
+                "最低": "low",
+                "成交量": "volume",
+            }
             df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
             if "close" not in df.columns:
                 return FundamentalDiagnosis(score=50, rating=reason, data_available=False)
@@ -582,7 +626,9 @@ class StockDiagnoser:
             if "volume" in df.columns:
                 vols = df["volume"].values.astype(float)
                 if len(vols) >= 20:
-                    vol_trend = float(np.mean(vols[-5:]) / np.mean(vols[-20:-5]) - 1) if np.mean(vols[-20:-5]) > 0 else 0
+                    vol_trend = (
+                        float(np.mean(vols[-5:]) / np.mean(vols[-20:-5]) - 1) if np.mean(vols[-20:-5]) > 0 else 0
+                    )
                     if vol_trend > 0.3:
                         fund.score = min(100, fund.score + 5)
                     elif vol_trend < -0.3:
@@ -678,10 +724,7 @@ class StockDiagnoser:
 
     def _diagnose_capital(self, code: str) -> CapitalDiagnosis:
         """资金面分析"""
-        cap = CapitalDiagnosis(
-            score=50, rating="待分析", main_force_direction="unknown",
-            data_available=False
-        )
+        cap = CapitalDiagnosis(score=50, rating="待分析", main_force_direction="unknown", data_available=False)
         try:
             df = self._fetcher.fetch_money_flow(code)
         except Exception:
@@ -755,8 +798,7 @@ class StockDiagnoser:
 
     # ── 市场面诊断 ────────────────────────────────────────
 
-    def _diagnose_market_context(self, code: str, price: float,
-                                  deadline: float = 0) -> MarketContext:
+    def _diagnose_market_context(self, code: str, price: float, deadline: float = 0) -> MarketContext:
         """市场环境分析"""
         from .market_analyzer import MarketAnalyzer
 
@@ -782,18 +824,23 @@ class StockDiagnoser:
 
         # 市场面评分
         trend_score_map = {
-            "强势牛市": 90, "偏多震荡": 65, "震荡市": 50,
-            "偏空震荡": 35, "弱势熊市": 15, "未知": 50,
+            "强势牛市": 90,
+            "偏多震荡": 65,
+            "震荡市": 50,
+            "偏空震荡": 35,
+            "弱势熊市": 15,
+            "未知": 50,
         }
         sentiment_score_map = {
-            "极度贪婪": 85, "贪婪": 70, "中性": 50,
-            "恐惧": 30, "极度恐惧": 15, "未知": 50,
+            "极度贪婪": 85,
+            "贪婪": 70,
+            "中性": 50,
+            "恐惧": 30,
+            "极度恐惧": 15,
+            "未知": 50,
         }
 
-        m_score = int(
-            trend_score_map.get(market_trend, 50) * 0.6 +
-            sentiment_score_map.get(market_sentiment, 50) * 0.4
-        )
+        m_score = int(trend_score_map.get(market_trend, 50) * 0.6 + sentiment_score_map.get(market_sentiment, 50) * 0.4)
 
         return MarketContext(
             score=m_score,
@@ -814,8 +861,8 @@ class StockDiagnoser:
         fund: FundamentalDiagnosis,
         cap: CapitalDiagnosis,
         market: MarketContext,
-        strategy_diags: List[StrategyDiagnosis] = None,
-    ) -> Tuple[int, str, str, str, str]:
+        strategy_diags: list[StrategyDiagnosis] | None = None,
+    ) -> tuple[int, str, str, str, str]:
         """计算综合评分、评级、建议、风险"""
         # 基础四维权重
         weights = {"tech": 0.35, "fund": 0.20, "capital": 0.15, "market": 0.10, "strategy": 0.20}
@@ -868,18 +915,19 @@ class StockDiagnoser:
             parts.append(f"资金面{cap.rating}")
         if strategy_diags:
             buy_count = sum(1 for s in strategy_diags if s.signal == "buy")
-            if buy_count >= 3:
-                parts.append(f"策略一致看多({buy_count}/4)")
-            elif buy_count >= 2:
-                parts.append(f"策略分歧({buy_count}/4看多)")
+            total_count = len(strategy_diags)
+            if buy_count >= total_count * 0.7:
+                parts.append(f"策略一致看多({buy_count}/{total_count})")
+            elif buy_count >= total_count * 0.4:
+                parts.append(f"策略分歧({buy_count}/{total_count}看多)")
             else:
-                parts.append(f"策略偏空({4-buy_count}/4看空)")
+                parts.append(f"策略偏空({total_count - buy_count}/{total_count}看空)")
         parts.append(f"综合{rating}")
         summary = f"{tech.stock_name or '该股'} — " + "，".join(parts)
 
         return composite, rating, rec, risk, summary
 
-    def _strategy_consensus_score(self, diags: List[StrategyDiagnosis]) -> int:
+    def _strategy_consensus_score(self, diags: list[StrategyDiagnosis]) -> int:
         """策略一致性评分：取策略评分的加权平均"""
         if not diags:
             return 50
@@ -893,9 +941,12 @@ class StockDiagnoser:
         return int(weighted / total_weight) if total_weight > 0 else 50
 
     def _generate_recommendation(
-        self, tech: TechDiagnosis, fund: FundamentalDiagnosis,
-        cap: CapitalDiagnosis, composite: int,
-        strategy_diags: List[StrategyDiagnosis] = None,
+        self,
+        tech: TechDiagnosis,
+        fund: FundamentalDiagnosis,
+        cap: CapitalDiagnosis,
+        composite: int,
+        strategy_diags: list[StrategyDiagnosis] | None = None,
     ) -> str:
         """生成操作建议"""
         recs = []
@@ -942,7 +993,7 @@ class StockDiagnoser:
 
         if not recs:
             if composite >= 60:
-                recs.append(("各策略指标中性偏多，可适量关注"))
+                recs.append("各策略指标中性偏多，可适量关注")
             elif composite >= 40:
                 recs.append("各项指标中性偏空，建议观望等待信号")
             else:
@@ -950,23 +1001,29 @@ class StockDiagnoser:
 
         return "；".join(recs) if recs else "暂无明确建议"
 
-    # ── 策略诊断 ──────────────────────────────────────────
+    # ── 策略诊断（动态策略池） ──────────────────────────
 
     def _diagnose_strategies(
-        self, df: pd.DataFrame,
+        self,
+        df: pd.DataFrame,
         tech: TechDiagnosis,
         fund: FundamentalDiagnosis,
         cap: CapitalDiagnosis,
-    ) -> List[StrategyDiagnosis]:
-        """用四种交易策略分别评估该股票"""
-        results = []
+    ) -> list[StrategyDiagnosis]:
+        """从策略池动态遍历所有支持诊股的策略进行评分"""
+        from .strategies import get_diagnose_strategies
+
         if df is None or df.empty or len(df) < 40:
             return self._empty_strategy_results()
 
         # 标准化列名（兼容中英文列名）
         col_map = {
-            "日期": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume",
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
         }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
@@ -984,10 +1041,38 @@ class StockDiagnoser:
         # 计算策略所需的基础指标
         indicators = self._calc_strategy_indicators(closes, highs, lows, volumes, opens)
 
-        results.append(self._eval_dragon_head(closes, highs, lows, volumes, opens, indicators, cap))
-        results.append(self._eval_sparrow(closes, highs, lows, indicators))
-        results.append(self._eval_turtle(closes, highs, lows, indicators))
-        results.append(self._eval_value_invest(closes, indicators, fund))
+        # 动态遍历所有注册的诊股策略
+        results = []
+        strategy_registry = get_diagnose_strategies()
+        for key, meta in strategy_registry.items():
+            strategy_cls = meta["class"]
+            try:
+                if hasattr(strategy_cls, 'diagnose'):
+                    raw = strategy_cls.diagnose(closes, highs, lows, volumes, opens, indicators, fund, cap)
+                    diag = StrategyDiagnosis(
+                        name=raw["name"],
+                        key=raw["key"],
+                        score=raw["score"],
+                        signal=raw["signal"],
+                        rating=raw["rating"],
+                        match_count=raw["match_count"],
+                        total_conditions=raw["total_conditions"],
+                        reasons=raw.get("reasons", []),
+                        warnings=raw.get("warnings", []),
+                    )
+                    results.append(diag)
+            except Exception as e:
+                logger.warning(f"策略 {key} 诊股异常: {e}")
+                results.append(StrategyDiagnosis(
+                    name=meta.get("label", key),
+                    key=key,
+                    score=50,
+                    signal="hold",
+                    rating="评估异常",
+                    match_count=0,
+                    total_conditions=0,
+                    warnings=[f"评估异常: {str(e)}"],
+                ))
 
         return results
 
@@ -1009,7 +1094,7 @@ class StockDiagnoser:
             tr = np.zeros(len(closes))
             tr[0] = highs[0] - lows[0]
             for i in range(1, len(closes)):
-                tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+                tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
             ind["atr14"] = float(np.mean(tr[-14:]))
         # RSI
         if len(closes) >= 15:
@@ -1029,10 +1114,10 @@ class StockDiagnoser:
             h9p, l9p = np.max(highs[-10:-1]), np.min(lows[-10:-1])
             prev = closes[-2]
             rsv_prev = (prev - l9p) / (h9p - l9p) * 100 if h9p > l9p else 50
-            k_prev = 50 * 2/3 + rsv_prev * 1/3
-            d_prev = 50 * 2/3 + k_prev * 1/3
-            k = k_prev * 2/3 + rsv * 1/3
-            d = d_prev * 2/3 + k * 1/3
+            k_prev = 50 * 2 / 3 + rsv_prev * 1 / 3
+            d_prev = 50 * 2 / 3 + k_prev * 1 / 3
+            k = k_prev * 2 / 3 + rsv * 1 / 3
+            d = d_prev * 2 / 3 + k * 1 / 3
             ind["k"] = float(k)
             ind["d"] = float(d)
             ind["j"] = float(3 * k - 2 * d)
@@ -1046,7 +1131,7 @@ class StockDiagnoser:
             ind["pct_today"] = float((closes[-1] / closes[-2] - 1) * 100) if closes[-2] > 0 else 0
             pcts = []
             for i in range(1, min(21, len(closes))):
-                pcts.append(float((closes[-i] / closes[-i-1] - 1) * 100))
+                pcts.append(float((closes[-i] / closes[-i - 1] - 1) * 100))
             ind["pcts"] = pcts
         # 250日价格分位
         if len(closes) >= 250:
@@ -1055,361 +1140,246 @@ class StockDiagnoser:
 
         return ind
 
-    # ── 龙头战法评估 ──
+    # ── 策略评估方法已移至各策略类的 diagnose() 静态方法 ──
+    # 参见 strategies/dragon_head.py, sparrow.py, turtle.py, value_invest.py 等
 
-    def _eval_dragon_head(self, closes, highs, lows, volumes, opens, ind, cap):
-        """龙头战法评分：连板、量比、换手率"""
-        reasons, warnings = [], []
-        score = 30  # 基础分
+    def _empty_strategy_results(self) -> list[StrategyDiagnosis]:
+        """K线数据不足时返回空策略结果（动态遍历策略池）"""
+        from .strategies import get_diagnose_strategies
 
-        pcts = ind.get("pcts", [])
-        vol_ratio = ind.get("vol_ratio", 1)
-
-        # 连板天数
-        limit_days = 0
-        for p in pcts:
-            if p >= 9.5:
-                limit_days += 1
-            else:
-                break
-        if limit_days > 0:
-            score += min(limit_days * 10, 30)
-            reasons.append(f"已{limit_days}连板")
-        else:
-            warnings.append("无涨停连板")
-
-        # 涨停强度
-        pct_today = ind.get("pct_today", 0)
-        if pct_today >= 9.5:
-            score += 15
-            reasons.append("今日涨停")
-        elif pct_today >= 5:
-            score += 5
-            reasons.append("今日大幅上涨")
-        elif pct_today <= -9.5:
-            score -= 20
-            warnings.append("今日跌停")
-
-        # 量比
-        if 1.5 <= vol_ratio <= 3:
-            score += 15
-            reasons.append(f"量比{vol_ratio:.1f}适中")
-        elif vol_ratio > 3:
-            score += 8
-            reasons.append(f"量比{vol_ratio:.1f}偏大")
-        elif vol_ratio >= 1:
-            score += 3
-        else:
-            score -= 5
-            warnings.append(f"量比{vol_ratio:.1f}偏小")
-
-        # 换手率（资金面数据优先，否则从成交量估算）
-        turnover = cap.turnover_rate
-        if turnover is not None:
-            if 5 <= turnover <= 30:
-                score += 10
-                reasons.append(f"换手率{turnover:.1f}%活跃")
-            elif 2 <= turnover < 5:
-                score += 5
-                reasons.append(f"换手率{turnover:.1f}%")
-            elif turnover > 30:
-                score -= 5
-                warnings.append(f"换手率{turnover:.1f}%过高")
-            else:
-                warnings.append(f"换手率{turnover:.1f}%偏低")
-
-        score = max(0, min(100, score))
-        match = len(reasons)
-        total = 4
-
-        if score >= 70:
-            signal, rating = "buy", "强烈推荐"
-        elif score >= 55:
-            signal, rating = "buy", "关注"
-        elif score >= 40:
-            signal, rating = "hold", "观望"
-        else:
-            signal, rating = "sell", "不适用"
-
-        return StrategyDiagnosis(
-            name="龙头战法", key="dragon_head",
-            score=score, signal=signal, rating=rating,
-            match_count=match, total_conditions=total,
-            reasons=reasons, warnings=warnings,
-        )
-
-    # ── 麻雀战法评估 ──
-
-    def _eval_sparrow(self, closes, highs, lows, ind):
-        """麻雀战法评分：MA20支撑、KDJ金叉、RSI"""
-        reasons, warnings = [], []
-        score = 30
-
-        cur = closes[-1]
-        ma20 = ind.get("ma20", 0)
-
-        # MA20 支撑
-        if ma20 > 0:
-            dist = (cur - ma20) / ma20 * 100
-            if -2 <= dist <= 2:
-                score += 25
-                reasons.append(f"紧贴MA20支撑(dist={dist:+.1f}%)")
-            elif -5 <= dist <= 5:
-                score += 15
-                reasons.append(f"靠近MA20(dist={dist:+.1f}%)")
-            elif dist > 10:
-                score += 5
-                warnings.append(f"远离MA20上方({dist:+.1f}%)")
-            elif dist < -5:
-                score -= 10
-                warnings.append(f"跌破MA20({dist:+.1f}%)")
-        else:
-            warnings.append("MA20无数据")
-
-        # KDJ 金叉
-        k, d = ind.get("k", 50), ind.get("d", 50)
-        kp, dp = ind.get("k_prev", 50), ind.get("d_prev", 50)
-        if kp <= dp and k > d:
-            score += 25
-            reasons.append(f"KDJ金叉(K={k:.0f},D={d:.0f})")
-        elif k > d:
-            score += 10
-            reasons.append(f"KDJ多头(K={k:.0f}>D={d:.0f})")
-        elif k < d:
-            score -= 5
-            warnings.append(f"KDJ空头(K={k:.0f}<D={d:.0f})")
-
-        # RSI
-        rsi = ind.get("rsi", 50)
-        if 30 <= rsi <= 55:
-            score += 20
-            reasons.append(f"RSI={rsi:.0f}温和")
-        elif 55 < rsi <= 70:
-            score += 8
-            reasons.append(f"RSI={rsi:.0f}偏强")
-        elif rsi > 70:
-            score -= 5
-            warnings.append(f"RSI={rsi:.0f}超买")
-        elif rsi < 30:
-            score -= 10
-            warnings.append(f"RSI={rsi:.0f}超卖")
-
-        score = max(0, min(100, score))
-        match = len(reasons)
-        total = 3
-
-        if score >= 70:
-            signal, rating = "buy", "建议建仓"
-        elif score >= 55:
-            signal, rating = "buy", "关注"
-        elif score >= 35:
-            signal, rating = "hold", "观望"
-        else:
-            signal, rating = "sell", "回避"
-
-        return StrategyDiagnosis(
-            name="麻雀战法", key="sparrow",
-            score=score, signal=signal, rating=rating,
-            match_count=match, total_conditions=total,
-            reasons=reasons, warnings=warnings,
-        )
-
-    # ── 海龟战法评估 ──
-
-    def _eval_turtle(self, closes, highs, lows, ind):
-        """海龟战法评分：MA200过滤、唐奇安突破、ATR波动"""
-        reasons, warnings = [], []
-        score = 30
-
-        cur = closes[-1]
-        ma200 = ind.get("ma200", 0)
-
-        # MA200 过滤
-        if ma200 > 0 and cur >= ma200:
-            score += 20
-            reasons.append(f"站上MA200(>={ma200:.2f})")
-        elif ma200 > 0:
-            score -= 15
-            warnings.append(f"低于MA200({cur:.2f}<{ma200:.2f})")
-        else:
-            warnings.append("MA200无数据(需250日K线)")
-
-        # 唐奇安通道
-        dh20 = ind.get("donchian_h20", 0)
-        dl20 = ind.get("donchian_l20", 0)
-        if dh20 > 0:
-            dist_to_h = (dh20 - cur) / dh20 * 100
-            if dist_to_h <= 2:
-                score += 25
-                reasons.append(f"接近突破({dist_to_h:.1f}%到20日高点)")
-            elif dist_to_h <= 5:
-                score += 15
-                reasons.append(f"靠近通道上沿({dist_to_h:.1f}%)")
-            elif dist_to_h <= 10:
-                score += 8
-            else:
-                score -= 5
-                warnings.append(f"远离突破({dist_to_h:.1f}%)")
-        else:
-            warnings.append("唐奇安通道无数据")
-
-        # ATR 波动率
-        atr = ind.get("atr14", 0)
-        if atr > 0 and cur > 0:
-            atr_pct = atr / cur * 100
-            if 2 <= atr_pct <= 5:
-                score += 15
-                reasons.append(f"ATR={atr_pct:.1f}%适度波动")
-            elif atr_pct < 2:
-                score += 5
-                warnings.append(f"ATR={atr_pct:.1f}%低波动")
-            else:
-                score += 8
-                reasons.append(f"ATR={atr_pct:.1f}%高波动")
-        else:
-            score += 5  # 默认中性
-
-        # 趋势强度（价格与多条均线的关系）
-        ma20 = ind.get("ma20", 0)
-        ma60 = ind.get("ma60", 0)
-        if ma20 > 0 and ma60 > 0:
-            if cur > ma20 > ma60:
-                score += 15
-                reasons.append("均线多头排列")
-            elif cur > ma20:
-                score += 8
-            elif cur < ma60:
-                score -= 10
-                warnings.append("均线空头排列")
-
-        score = max(0, min(100, score))
-        match = len(reasons)
-        total = 4
-
-        if score >= 70:
-            signal, rating = "buy", "建议建仓"
-        elif score >= 50:
-            signal, rating = "hold", "等待突破"
-        else:
-            signal, rating = "sell", "不适用"
-
-        return StrategyDiagnosis(
-            name="海龟战法", key="turtle",
-            score=score, signal=signal, rating=rating,
-            match_count=match, total_conditions=total,
-            reasons=reasons, warnings=warnings,
-        )
-
-    # ── 价值投资评估 ──
-
-    def _eval_value_invest(self, closes, ind, fund):
-        """价值投资评分：价格分位、估值、RSI"""
-        reasons, warnings = [], []
-        score = 30
-
-        # 250日价格分位
-        pct = ind.get("price_percentile", 50)
-        if pct <= 20:
-            score += 30
-            reasons.append(f"极度低估(250日分位{pct:.0f}%)")
-        elif pct <= 40:
-            score += 20
-            reasons.append(f"低估(250日分位{pct:.0f}%)")
-        elif pct <= 60:
-            score += 5
-            reasons.append(f"估值合理(250日分位{pct:.0f}%)")
-        elif pct <= 80:
-            score -= 10
-            warnings.append(f"偏高(250日分位{pct:.0f}%)")
-        else:
-            score -= 20
-            warnings.append(f"严重高估(250日分位{pct:.0f}%)")
-
-        # RSI 入场时机
-        rsi = ind.get("rsi", 50)
-        if rsi < 45:
-            score += 20
-            reasons.append(f"RSI={rsi:.0f}入场时机好")
-        elif rsi < 60:
-            score += 10
-        else:
-            score -= 5
-            warnings.append(f"RSI={rsi:.0f}偏高")
-
-        # MA250 位置
-        ma250 = ind.get("ma250", 0)
-        cur = closes[-1]
-        if ma250 > 0:
-            dist250 = (cur - ma250) / ma250 * 100
-            if dist250 < -10:
-                score += 10
-                reasons.append("跌破年线，超跌信号")
-            elif -10 <= dist250 <= 10:
-                score += 5
-                reasons.append("靠近年线")
-            elif dist250 > 30:
-                score -= 5
-                warnings.append(f"远离年线上方({dist250:.0f}%)")
-        else:
-            score += 3  # 数据不足，中性
-
-        # 如果基本面数据可用
-        if fund.data_available:
-            if fund.pe is not None and fund.pe < 15:
-                score += 10
-                reasons.append(f"PE={fund.pe:.1f}低估")
-            elif fund.pe is not None and fund.pe > 50:
-                score -= 10
-                warnings.append(f"PE={fund.pe:.1f}高估")
-            if fund.pb is not None and fund.pb < 1.5:
-                score += 8
-                reasons.append(f"PB={fund.pb:.2f}破净")
-            if fund.roe is not None and fund.roe > 15:
-                score += 7
-                reasons.append(f"ROE={fund.roe:.1f}%优秀")
-            if fund.dividend_yield is not None and fund.dividend_yield > 3:
-                score += 5
-                reasons.append(f"股息率{fund.dividend_yield:.1f}%")
-        else:
-            warnings.append("无财务数据(仅技术面估值)")
-
-        score = max(0, min(100, score))
-        match = len(reasons)
-        total = 4 if fund.data_available else 3
-
-        if score >= 70:
-            signal, rating = "buy", "建议长线布局"
-        elif score >= 55:
-            signal, rating = "buy", "逢低关注"
-        elif score >= 40:
-            signal, rating = "hold", "观望"
-        else:
-            signal, rating = "sell", "回避"
-
-        return StrategyDiagnosis(
-            name="价值投资", key="value_invest",
-            score=score, signal=signal, rating=rating,
-            match_count=match, total_conditions=total,
-            reasons=reasons, warnings=warnings,
-        )
-
-    def _empty_strategy_results(self) -> List[StrategyDiagnosis]:
-        """K线数据不足时返回空策略结果"""
         results = []
-        for key, name in [("dragon_head", "龙头战法"), ("sparrow", "麻雀战法"),
-                           ("turtle", "海龟战法"), ("value_invest", "价值投资")]:
-            results.append(StrategyDiagnosis(
-                name=name, key=key, score=50, signal="hold", rating="数据不足",
-                match_count=0, total_conditions=0,
-                warnings=["K线数据不足，无法评估"],
-            ))
+        for key, meta in get_diagnose_strategies().items():
+            results.append(
+                StrategyDiagnosis(
+                    name=meta.get("label", key),
+                    key=key,
+                    score=50,
+                    signal="hold",
+                    rating="数据不足",
+                    match_count=0,
+                    total_conditions=0,
+                    warnings=["K线数据不足，无法评估"],
+                )
+            )
         return results
+
+    # ── 策略池集成 ────────────────────────────────────
+
+    def _get_pool_manager(self):
+        """延迟加载 PoolManager 单例"""
+        try:
+            from .stock_pool import PoolManager
+
+            return PoolManager()
+        except Exception:
+            return None
+
+    def _auto_add_to_pools(
+        self, code: str, name: str, price: float, strategy_diags: list[StrategyDiagnosis]
+    ) -> dict[str, dict]:
+        """诊股后自动将高评分股票加入对应策略池
+
+        根据 DIAGNOSE_STRATEGIES 中定义的 auto_add_threshold，评分达标的策略
+        自动将该股票加入其股票池（如果尚未在池中）。
+
+        Returns:
+            {strategy_key: {added: bool, already_in: bool, score: int, threshold: int, plan: dict|null, error: str|null}}
+        """
+        from .strategies import get_diagnose_strategies
+
+        registry = get_diagnose_strategies()
+        results = {}
+
+        for diag in strategy_diags:
+            meta = registry.get(diag.key, {})
+            threshold = meta.get("auto_add_threshold", 70)
+
+            result = {
+                "added": False,
+                "already_in": False,
+                "score": diag.score,
+                "threshold": threshold,
+                "plan": None,
+                "error": None,
+            }
+
+            # 评分未达自动入池阈值，跳过
+            if diag.score < threshold:
+                results[diag.key] = result
+                continue
+
+            # 检查是否已在池中
+            dm = self._get_pool_manager()
+            if dm is None:
+                result["error"] = "PoolManager 不可用"
+                results[diag.key] = result
+                continue
+
+            pool = dm.get_pool(diag.key)
+            if pool is None:
+                result["error"] = f"策略 {diag.key} 无对应池"
+                results[diag.key] = result
+                continue
+
+            existing = pool.get(code)
+            if existing and existing.status == "active":
+                result["already_in"] = True
+                results[diag.key] = result
+                continue
+
+            # 执行自动入池
+            try:
+                from .stock_pool import StockPoolItem
+
+                item = StockPoolItem(
+                    code=code,
+                    name=name or f"股票{code}",
+                    score=float(diag.score),
+                    components={"诊断推荐": float(diag.score)},
+                    screened_at=datetime.now().strftime("%Y%m%d"),
+                    entry_price=round(price, 2),
+                    max_price=round(price, 2),
+                )
+                pool.items[code] = item
+                pool.save()
+
+                # 生成交易计划
+                plan_obj = pool.create_trade_plan(code, name or f"股票{code}", price, float(diag.score))
+
+                result["added"] = True
+                result["plan"] = {
+                    "entry_price": plan_obj.entry_price,
+                    "entry_type": plan_obj.entry_type,
+                    "stop_loss": plan_obj.stop_loss,
+                    "stop_loss_pct": plan_obj.stop_loss_pct,
+                    "take_profit_1": plan_obj.take_profit_1,
+                    "take_profit_1_pct": plan_obj.take_profit_1_pct,
+                    "take_profit_2": plan_obj.take_profit_2,
+                    "take_profit_2_pct": plan_obj.take_profit_2_pct,
+                    "position_pct": plan_obj.position_pct,
+                    "risk_reward_ratio": plan_obj.risk_reward_ratio,
+                    "hold_days": plan_obj.hold_days,
+                    "reasons": plan_obj.reasons,
+                    "warnings": plan_obj.warnings,
+                    "created_at": plan_obj.created_at,
+                }
+                logger.info(f"自动入池 [{diag.key}]: {code} {name} 评分{diag.score}≥{threshold}")
+
+            except Exception as e:
+                result["error"] = str(e)
+                logger.warning(f"自动入池失败 [{diag.key}]: {code} {e}")
+
+            results[diag.key] = result
+
+        return results
+
+    def check_pool_status(self, code: str) -> dict[str, dict]:
+        """查询该股票在各策略池中的状态
+
+        返回: {strategy_key: {in_pool: bool, tier: str, score: float, entry_price: float}}
+        """
+        dm = self._get_pool_manager()
+        if dm is None:
+            return {}
+        status = {}
+        for key, pool in dm.pools.items():
+            item = pool.get(code)
+            if item and item.status == "active":
+                status[key] = {
+                    "in_pool": True,
+                    "tier": item.tier or "broad",
+                    "score": round(item.score, 1),
+                    "entry_price": round(item.entry_price, 2) if item.entry_price > 0 else 0,
+                }
+            else:
+                status[key] = {
+                    "in_pool": False,
+                    "tier": "",
+                    "score": 0,
+                    "entry_price": 0,
+                }
+        return status
+
+    def add_diagnosed_to_pool(self, code: str, name: str, strategy_key: str, score: int, price: float) -> dict | None:
+        """将诊股中高评分的股票加入对应策略池，并生成交易计划
+
+        Args:
+            code: 股票代码
+            name: 股票名称
+            strategy_key: 策略 key (dragon_head/sparrow/turtle/value_invest)
+            score: 诊股时该策略的评分
+            price: 当前价格
+
+        Returns:
+            {success, item, plan} 或 None (策略不存在)
+        """
+        dm = self._get_pool_manager()
+        if dm is None:
+            return {"success": False, "error": "PoolManager 初始化失败"}
+
+        pool = dm.get_pool(strategy_key)
+        if pool is None:
+            return {"success": False, "error": f"未知策略: {strategy_key}"}
+
+        # 检查是否已在池中
+        existing = pool.get(code)
+        if existing and existing.status == "active":
+            return {
+                "success": False,
+                "error": f"已在 {pool.strategy_label} 池中（{existing.tier or '待评估'}层，评分{existing.score:.0f}）",
+            }
+
+        # 加入池
+        try:
+            from .stock_pool import StockPoolItem
+
+            item = StockPoolItem(
+                code=code,
+                name=name,
+                score=float(score),
+                components={"诊断推荐": float(score)},
+                screened_at=datetime.now().strftime("%Y%m%d"),
+                entry_price=round(price, 2),
+                max_price=round(price, 2),
+            )
+            pool.items[code] = item
+            pool.save()
+
+            # 生成交易计划
+            plan = pool.create_trade_plan(code, name, price, float(score))
+
+            return {
+                "success": True,
+                "item": item.to_dict(),
+                "plan": {
+                    "entry_price": plan.entry_price,
+                    "entry_type": plan.entry_type,
+                    "stop_loss": plan.stop_loss,
+                    "stop_loss_pct": plan.stop_loss_pct,
+                    "take_profit_1": plan.take_profit_1,
+                    "take_profit_1_pct": plan.take_profit_1_pct,
+                    "take_profit_2": plan.take_profit_2,
+                    "take_profit_2_pct": plan.take_profit_2_pct,
+                    "position_pct": plan.position_pct,
+                    "risk_reward_ratio": plan.risk_reward_ratio,
+                    "hold_days": plan.hold_days,
+                    "reasons": plan.reasons,
+                    "warnings": plan.warnings,
+                    "created_at": plan.created_at,
+                },
+            }
+        except Exception as e:
+            logger.error(f"加入策略池失败: {e}")
+            return {"success": False, "error": str(e)}
 
     # ── 数据质量评估 ───────────────────────────────────
 
     def _assess_data_quality(
-        self, tech: TechDiagnosis, fund: FundamentalDiagnosis,
-        cap: CapitalDiagnosis, market: MarketContext,
+        self,
+        tech: TechDiagnosis,
+        fund: FundamentalDiagnosis,
+        cap: CapitalDiagnosis,
+        market: MarketContext,
     ) -> str:
         """评估整体数据质量"""
         missing = []
@@ -1436,10 +1406,10 @@ class StockDiagnoser:
         """解析股票名称"""
         try:
             from .data_manager import DataFetcher
+
             fetcher = DataFetcher()
             df = fetcher.fetch_stock_list()
             if df is not None and not df.empty:
-                cols = df.columns
                 mask = None
                 for c in ["代码", "code", "symbol"]:
                     if c in df.columns:
@@ -1459,7 +1429,7 @@ class StockDiagnoser:
         return "未知板块"
 
     @staticmethod
-    def _safe_float(val) -> Optional[float]:
+    def _safe_float(val) -> float | None:
         """安全转换为 float"""
         if val is None:
             return None
@@ -1484,7 +1454,7 @@ class StockDiagnoser:
 
 
 # ─── 模块级单例 ────────────────────────────────────────────
-_diagnoser: Optional[StockDiagnoser] = None
+_diagnoser: StockDiagnoser | None = None
 
 
 def get_diagnoser() -> StockDiagnoser:

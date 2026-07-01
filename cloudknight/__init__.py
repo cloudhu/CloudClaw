@@ -8,7 +8,9 @@ CloudKnight - 云侠量化交易系统 [AKQuant 高性能引擎]
   - A股时间周期驱动的实时交易引擎
 """
 
-from .version import get_version, get_semver, SemVer
+from .version import SemVer as SemVer
+from .version import get_semver as get_semver
+from .version import get_version
 
 __version__ = get_version()
 __author__ = "CloudKnight"

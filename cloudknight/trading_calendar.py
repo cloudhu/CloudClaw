@@ -11,10 +11,11 @@ A股交易时间周期:
   - 15:00-次日   盘后选股 (PostMarket)
 """
 
-from datetime import datetime, date, time, timedelta
-from enum import Enum
-from typing import Optional, Tuple, List
 import logging
+from datetime import date, datetime, time, timedelta
+from enum import Enum
+
+import pandas as pd
 
 try:
     import akshare as ak
@@ -26,14 +27,15 @@ logger = logging.getLogger(__name__)
 
 class TradingPhase(Enum):
     """交易时间段枚举"""
-    CLOSED = "closed"           # 非交易日 / 休市
-    PRE_MARKET = "pre_market"   # 盘前 08:30-09:15
-    AUCTION = "auction"         # 集合竞价 09:15-09:25
+
+    CLOSED = "closed"  # 非交易日 / 休市
+    PRE_MARKET = "pre_market"  # 盘前 08:30-09:15
+    AUCTION = "auction"  # 集合竞价 09:15-09:25
     AUCTION_RESULT = "auction_result"  # 竞价结果 09:26-09:29
-    MORNING = "morning"         # 早盘 09:30-11:30
-    LUNCH = "lunch"             # 午休 11:30-13:00
-    AFTERNOON = "afternoon"     # 午盘 13:00-15:00
-    POST_MARKET = "post_market" # 盘后 15:00-次日
+    MORNING = "morning"  # 早盘 09:30-11:30
+    LUNCH = "lunch"  # 午休 11:30-13:00
+    AFTERNOON = "afternoon"  # 午盘 13:00-15:00
+    POST_MARKET = "post_market"  # 盘后 15:00-次日
 
     def is_trading_phase(self) -> bool:
         """是否处于可交易时间段"""
@@ -60,10 +62,10 @@ class TradingCalendar:
     """A股交易日历管理器"""
 
     def __init__(self):
-        self._trading_dates: List[date] = []
-        self._cache_year: Optional[int] = None
+        self._trading_dates: list[date] = []
+        self._cache_year: int | None = None
 
-    def is_trading_day(self, dt: Optional[datetime] = None) -> bool:
+    def is_trading_day(self, dt: datetime | None = None) -> bool:
         """判断是否为交易日
 
         Args:
@@ -89,10 +91,7 @@ class TradingCalendar:
                 df = ak.tool_trade_date_hist_sina()
                 if df is not None and not df.empty:
                     dates_col = df.columns[0]
-                    all_dates = set(
-                        d.date() if hasattr(d, 'date') else d
-                        for d in pd.to_datetime(df[dates_col]).tolist()
-                    )
+                    all_dates = {d.date() if hasattr(d, "date") else d for d in pd.to_datetime(df[dates_col]).tolist()}
                     self._trading_dates = sorted(all_dates)
                     return d in all_dates
             except Exception as e:
@@ -100,7 +99,7 @@ class TradingCalendar:
 
         return False
 
-    def _get_trading_dates(self, year: int) -> List[date]:
+    def _get_trading_dates(self, year: int) -> list[date]:
         """获取指定年份的交易日列表（缓存）"""
         if self._cache_year == year and self._trading_dates:
             return self._trading_dates
@@ -109,12 +108,12 @@ class TradingCalendar:
         if ak is not None:
             try:
                 import pandas as pd
+
                 df = ak.tool_trade_date_hist_sina()
                 if df is not None and not df.empty:
                     dates_col = df.columns[0]
                     all_dates = sorted(
-                        d.date() if hasattr(d, 'date') else d
-                        for d in pd.to_datetime(df[dates_col]).tolist()
+                        d.date() if hasattr(d, "date") else d for d in pd.to_datetime(df[dates_col]).tolist()
                     )
                     dates = [d for d in all_dates if d.year == year]
                     self._trading_dates = sorted(all_dates)
@@ -133,7 +132,7 @@ class TradingCalendar:
 
         return dates
 
-    def get_next_trading_day(self, dt: Optional[datetime] = None) -> date:
+    def get_next_trading_day(self, dt: datetime | None = None) -> date:
         """获取下一个交易日"""
         if dt is None:
             dt = datetime.now()
@@ -142,7 +141,7 @@ class TradingCalendar:
             d += timedelta(days=1)
         return d
 
-    def get_previous_trading_day(self, dt: Optional[datetime] = None) -> date:
+    def get_previous_trading_day(self, dt: datetime | None = None) -> date:
         """获取上一个交易日"""
         if dt is None:
             dt = datetime.now()
@@ -151,7 +150,7 @@ class TradingCalendar:
             d -= timedelta(days=1)
         return d
 
-    def get_current_phase(self, dt: Optional[datetime] = None) -> TradingPhase:
+    def get_current_phase(self, dt: datetime | None = None) -> TradingPhase:
         """获取当前所处的交易时间段"""
         if dt is None:
             dt = datetime.now()
@@ -179,7 +178,7 @@ class TradingCalendar:
         # 00:00-08:29，交易日但交易所未开盘，返回休市
         return TradingPhase.CLOSED
 
-    def time_until_next_phase(self, dt: Optional[datetime] = None) -> Optional[Tuple[TradingPhase, int]]:
+    def time_until_next_phase(self, dt: datetime | None = None) -> tuple[TradingPhase, int] | None:
         """计算距离下一阶段还有多少秒
 
         Returns:
@@ -218,8 +217,7 @@ class TradingCalendar:
         seconds = int((target - dt).total_seconds())
         return TradingPhase.PRE_MARKET, seconds
 
-    def is_within_window(self, start_time: time, end_time: time,
-                         dt: Optional[datetime] = None) -> bool:
+    def is_within_window(self, start_time: time, end_time: time, dt: datetime | None = None) -> bool:
         """判断当前是否在指定时间窗口内"""
         if dt is None:
             dt = datetime.now()

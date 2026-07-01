@@ -5,7 +5,7 @@
   StockPoolItem        - 池中单只股票（含评分明细）
   StrategyStockPool    - 单策略股票池（筛选/评分/排序/持久化）
   PoolManager          - 全局池管理器（统一调度）
-  
+
 四种策略的评分器：
   DragonHeadScorer     - 龙头战法：涨停连板 + 换手 + 量比 + 封板 + 资金
   SparrowScorer        - 麻雀战法：均线多头 + KDJ金叉 + 回调 + RSI
@@ -14,30 +14,29 @@
 """
 
 import json
-import os
 import logging
-from datetime import datetime
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Callable
+from datetime import datetime
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from .config import DATA_DIR, STRATEGIES
-from .indicators import calc_ma, calc_macd, calc_kdj, calc_rsi, calc_atr, calc_breakout
+from .indicators import calc_atr, calc_breakout, calc_kdj, calc_ma, calc_rsi
 
 logger = logging.getLogger(__name__)
 
 POOL_DIR = os.path.join(DATA_DIR, "pools")
 os.makedirs(POOL_DIR, exist_ok=True)
 
-MAX_POOL_SIZE = 30         # 每种策略池最多保留 30 只
-SCREEN_SAMPLE_SIZE = 200   # 一次筛选最多遍历 200 只
+MAX_POOL_SIZE = 30  # 每种策略池最多保留 30 只
+SCREEN_SAMPLE_SIZE = 200  # 一次筛选最多遍历 200 只
 
 # 层级定义
-TIER_FOCUS = "focus"       # 精选层：评分 ≥ 80，可直接候选开仓
-TIER_WATCH = "watch"       # 观察层：评分 60-80，持续跟踪等待信号
-TIER_BROAD = "broad"       # 备选层：评分 40-60，潜力储备
+TIER_FOCUS = "focus"  # 精选层：评分 ≥ 80，可直接候选开仓
+TIER_WATCH = "watch"  # 观察层：评分 60-80，持续跟踪等待信号
+TIER_BROAD = "broad"  # 备选层：评分 40-60，潜力储备
 TIER_ELIMINATED = "eliminated"  # 淘汰层：已剔除
 
 TIER_THRESHOLDS = {
@@ -54,36 +53,70 @@ TIER_LABELS = {
 }
 
 # 淘汰条件阈值
-ELIMINATE_DRAWDOWN = -8.0     # 累计跌幅超过 8% 淘汰
-ELIMINATE_SCORE_FLOOR = 30    # 评分低于 30 分淘汰
-ELIMINATE_DAYS_STALE = 20     # 入池超过 N 天仍未晋级则淘汰
+ELIMINATE_DRAWDOWN = -8.0  # 累计跌幅超过 8% 淘汰
+ELIMINATE_SCORE_FLOOR = 30  # 评分低于 30 分淘汰
+ELIMINATE_DAYS_STALE = 20  # 入池超过 N 天仍未晋级则淘汰
 
 # 维护频率（按策略）
 MAINTENANCE_INTERVALS = {
-    "dragon_head": 1,      # 龙头：每日
-    "sparrow": 2,          # 麻雀：每2天
-    "turtle": 5,           # 海龟：每周(5个交易日)
-    "value_invest": 10,    # 价值：每2周
+    "dragon_head": 1,  # 龙头：每日
+    "sparrow": 2,  # 麻雀：每2天
+    "turtle": 5,  # 海龟：每周(5个交易日)
+    "value_invest": 10,  # 价值：每2周
+    "bollinger": 3,  # 布林带：每3天
+    "grid": 3,  # 网格：每3天
+    "ma_cross": 3,  # 均线：每3天
+    "volume_breakout": 2,  # 量价：每2天
+    "trend_accel": 3,  # 趋势加速：每3天
 }
+
+
+# ─── 交易计划 ──────────────────────────────────────────
+
+
+@dataclass
+class TradePlan:
+    """策略股票池中个股的交易计划"""
+
+    strategy_key: str
+    strategy_name: str
+    code: str
+    name: str
+    entry_price: float  # 建议入场价
+    entry_type: str  # 入场方式: 现价/限价/突破
+    stop_loss: float  # 止损价
+    stop_loss_pct: float  # 止损幅度 %
+    take_profit_1: float  # 第一止盈价
+    take_profit_1_pct: float  # 第一止盈幅度 %
+    take_profit_2: float  # 第二止盈价
+    take_profit_2_pct: float  # 第二止盈幅度 %
+    position_pct: float  # 建议仓位占比（总资金的 %）
+    risk_reward_ratio: float  # 风险收益比
+    hold_days: int  # 建议持仓天数
+    reasons: list[str] = field(default_factory=list)  # 交易理由
+    warnings: list[str] = field(default_factory=list)  # 风险提示
+    created_at: str = ""
 
 
 # ─── 数据结构 ─────────────────────────────────────────────
 
+
 @dataclass
 class StockPoolItem:
     """股票池中的单只股票"""
+
     code: str
     name: str
-    score: float                           # 综合评分 0-100
-    components: Dict[str, float] = field(default_factory=dict)  # 各维度得分
-    screened_at: str = ""                  # 入池日期
-    status: str = "active"                 # active | traded | removed
-    entry_price: float = 0.0               # 入池时的收盘价
-    max_price: float = 0.0                 # 入池后最高收盘价
-    tier: str = ""                         # 层级: focus/watch/broad/eliminated
-    evaluated_at: str = ""                 # 上次评估日期
+    score: float  # 综合评分 0-100
+    components: dict[str, float] = field(default_factory=dict)  # 各维度得分
+    screened_at: str = ""  # 入池日期
+    status: str = "active"  # active | traded | removed
+    entry_price: float = 0.0  # 入池时的收盘价
+    max_price: float = 0.0  # 入池后最高收盘价
+    tier: str = ""  # 层级: focus/watch/broad/eliminated
+    evaluated_at: str = ""  # 上次评估日期
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         d = {
             "code": self.code,
             "name": self.name,
@@ -102,10 +135,13 @@ class StockPoolItem:
         return d
 
     @classmethod
-    def from_dict(cls, d: Dict) -> "StockPoolItem":
+    def from_dict(cls, d: dict) -> "StockPoolItem":
         return cls(
-            code=d["code"], name=d.get("name", ""), score=d.get("score", 0),
-            components=d.get("components", {}), screened_at=d.get("screened_at", ""),
+            code=d["code"],
+            name=d.get("name", ""),
+            score=d.get("score", 0),
+            components=d.get("components", {}),
+            screened_at=d.get("screened_at", ""),
             status=d.get("status", "active"),
             entry_price=d.get("entry_price", 0.0),
             max_price=d.get("max_price", 0.0),
@@ -138,12 +174,13 @@ class StockPoolItem:
 
 # ─── 评分器基类 ──────────────────────────────────────────
 
+
 class BaseScorer:
     """评分器基类"""
+
     name: str = "base"
 
-    def score(self, code: str, name: str, df: pd.DataFrame,
-              extra: Dict = None) -> StockPoolItem:
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
         """返回 StockPoolItem，含综合分和各维度明细"""
         raise NotImplementedError
 
@@ -163,16 +200,14 @@ class BaseScorer:
             pass
         return float(default)
 
-    def _linear_score(self, val: float, low: float, high: float,
-                      floor: float = 0, ceil: float = 100) -> float:
+    def _linear_score(self, val: float, low: float, high: float, floor: float = 0, ceil: float = 100) -> float:
         """线性映射 val ∈ [low, high] → [0, 1]，再拉伸到 [floor, ceil]"""
         if high <= low:
             return floor
         ratio = max(0, min(1, (val - low) / (high - low)))
         return round(floor + ratio * (ceil - floor), 1)
 
-    def _bell_score(self, val: float, low: float, mid: float, high: float,
-                    max_pts: float = 100) -> float:
+    def _bell_score(self, val: float, low: float, mid: float, high: float, max_pts: float = 100) -> float:
         """钟形得分：在 mid 附近最高，两端递减"""
         if val < low or val > high:
             return 0
@@ -184,18 +219,19 @@ class BaseScorer:
 
 # ─── 龙头战法评分器 ──────────────────────────────────────
 
+
 class DragonHeadScorer(BaseScorer):
     """龙头战法评分：涨停连板 + 换手 + 量比 + 封板强度 + 资金流向"""
+
     name = "dragon_head"
 
-    def score(self, code: str, name: str, df: pd.DataFrame,
-              extra: Dict = None) -> StockPoolItem:
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
         if df.empty or len(df) < 5:
             return StockPoolItem(code=code, name=name, score=0, components={})
 
         latest = df.iloc[-1]
         close = self._safe_val(latest, "close", "收盘")
-        open_p = self._safe_val(latest, "open", "开盘")
+        self._safe_val(latest, "open", "开盘")
         high = self._safe_val(latest, "high", "最高")
         low = self._safe_val(latest, "low", "最低")
         volume = self._safe_val(latest, "volume", "成交量")
@@ -226,7 +262,7 @@ class DragonHeadScorer(BaseScorer):
             accel_score = 15
         elif limit_days >= 2 and vol_ratio < 1.5:
             accel_score = 10
-        elif is_limit_up := (pct >= 9.5):
+        elif pct >= 9.5:
             accel_score = 8
         else:
             accel_score = 0
@@ -240,9 +276,13 @@ class DragonHeadScorer(BaseScorer):
         }
         total = sum(comp.values())
         return StockPoolItem(
-            code=code, name=name, score=round(total, 1),
-            components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
-            entry_price=round(close, 2), max_price=round(close, 2),
+            code=code,
+            name=name,
+            score=round(total, 1),
+            components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2),
+            max_price=round(close, 2),
         )
 
     def _count_limit_days(self, df: pd.DataFrame) -> int:
@@ -258,12 +298,13 @@ class DragonHeadScorer(BaseScorer):
 
 # ─── 麻雀战法评分器 ──────────────────────────────────────
 
+
 class SparrowScorer(BaseScorer):
     """麻雀战法评分：均线多头 + KDJ金叉 + 回调支撑 + RSI"""
+
     name = "sparrow"
 
-    def score(self, code: str, name: str, df: pd.DataFrame,
-              extra: Dict = None) -> StockPoolItem:
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
         if df.empty or len(df) < 60:
             return StockPoolItem(code=code, name=name, score=0, components={})
 
@@ -278,7 +319,7 @@ class SparrowScorer(BaseScorer):
         ma10 = latest.get("MA10", 0)
         ma20 = latest.get("MA20", 0)
         rsi = latest.get("RSI", 50)
-        k, d, j = latest["K"], latest["D"], latest["J"]
+        k, d, _j = latest["K"], latest["D"], latest["J"]
 
         # 1. 均线多头排列 (25分)
         if ma5 > ma10 > ma20:
@@ -299,7 +340,7 @@ class SparrowScorer(BaseScorer):
             else:
                 kdj_score = 12
         elif k > d:
-            kdj_score = 8   # 已处于多头但未金叉
+            kdj_score = 8  # 已处于多头但未金叉
         else:
             kdj_score = 0
 
@@ -325,9 +366,13 @@ class SparrowScorer(BaseScorer):
         }
         total = sum(comp.values())
         return StockPoolItem(
-            code=code, name=name, score=round(total, 1),
-            components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
-            entry_price=round(close, 2), max_price=round(close, 2),
+            code=code,
+            name=name,
+            score=round(total, 1),
+            components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2),
+            max_price=round(close, 2),
         )
 
     def _volume_price_score(self, df: pd.DataFrame, window: int = 3) -> float:
@@ -341,13 +386,13 @@ class SparrowScorer(BaseScorer):
             if len(pct_changes) == 0:
                 return 7.5
             align = 0
-            for pc, vc in zip(pct_changes, vol_changes):
+            for pc, vc in zip(pct_changes, vol_changes, strict=False):
                 if pc > 0 and vc > 0:
-                    align += 1     # 价量同向：好
+                    align += 1  # 价量同向：好
                 elif pc < 0 and vc < 0:
-                    align += 0.5   # 缩量下跌：中性偏多
+                    align += 0.5  # 缩量下跌：中性偏多
                 elif pc > 0 and vc < 0:
-                    align += 0.3   # 缩量上涨：一般
+                    align += 0.3  # 缩量上涨：一般
                 # 价跌量增：不加分
             return round(align / len(pct_changes) * 15, 1)
         except Exception:
@@ -356,12 +401,13 @@ class SparrowScorer(BaseScorer):
 
 # ─── 海龟战法评分器 ──────────────────────────────────────
 
+
 class TurtleScorer(BaseScorer):
     """海龟战法评分：通道突破 + ATR波动率 + 趋势 + 流动性"""
+
     name = "turtle"
 
-    def score(self, code: str, name: str, df: pd.DataFrame,
-              extra: Dict = None) -> StockPoolItem:
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
         if df.empty or len(df) < 100:
             return StockPoolItem(code=code, name=name, score=0, components={})
 
@@ -374,7 +420,7 @@ class TurtleScorer(BaseScorer):
         current_atr = atr_series.iloc[-1]
 
         # 通道
-        upper, lower = calc_breakout(df, entry_period)
+        upper, _lower = calc_breakout(df, entry_period)
         entry_upper = upper.iloc[-1]
 
         # MA200
@@ -428,20 +474,25 @@ class TurtleScorer(BaseScorer):
         }
         total = sum(comp.values())
         return StockPoolItem(
-            code=code, name=name, score=round(total, 1),
-            components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
-            entry_price=round(close, 2), max_price=round(close, 2),
+            code=code,
+            name=name,
+            score=round(total, 1),
+            components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2),
+            max_price=round(close, 2),
         )
 
 
 # ─── 价值投资评分器 ──────────────────────────────────────
 
+
 class ValueInvestScorer(BaseScorer):
     """价值投资评分：PE/PB分位 + ROE + 股息率 + 负债率"""
+
     name = "value_invest"
 
-    def score(self, code: str, name: str, df: pd.DataFrame,
-              extra: Dict = None) -> StockPoolItem:
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
         extra = extra or {}
         if df.empty or len(df) < 100:
             return StockPoolItem(code=code, name=name, score=0, components={})
@@ -511,13 +562,311 @@ class ValueInvestScorer(BaseScorer):
         }
         total = sum(comp.values())
         return StockPoolItem(
-            code=code, name=name, score=round(total, 1),
-            components=comp, screened_at=datetime.now().strftime("%Y%m%d"),
+            code=code,
+            name=name,
+            score=round(total, 1),
+            components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2),
+            max_price=round(close, 2),
+        )
+
+
+# ─── 布林带回归评分器 ────────────────────────────────────
+
+
+class BollingerBandScorer(BaseScorer):
+    """布林带回归评分：%B位置 + 带宽 + RSI"""
+
+    name = "bollinger"
+
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
+        if df.empty or len(df) < 25:
+            return StockPoolItem(code=code, name=name, score=0, components={})
+
+        latest = df.iloc[-1]
+        close = latest["close"]
+        closes = df["close"].values.astype(float)
+        volumes = df["volume"].values.astype(float) if "volume" in df.columns else np.array([0])
+
+        # 布林带计算
+        period = 20
+        mid = np.mean(closes[-period:]) if len(closes) >= period else close
+        std = np.std(closes[-period:]) if len(closes) >= period else 0
+        upper = mid + 2 * std
+        lower = mid - 2 * std
+        band_range = upper - lower
+        percent_b = (close - lower) / band_range if band_range > 0 else 0.5
+        bandwidth = band_range / mid * 100 if mid > 0 else 0
+
+        # RSI
+        rsi = self._safe_val(latest, "RSI", "rsi", default=50.0)
+
+        # 1. %B位置 (35分): 越低越好
+        bb_score = self._linear_score(percent_b, 1.0, 0.0, 0, 35) if percent_b <= 0.5 else self._linear_score(percent_b, 1.0, 0.5, 35, 0)
+
+        # 2. 带宽 (25分): 适中
+        bw_score = self._bell_score(bandwidth, 3, 10, 30, 25)
+
+        # 3. RSI超卖 (20分): 越低越好
+        rsi_score = self._linear_score(rsi, 50, 25, 0, 20)
+
+        # 4. 量能 (20分)
+        vol = volumes[-1] if len(volumes) > 0 else 0
+        avg_vol = np.mean(volumes[-6:-1]) if len(volumes) >= 6 else vol
+        vol_ratio = vol / avg_vol if avg_vol > 0 else 1
+        vol_score = self._bell_score(vol_ratio, 0.5, 1.5, 3.0, 20)
+
+        comp = {
+            "%B低位": round(bb_score, 1),
+            "带宽适中": round(bw_score, 1),
+            "RSI超卖": round(rsi_score, 1),
+            "量能": round(vol_score, 1),
+        }
+        total = sum(comp.values())
+        return StockPoolItem(
+            code=code, name=name, score=round(total, 1), components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
+        )
+
+
+# ─── 网格交易评分器 ──────────────────────────────────────
+
+
+class GridScorer(BaseScorer):
+    """网格交易评分：价格位置 + 波动率 + RSI"""
+
+    name = "grid"
+
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
+        if df.empty or len(df) < 60:
+            return StockPoolItem(code=code, name=name, score=0, components={})
+
+        df = calc_ma(df, [60])
+        latest = df.iloc[-1]
+        close = latest["close"]
+        ma60 = latest.get("MA60", close)
+        rsi = self._safe_val(latest, "RSI", "rsi", default=50.0)
+
+        # ATR
+        closes = df["close"].values.astype(float)
+        highs = df["high"].values.astype(float)
+        lows = df["low"].values.astype(float)
+        atr_series = calc_atr(df, 20)
+        atr = float(atr_series.iloc[-1]) if len(atr_series) > 0 else 0
+
+        # 1. MA60偏离 (30分): 偏离适中最佳
+        dist_ma60 = (close - ma60) / ma60 * 100 if ma60 > 0 else 0
+        grid_score = self._bell_score(abs(dist_ma60), 2, 8, 20, 30)
+
+        # 2. 波动率 (25分): 适度波动
+        if close > 0 and atr > 0:
+            atr_pct = atr / close * 100
+            atr_score = self._bell_score(atr_pct, 0.8, 3, 7, 25)
+        else:
+            atr_score = 12
+
+        # 3. RSI超卖 (25分): 低吸判断
+        rsi_score = self._linear_score(rsi, 50, 25, 0, 25)
+
+        # 4. 成交量 (20分)
+        volumes = df["volume"].values.astype(float)
+        avg_vol = np.mean(volumes[-20:]) if len(volumes) >= 20 else volumes[-1]
+        vol_stable = volumes[-1] / avg_vol if avg_vol > 0 else 1
+        stable_score = self._bell_score(vol_stable, 0.5, 1.0, 2.0, 20)
+
+        comp = {
+            "MA60偏离": round(grid_score, 1),
+            "波动适中": round(atr_score, 1),
+            "RSI低位": round(rsi_score, 1),
+            "量能稳定": round(stable_score, 1),
+        }
+        total = sum(comp.values())
+        return StockPoolItem(
+            code=code, name=name, score=round(total, 1), components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
+        )
+
+
+# ─── 均线交叉评分器 ──────────────────────────────────────
+
+
+class MACrossoverScorer(BaseScorer):
+    """均线交叉评分：金叉信号 + 趋势 + RSI"""
+
+    name = "ma_cross"
+
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
+        if df.empty or len(df) < 60:
+            return StockPoolItem(code=code, name=name, score=0, components={})
+
+        df = calc_ma(df, [10, 30, 60])
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        close = latest["close"]
+        ma10 = latest.get("MA10", 0)
+        ma30 = latest.get("MA30", 0)
+        ma60 = latest.get("MA60", 0)
+        rsi = self._safe_val(latest, "RSI", "rsi", default=50.0)
+
+        # 1. 金叉信号 (30分)
+        prev_ma10 = prev.get("MA10", ma10)
+        prev_ma30 = prev.get("MA30", ma30)
+        golden = prev_ma10 <= prev_ma30 and ma10 > ma30
+        if golden:
+            cross_score = 30
+        elif ma10 > ma30:
+            cross_score = 15
+        else:
+            cross_score = 0
+
+        # 2. 趋势强度 (25分)
+        if ma60 > 0 and close > ma60:
+            trend_score = 25
+        elif ma60 > 0:
+            trend_score = 5
+        else:
+            trend_score = 10
+
+        # 3. RSI合理 (25分)
+        rsi_score = self._bell_score(rsi, 30, 50, 75, 25)
+
+        # 4. 量能确认 (20分)
+        volumes = df["volume"].values.astype(float)
+        avg_vol = np.mean(volumes[-6:-1]) if len(volumes) >= 6 else volumes[-1]
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
+        vol_score = self._bell_score(vol_ratio, 0.5, 1.5, 3.0, 20)
+
+        comp = {
+            "金叉信号": round(cross_score, 1),
+            "趋势强度": round(trend_score, 1),
+            "RSI": round(rsi_score, 1),
+            "量能确认": round(vol_score, 1),
+        }
+        total = sum(comp.values())
+        return StockPoolItem(
+            code=code, name=name, score=round(total, 1), components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
+        )
+
+
+# ─── 量价突破评分器 ──────────────────────────────────────
+
+
+class VolumeBreakoutScorer(BaseScorer):
+    """量价突破评分：突破强度 + 量比 + RSI + MA确认"""
+
+    name = "volume_breakout"
+
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
+        if df.empty or len(df) < 30:
+            return StockPoolItem(code=code, name=name, score=0, components={})
+
+        df = calc_ma(df, [20])
+        latest = df.iloc[-1]
+        close = latest["close"]
+        high = latest["high"]
+        ma20 = latest.get("MA20", close)
+        rsi = self._safe_val(latest, "RSI", "rsi", default=50.0)
+
+        # 突破距离
+        highs = df["high"].values.astype(float)
+        recent_high = float(np.max(highs[-21:-1])) if len(highs) >= 21 else high
+        breakout_pct = (close - recent_high) / recent_high * 100 if recent_high > 0 else 0
+
+        # 量比
+        volumes = df["volume"].values.astype(float)
+        avg_vol = np.mean(volumes[-21:-1]) if len(volumes) >= 21 else volumes[-1]
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
+
+        # 1. 突破强度 (30分)
+        break_score = self._linear_score(breakout_pct, -3, 3, 0, 30)
+
+        # 2. 量比 (30分)
+        vol_score = self._bell_score(vol_ratio, 0.5, 2.0, 5.0, 30)
+
+        # 3. RSI动量 (20分)
+        rsi_score = self._bell_score(rsi, 40, 60, 80, 20)
+
+        # 4. MA20确认 (20分)
+        ma_score = 20 if close > ma20 and ma20 > 0 else (10 if ma20 > 0 else 5)
+
+        comp = {
+            "突破强度": round(break_score, 1),
+            "量比放大": round(vol_score, 1),
+            "RSI动量": round(rsi_score, 1),
+            "均线站位": round(ma_score, 1),
+        }
+        total = sum(comp.values())
+        return StockPoolItem(
+            code=code, name=name, score=round(total, 1), components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
+            entry_price=round(close, 2), max_price=round(close, 2),
+        )
+
+
+# ─── 趋势加速评分器 ──────────────────────────────────────
+
+
+class TrendAccelerationScorer(BaseScorer):
+    """趋势加速评分：EMA排列 + 加速度 + 回调位置 + RSI"""
+
+    name = "trend_accel"
+
+    def score(self, code: str, name: str, df: pd.DataFrame, extra: dict | None = None) -> StockPoolItem:
+        if df.empty or len(df) < 80:
+            return StockPoolItem(code=code, name=name, score=0, components={})
+
+        df = calc_ma(df, [5, 10, 20, 60, 120])
+        latest = df.iloc[-1]
+        close = latest["close"]
+        ma5 = latest.get("MA5", 0)
+        ma10 = latest.get("MA10", 0)
+        ma20 = latest.get("MA20", 0)
+        ma60 = latest.get("MA60", 0)
+        ma120 = latest.get("MA120", 0)
+        rsi = self._safe_val(latest, "RSI", "rsi", default=50.0)
+
+        # 1. EMA多头排列 (30分): 多周期MA排列
+        mas = [(5, ma5), (10, ma10), (20, ma20), (60, ma60)]
+        aligned = sum(1 for i in range(len(mas) - 1) if mas[i][1] > 0 and mas[i + 1][1] > 0 and mas[i][1] > mas[i + 1][1])
+        align_score = self._linear_score(aligned, 0, 3, 0, 30)
+
+        # 2. 趋势位置 (25分): vs MA120
+        if ma120 > 0:
+            trend_score = self._linear_score((close - ma120) / ma120 * 100, 0, 30, 5, 25)
+        else:
+            trend_score = 10
+
+        # 3. 回调深度 (25分): 距MA20
+        if ma20 > 0:
+            pullback = abs(close / ma20 - 1) * 100
+            pb_score = self._bell_score(pullback, 0.5, 3, 10, 25)
+        else:
+            pb_score = 12
+
+        # 4. RSI位置 (20分)
+        rsi_score = self._bell_score(rsi, 35, 50, 70, 20)
+
+        comp = {
+            "EMA排列": round(align_score, 1),
+            "趋势位置": round(trend_score, 1),
+            "回调深度": round(pb_score, 1),
+            "RSI": round(rsi_score, 1),
+        }
+        total = sum(comp.values())
+        return StockPoolItem(
+            code=code, name=name, score=round(total, 1), components=comp,
+            screened_at=datetime.now().strftime("%Y%m%d"),
             entry_price=round(close, 2), max_price=round(close, 2),
         )
 
 
 # ─── 策略股票池 ──────────────────────────────────────────
+
 
 class StrategyStockPool:
     """单个策略的股票池"""
@@ -526,17 +875,18 @@ class StrategyStockPool:
         self.strategy_key = strategy_key
         self.strategy_label = strategy_label
         self.scorer = scorer
-        self.items: Dict[str, StockPoolItem] = {}   # code → item
-        self.last_screened: Optional[str] = None
+        self.items: dict[str, StockPoolItem] = {}  # code → item
+        self.last_screened: str | None = None
         self._file = os.path.join(POOL_DIR, f"{strategy_key}.json")
 
     def _get_fetcher(self):
         from .data_manager import DataFetcher
+
         return DataFetcher()
 
-    def screen(self, stock_pool: List[str] = None,
-               stock_info: pd.DataFrame = None,
-               verbose: bool = False) -> List[StockPoolItem]:
+    def screen(
+        self, stock_pool: list[str] | None = None, stock_info: pd.DataFrame = None, verbose: bool = False
+    ) -> list[StockPoolItem]:
         """
         从股票池中筛选并评分的个股，加入策略池。
 
@@ -558,15 +908,12 @@ class StrategyStockPool:
 
         name_map = {}
         if not stock_info.empty:
-            name_map = dict(zip(
-                stock_info["股票代码"].astype(str),
-                stock_info["股票简称"].astype(str)
-            ))
+            name_map = dict(zip(stock_info["股票代码"].astype(str), stock_info["股票简称"].astype(str), strict=False))
 
         if verbose:
             logger.info(f"  [{self.strategy_label}] 开始筛选，候选 {len(sample)} 只...")
 
-        candidates: List[StockPoolItem] = []
+        candidates: list[StockPoolItem] = []
         screened = 0
 
         for code in sample:
@@ -605,20 +952,27 @@ class StrategyStockPool:
         self.last_screened = datetime.now().strftime("%Y%m%d")
 
         if verbose:
-            logger.info(f"  [{self.strategy_label}] 筛选完成: {screened} 只达标, "
-                        f"保留 Top {len(self.items)}")
+            logger.info(f"  [{self.strategy_label}] 筛选完成: {screened} 只达标, 保留 Top {len(self.items)}")
 
         # 自动保存
         self.save()
         return self.ranked()
 
     def _normalize_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-                   "最低": "low", "成交量": "volume", "成交额": "amount",
-                   "涨跌幅": "pct_change", "换手率": "turnover"}
+        col_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "涨跌幅": "pct_change",
+            "换手率": "turnover",
+        }
         return df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
-    def _get_finance_extra(self, fetcher, code: str) -> Dict:
+    def _get_finance_extra(self, fetcher, code: str) -> dict:
         """获取价值投资评分需要的财务数据"""
         try:
             fin = fetcher.fetch_financial_data(code)
@@ -651,24 +1005,25 @@ class StrategyStockPool:
 
     # ─── 池操作 ──────────────────────────────────────
 
-    def ranked(self, min_score: float = 0) -> List[StockPoolItem]:
+    def ranked(self, min_score: float = 0) -> list[StockPoolItem]:
         """返回按评分降序的股票列表"""
         items = [it for it in self.items.values() if it.status == "active" and it.score >= min_score]
         items.sort(key=lambda x: x.score, reverse=True)
         return items
 
-    def top_codes(self, n: int = 10, min_score: float = 30) -> List[str]:
+    def top_codes(self, n: int = 10, min_score: float = 30) -> list[str]:
         """返回 Top N 股票代码"""
         return [it.code for it in self.ranked(min_score)[:n]]
 
-    def get(self, code: str) -> Optional[StockPoolItem]:
+    def get(self, code: str) -> StockPoolItem | None:
         return self.items.get(code)
 
-    def add(self, code: str, name: str, score: float = 0,
-            components: Dict = None):
+    def add(self, code: str, name: str, score: float = 0, components: dict | None = None):
         """手动添加"""
         self.items[code] = StockPoolItem(
-            code=code, name=name, score=score,
+            code=code,
+            name=name,
+            score=score,
             components=components or {},
             screened_at=datetime.now().strftime("%Y%m%d"),
         )
@@ -692,7 +1047,7 @@ class StrategyStockPool:
     def size(self) -> int:
         return sum(1 for it in self.items.values() if it.status == "active")
 
-    def summary(self) -> Dict:
+    def summary(self) -> dict:
         top = self.ranked()[:5]
         return {
             "strategy": self.strategy_label,
@@ -721,7 +1076,7 @@ class StrategyStockPool:
         if not os.path.exists(self._file):
             return False
         try:
-            with open(self._file, "r", encoding="utf-8") as f:
+            with open(self._file, encoding="utf-8") as f:
                 data = json.load(f)
             self.last_screened = data.get("last_screened")
             self.items = {}
@@ -733,9 +1088,9 @@ class StrategyStockPool:
             logger.warning(f"加载池 {self.strategy_key} 失败: {e}")
             return False
 
-    def refresh_gains(self, verbose: bool = False) -> Dict[str, Dict]:
+    def refresh_gains(self, verbose: bool = False) -> dict[str, dict]:
         """刷新池内所有股票的涨幅数据（累计/当日/最大）
-        
+
         对于没有 entry_price 的旧数据，自动从入池日K线回填。
         返回: {code: {cumulative_gain_pct, daily_gain_pct, max_gain_pct}}
         """
@@ -816,7 +1171,7 @@ class StrategyStockPool:
 
     # ─── 层级评估与池维护 ────────────────────────────
 
-    def evaluate_pool(self, verbose: bool = False) -> Dict[str, List[str]]:
+    def evaluate_pool(self, verbose: bool = False) -> dict[str, list[str]]:
         """评估池内所有标的，分配层级（focus/watch/broad/eliminated）
 
         流程：
@@ -830,9 +1185,7 @@ class StrategyStockPool:
         gains = self.refresh_gains(verbose=False)
 
         today = datetime.now().strftime("%Y%m%d")
-        result: Dict[str, List[str]] = {
-            TIER_FOCUS: [], TIER_WATCH: [], TIER_BROAD: [], TIER_ELIMINATED: []
-        }
+        result: dict[str, list[str]] = {TIER_FOCUS: [], TIER_WATCH: [], TIER_BROAD: [], TIER_ELIMINATED: []}
 
         need_save = False
         elim_count = 0
@@ -856,13 +1209,17 @@ class StrategyStockPool:
                 result[TIER_ELIMINATED].append(item.code)
                 need_save = True
                 if verbose:
-                    reason = f"评分{item.score:.0f}" if item.score < ELIMINATE_SCORE_FLOOR else f"累计跌幅{cum_gain:.1f}%"
+                    reason = (
+                        f"评分{item.score:.0f}" if item.score < ELIMINATE_SCORE_FLOOR else f"累计跌幅{cum_gain:.1f}%"
+                    )
                     logger.info(f"  [{self.strategy_label}] 淘汰 {item.code} {item.name}: {reason}")
             else:
                 if item.tier != new_tier:
                     if verbose and item.tier:
-                        logger.info(f"  [{self.strategy_label}] {item.code} {item.name}: "
-                                    f"{TIER_LABELS.get(item.tier, '?')} → {TIER_LABELS[new_tier]}")
+                        logger.info(
+                            f"  [{self.strategy_label}] {item.code} {item.name}: "
+                            f"{TIER_LABELS.get(item.tier, '?')} → {TIER_LABELS[new_tier]}"
+                        )
                     item.tier = new_tier
                     need_save = True
                 result[new_tier].append(item.code)
@@ -874,12 +1231,136 @@ class StrategyStockPool:
             focus_n = len(result[TIER_FOCUS])
             watch_n = len(result[TIER_WATCH])
             broad_n = len(result[TIER_BROAD])
-            logger.info(f"  [{self.strategy_label}] 评估完成: "
-                        f"精选{focus_n} | 观察{watch_n} | 备选{broad_n} | 淘汰{elim_count}")
+            logger.info(
+                f"  [{self.strategy_label}] 评估完成: 精选{focus_n} | 观察{watch_n} | 备选{broad_n} | 淘汰{elim_count}"
+            )
 
         return result
 
-    def maintenance(self, verbose: bool = False) -> Dict:
+    def create_trade_plan(
+        self, code: str, name: str, current_price: float, score: float, reasons: list[str] | None = None
+    ) -> TradePlan:
+        """根据策略类型生成个股交易计划
+
+        不同策略有不同的入场/止损/止盈/仓位逻辑：
+        - 龙头战法: 短线激进，涨停价入场，-5% 严格止损，+15%/+30% 分批止盈，仓位20%
+        - 麻雀战法: 中线波段，现价入场，MA20-3%止损，+8%/+15%止盈，仓位15%
+        - 海龟战法: 趋势跟踪，突破入场，-2ATR 止损，+3ATR/+6ATR 止盈，仓位10%
+        - 价值投资: 长线布局，现价入场，-10%宽松止损，+20%/+40%止盈，仓位25%
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if self.strategy_key == "dragon_head":
+            return TradePlan(
+                strategy_key=self.strategy_key,
+                strategy_name=self.strategy_label,
+                code=code,
+                name=name,
+                entry_price=round(current_price, 2),
+                entry_type="涨停价入场" if score >= 70 else "现价入场",
+                stop_loss=round(current_price * 0.95, 2),
+                stop_loss_pct=-5.0,
+                take_profit_1=round(current_price * 1.15, 2),
+                take_profit_1_pct=15.0,
+                take_profit_2=round(current_price * 1.30, 2),
+                take_profit_2_pct=30.0,
+                position_pct=20.0,
+                risk_reward_ratio=3.0,
+                hold_days=5,
+                reasons=reasons or [f"龙头战法评分{score:.0f}分", "短线强势追涨"],
+                warnings=["涨停板买入需排队，可能买不到", "严格止损-5%，不可扛单", "不适合重仓"],
+                created_at=now,
+            )
+
+        elif self.strategy_key == "sparrow":
+            return TradePlan(
+                strategy_key=self.strategy_key,
+                strategy_name=self.strategy_label,
+                code=code,
+                name=name,
+                entry_price=round(current_price, 2),
+                entry_type="回调至MA20附近入场",
+                stop_loss=round(current_price * 0.93, 2),
+                stop_loss_pct=-7.0,
+                take_profit_1=round(current_price * 1.08, 2),
+                take_profit_1_pct=8.0,
+                take_profit_2=round(current_price * 1.15, 2),
+                take_profit_2_pct=15.0,
+                position_pct=15.0,
+                risk_reward_ratio=2.1,
+                hold_days=10,
+                reasons=reasons or [f"麻雀战法评分{score:.0f}分", "均线支撑+KDJ金叉信号"],
+                warnings=["等待回调至MA20附近再入场", "若跌破MA20立即止损", "分批建仓降低风险"],
+                created_at=now,
+            )
+
+        elif self.strategy_key == "turtle":
+            return TradePlan(
+                strategy_key=self.strategy_key,
+                strategy_name=self.strategy_label,
+                code=code,
+                name=name,
+                entry_price=round(current_price, 2),
+                entry_type="突破20日高点确认后入场",
+                stop_loss=round(current_price * 0.90, 2),
+                stop_loss_pct=-10.0,
+                take_profit_1=round(current_price * 1.15, 2),
+                take_profit_1_pct=15.0,
+                take_profit_2=round(current_price * 1.30, 2),
+                take_profit_2_pct=30.0,
+                position_pct=10.0,
+                risk_reward_ratio=3.0,
+                hold_days=20,
+                reasons=reasons or [f"海龟战法评分{score:.0f}分", "趋势突破信号"],
+                warnings=["趋势跟踪需要较大止损空间", "可能出现假突破", "建议分批加仓（金字塔）"],
+                created_at=now,
+            )
+
+        elif self.strategy_key == "value_invest":
+            return TradePlan(
+                strategy_key=self.strategy_key,
+                strategy_name=self.strategy_label,
+                code=code,
+                name=name,
+                entry_price=round(current_price, 2),
+                entry_type="现价分批入场",
+                stop_loss=round(current_price * 0.90, 2),
+                stop_loss_pct=-10.0,
+                take_profit_1=round(current_price * 1.20, 2),
+                take_profit_1_pct=20.0,
+                take_profit_2=round(current_price * 1.40, 2),
+                take_profit_2_pct=40.0,
+                position_pct=25.0,
+                risk_reward_ratio=4.0,
+                hold_days=60,
+                reasons=reasons or [f"价值投资评分{score:.0f}分", "估值合理，适合长线布局"],
+                warnings=["长线持有需要耐心", "关注基本面变化", "建议分3-5批建仓"],
+                created_at=now,
+            )
+
+        # 兜底：通用交易计划
+        return TradePlan(
+            strategy_key=self.strategy_key,
+            strategy_name=self.strategy_label,
+            code=code,
+            name=name,
+            entry_price=round(current_price, 2),
+            entry_type="现价入场",
+            stop_loss=round(current_price * 0.92, 2),
+            stop_loss_pct=-8.0,
+            take_profit_1=round(current_price * 1.12, 2),
+            take_profit_1_pct=12.0,
+            take_profit_2=round(current_price * 1.22, 2),
+            take_profit_2_pct=22.0,
+            position_pct=15.0,
+            risk_reward_ratio=2.5,
+            hold_days=15,
+            reasons=reasons or [f"评分{score:.0f}分"],
+            warnings=["请根据个人风险偏好调整"],
+            created_at=now,
+        )
+
+    def maintenance(self, verbose: bool = False) -> dict:
         """执行一次完整的池维护（评估 + 淘汰 + 补入）
 
         1. 评估现有标的层级
@@ -889,16 +1370,13 @@ class StrategyStockPool:
 
         返回: {evaluated, eliminated, replenished, tier_counts, error}
         """
-        result = {"evaluated": 0, "eliminated": 0, "replenished": 0,
-                  "tier_counts": {}, "error": None}
+        result = {"evaluated": 0, "eliminated": 0, "replenished": 0, "tier_counts": {}, "error": None}
 
         try:
             # 1. 评估层级
             tier_result = self.evaluate_pool(verbose=verbose)
             active = sum(1 for it in self.items.values() if it.status == "active")
-            result["tier_counts"] = {
-                tier: len(codes) for tier, codes in tier_result.items() if tier != TIER_ELIMINATED
-            }
+            result["tier_counts"] = {tier: len(codes) for tier, codes in tier_result.items() if tier != TIER_ELIMINATED}
             result["evaluated"] = active + len(tier_result[TIER_ELIMINATED])
             result["eliminated"] = len(tier_result[TIER_ELIMINATED])
 
@@ -913,7 +1391,7 @@ class StrategyStockPool:
                 fresh_pool = [c for c in stock_pool if c not in existing]
 
                 if fresh_pool:
-                    candidates: List[StockPoolItem] = []
+                    candidates: list[StockPoolItem] = []
                     for code in fresh_pool[:SCREEN_SAMPLE_SIZE]:
                         try:
                             df = fetcher.fetch_daily_kline(str(code), start_date="20240101")
@@ -938,8 +1416,10 @@ class StrategyStockPool:
                         self.items[item.code] = item
                         result["replenished"] += 1
                         if verbose:
-                            logger.info(f"  [{self.strategy_label}] 补入 {item.code} {item.name} "
-                                        f"评分{item.score:.0f} → {TIER_LABELS.get(item.tier, '?')}")
+                            logger.info(
+                                f"  [{self.strategy_label}] 补入 {item.code} {item.name} "
+                                f"评分{item.score:.0f} → {TIER_LABELS.get(item.tier, '?')}"
+                            )
 
             self.save()
 
@@ -949,7 +1429,7 @@ class StrategyStockPool:
 
         return result
 
-    def tier_summary(self) -> Dict[str, int]:
+    def tier_summary(self) -> dict[str, int]:
         """返回各层级数量统计"""
         counts = {TIER_FOCUS: 0, TIER_WATCH: 0, TIER_BROAD: 0, TIER_ELIMINATED: 0}
         for item in self.items.values():
@@ -957,10 +1437,9 @@ class StrategyStockPool:
                 counts[item.tier] = counts.get(item.tier, 0) + 1
         return counts
 
-    def get_by_tier(self, tier: str) -> List[StockPoolItem]:
+    def get_by_tier(self, tier: str) -> list[StockPoolItem]:
         """获取指定层级的所有标的（按评分降序）"""
-        items = [it for it in self.items.values()
-                 if it.tier == tier and it.status == "active"]
+        items = [it for it in self.items.values() if it.tier == tier and it.status == "active"]
         items.sort(key=lambda x: x.score, reverse=True)
         return items
 
@@ -979,11 +1458,16 @@ class StrategyStockPool:
 
 # ─── 全局池管理器 ────────────────────────────────────────
 
-SCORER_MAP: Dict[str, BaseScorer] = {
+SCORER_MAP: dict[str, BaseScorer] = {
     "dragon_head": DragonHeadScorer(),
     "sparrow": SparrowScorer(),
     "turtle": TurtleScorer(),
     "value_invest": ValueInvestScorer(),
+    "bollinger": BollingerBandScorer(),
+    "grid": GridScorer(),
+    "ma_cross": MACrossoverScorer(),
+    "volume_breakout": VolumeBreakoutScorer(),
+    "trend_accel": TrendAccelerationScorer(),
 }
 
 POOL_LABEL_MAP = {
@@ -991,6 +1475,11 @@ POOL_LABEL_MAP = {
     "sparrow": "麻雀战法",
     "turtle": "海龟战法",
     "value_invest": "价值投资",
+    "bollinger": "布林带回归",
+    "grid": "网格交易",
+    "ma_cross": "均线交叉",
+    "volume_breakout": "量价突破",
+    "trend_accel": "趋势加速",
 }
 
 
@@ -998,11 +1487,13 @@ class PoolManager:
     """全局股票池管理器 - 统一管理四种策略的独立股票池"""
 
     def __init__(self):
-        self.pools: Dict[str, StrategyStockPool] = {}
+        self.pools: dict[str, StrategyStockPool] = {}
         self._init_pools()
 
     def _init_pools(self):
         for key in STRATEGIES:
+            if key not in SCORER_MAP:
+                continue
             label = STRATEGIES[key]
             scorer = SCORER_MAP[key]
             pool = StrategyStockPool(key, label, scorer)
@@ -1012,18 +1503,20 @@ class PoolManager:
 
     # ─── 统一操作 ──────────────────────────────────────
 
-    def screen_all(self, stock_pool: List[str] = None, verbose: bool = False) -> Dict[str, List[StockPoolItem]]:
+    def screen_all(self, stock_pool: list[str] | None = None, verbose: bool = False) -> dict[str, list[StockPoolItem]]:
         """为所有策略执行筛选"""
         results = {}
         if stock_pool is None:
             from .data_manager import DataFetcher
+
             stock_pool = DataFetcher().build_stock_pool(filter_st=True, filter_new=True)
         for key, pool in self.pools.items():
             results[key] = pool.screen(stock_pool, verbose=verbose)
         return results
 
-    def screen_one(self, strategy_key: str, stock_pool: List[str] = None,
-                   verbose: bool = False) -> List[StockPoolItem]:
+    def screen_one(
+        self, strategy_key: str, stock_pool: list[str] | None = None, verbose: bool = False
+    ) -> list[StockPoolItem]:
         """为指定策略执行筛选"""
         pool = self.pools.get(strategy_key)
         if pool is None:
@@ -1031,19 +1524,19 @@ class PoolManager:
             return []
         return pool.screen(stock_pool, verbose=verbose)
 
-    def get_pool(self, strategy_key: str) -> Optional[StrategyStockPool]:
+    def get_pool(self, strategy_key: str) -> StrategyStockPool | None:
         return self.pools.get(strategy_key)
 
-    def get_ranked_codes(self, strategy_key: str, n: int = 10) -> List[str]:
+    def get_ranked_codes(self, strategy_key: str, n: int = 10) -> list[str]:
         """获取某策略 Top N 股票代码（赛马引擎直接调用）"""
         pool = self.pools.get(strategy_key)
         return pool.top_codes(n, min_score=30) if pool else []
 
-    def overview(self) -> List[Dict]:
+    def overview(self) -> list[dict]:
         """返回所有池概览"""
         return [p.summary() for p in self.pools.values()]
 
-    def summary(self) -> Dict[str, int]:
+    def summary(self) -> dict[str, int]:
         """返回各策略池股票数量的简单汇总"""
         return {key: pool.size for key, pool in self.pools.items()}
 
@@ -1055,14 +1548,14 @@ class PoolManager:
         for pool in self.pools.values():
             pool.load()
 
-    def refresh_all_gains(self, verbose: bool = False) -> Dict[str, Dict[str, Dict]]:
+    def refresh_all_gains(self, verbose: bool = False) -> dict[str, dict[str, dict]]:
         """刷新所有策略池的涨幅数据"""
         all_gains = {}
         for key, pool in self.pools.items():
             all_gains[key] = pool.refresh_gains(verbose=verbose)
         return all_gains
 
-    def evaluate_all(self, verbose: bool = False) -> Dict[str, Dict[str, List[str]]]:
+    def evaluate_all(self, verbose: bool = False) -> dict[str, dict[str, list[str]]]:
         """评估所有策略池的层级"""
         results = {}
         for key, pool in self.pools.items():
@@ -1071,7 +1564,7 @@ class PoolManager:
             results[key] = pool.evaluate_pool(verbose=verbose)
         return results
 
-    def maintenance_all(self, verbose: bool = False) -> Dict[str, Dict]:
+    def maintenance_all(self, verbose: bool = False) -> dict[str, dict]:
         """对所有策略池执行维护（评估 + 淘汰 + 补入）"""
         results = {}
         for key, pool in self.pools.items():
@@ -1080,17 +1573,16 @@ class PoolManager:
                     logger.info(f"\n维护 {pool.strategy_label}（频率: {MAINTENANCE_INTERVALS.get(key, 5)}天）...")
                 results[key] = pool.maintenance(verbose=verbose)
             else:
-                results[key] = {"skipped": True,
-                                "reason": f"距上次维护不足{MAINTENANCE_INTERVALS.get(key, 5)}天"}
+                results[key] = {"skipped": True, "reason": f"距上次维护不足{MAINTENANCE_INTERVALS.get(key, 5)}天"}
         return results
 
-    def maintenance_one(self, strategy_key: str, verbose: bool = False) -> Dict:
+    def maintenance_one(self, strategy_key: str, verbose: bool = False) -> dict:
         """对指定策略池执行维护"""
         pool = self.pools.get(strategy_key)
         if pool is None:
             return {"error": f"未知策略: {strategy_key}"}
         return pool.maintenance(verbose=verbose)
 
-    def tier_overview(self) -> Dict[str, Dict[str, int]]:
+    def tier_overview(self) -> dict[str, dict[str, int]]:
         """返回所有池的层级统计"""
         return {key: pool.tier_summary() for key, pool in self.pools.items()}

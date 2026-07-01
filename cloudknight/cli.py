@@ -1,23 +1,32 @@
 """命令行界面 - 基于 AKQuant 的交互式操盘终端"""
 
-import sys
 import cmd
 import logging
+import sys
 from datetime import datetime
-from typing import List
 
 import pandas as pd
 from tabulate import tabulate
 
-from .config import STRATEGIES, DEFAULT_CAPITAL, POOL_MAX_SIZE
-from .data_manager import DataFetcher
-from .indicators import (comprehensive_analysis, trend_score, calc_ma)
-from .strategies import (DragonHeadStrategy, SparrowStrategy,
-                         TurtleStrategy, ValueInvestStrategy, STRATEGY_CLASSES)
 from .backtest_engine import BacktestEngine
+from .config import DEFAULT_CAPITAL, POOL_MAX_SIZE, STRATEGIES
+from .data_manager import DataFetcher
+from .indicators import calc_ma, comprehensive_analysis, trend_score
 from .paper_trader import PaperTrader
 from .stock_pool import PoolManager
-from .trading_calendar import TradingCalendar, TradingPhase, get_phase_label
+from .strategies import (
+    STRATEGY_CLASSES,
+    BollingerBandStrategy,
+    DragonHeadStrategy,
+    GridStrategy,
+    MACrossoverStrategy,
+    SparrowStrategy,
+    TrendAccelerationStrategy,
+    TurtleStrategy,
+    ValueInvestStrategy,
+    VolumeBreakoutStrategy,
+)
+from .trading_calendar import TradingCalendar, get_phase_label
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +47,10 @@ class CloudKnightCLI(cmd.Cmd):
         self.engine = BacktestEngine(capital=DEFAULT_CAPITAL)
         self.trader = PaperTrader()
         self.pool_mgr = PoolManager()
-        self.current_strategy_cls = None   # 策略类（AKQ 策略不持有实例状态）
-        self.stock_pool: List[str] = []
+        self.current_strategy_cls = None  # 策略类（AKQ 策略不持有实例状态）
+        self.stock_pool: list[str] = []
         self.calendar = TradingCalendar()
-        self._live_engine = None           # 实时引擎引用（懒加载）
+        self._live_engine = None  # 实时引擎引用（懒加载）
 
     def do_help(self, arg):
         print("""
@@ -152,8 +161,16 @@ class CloudKnightCLI(cmd.Cmd):
         df = self.fetcher.fetch_daily_kline(code, start_date="20240101")
         if df.empty or len(df) < 60:
             return print(f"{code} 数据不足，至少需要60个交易日")
-        col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-                   "最低": "low", "成交量": "volume", "涨跌幅": "pct_change", "换手率": "turnover"}
+        col_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "涨跌幅": "pct_change",
+            "换手率": "turnover",
+        }
         df_std = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
         results = comprehensive_analysis(df_std)
         score = trend_score(df_std)
@@ -164,8 +181,11 @@ class CloudKnightCLI(cmd.Cmd):
         print(tabulate(table_data, headers=["指标", "信号", "趋势", "强度", "详情"], tablefmt="grid"))
         df_std = calc_ma(df_std, [5, 10, 20, 60])
         latest = df_std.iloc[-1]
-        ma_data = [[f"MA{p}", f"{latest[f'MA{p}']:.2f}", "上方" if latest["close"] > latest[f"MA{p}"] else "下方"]
-                   for p in [5, 10, 20, 60] if pd.notna(latest.get(f"MA{p}"))]
+        ma_data = [
+            [f"MA{p}", f"{latest[f'MA{p}']:.2f}", "上方" if latest["close"] > latest[f"MA{p}"] else "下方"]
+            for p in [5, 10, 20, 60]
+            if pd.notna(latest.get(f"MA{p}"))
+        ]
         if ma_data:
             print("\n均线系统:")
             print(tabulate(ma_data, headers=["均线", "价格", "位置"], tablefmt="simple"))
@@ -177,8 +197,16 @@ class CloudKnightCLI(cmd.Cmd):
         df = self.fetcher.fetch_daily_kline(code, start_date="20240101")
         if df.empty:
             return print(f"未找到 {code} 的数据")
-        col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-                   "最低": "low", "成交量": "volume", "涨跌幅": "pct_change", "换手率": "turnover"}
+        col_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "涨跌幅": "pct_change",
+            "换手率": "turnover",
+        }
         df_std = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
         score = trend_score(df_std)
         print(f"\n{code} 趋势评分: {score['score']} / 100")
@@ -191,13 +219,16 @@ class CloudKnightCLI(cmd.Cmd):
         name = arg.strip().lower()
         cls = STRATEGY_CLASSES.get(name)
         if cls is None:
-            return print(f"未知策略: {name}\n可用: dragon, sparrow, turtle, value")
+            return print(
+                f"未知策略: {name}\n"
+                "可用: dragon, sparrow, turtle, value, grid, ma_cross, bollinger, volume_breakout, trend_accel"
+            )
         self.current_strategy_cls = cls
         inst = cls()
         print(f"\n已选择策略: {inst.description}")
         print(f"参数: {inst.get_params_info()}")
         print(f"预热期: {inst.warmup_period} 根K线")
-        print(f"引擎: AKQuant 高性能事件驱动回测")
+        print("引擎: AKQuant 高性能事件驱动回测")
 
     def do_params(self, arg):
         if self.current_strategy_cls is None:
@@ -221,11 +252,9 @@ class CloudKnightCLI(cmd.Cmd):
         print(f"\n[AKQuant] 开始回测: {inst.description}")
         print(f"期间: {start} ~ {end}, 股票池: {len(self.stock_pool)} 只")
         print(f"初始资金: {DEFAULT_CAPITAL:,.0f}, 佣金: 0.03%, 印花税: 0.1%")
-        print(f"T+1 交易, 1手=100股\n")
+        print("T+1 交易, 1手=100股\n")
 
-        result = self.engine.run_backtest(
-            self.current_strategy_cls, start, end, self.stock_pool[:30], verbose=True
-        )
+        result = self.engine.run_backtest(self.current_strategy_cls, start, end, self.stock_pool[:30], verbose=True)
         if result:
             self._last_result = result
             print(f"\n═══ {result.strategy_name} 回测结果 ═══")
@@ -239,10 +268,18 @@ class CloudKnightCLI(cmd.Cmd):
             if result.avg_profit:
                 print(f"均盈/均亏: {result.avg_profit:.0f} / {result.avg_loss:.0f}")
             if result.trades:
-                trade_data = [[t.get("date", ""), t.get("code", ""), t.get("action", ""),
-                              f"{t.get('price', 0):.2f}", t.get("volume", 0),
-                              f"{t.get('pnl', 0):.0f}"] for t in result.trades[-10:]]
-                print(f"\n最近交易记录:")
+                trade_data = [
+                    [
+                        t.get("date", ""),
+                        t.get("code", ""),
+                        t.get("action", ""),
+                        f"{t.get('price', 0):.2f}",
+                        t.get("volume", 0),
+                        f"{t.get('pnl', 0):.0f}",
+                    ]
+                    for t in result.trades[-10:]
+                ]
+                print("\n最近交易记录:")
                 print(tabulate(trade_data, headers=["日期", "代码", "方向", "价格", "数量", "盈亏"], tablefmt="grid"))
         else:
             print("\n回测失败，请检查数据源")
@@ -251,18 +288,44 @@ class CloudKnightCLI(cmd.Cmd):
         if not self.stock_pool:
             return print("请先构建股票池: pool screen")
 
-        print(f"\n[AKQuant] 多策略对比回测...")
-        strategy_classes = [DragonHeadStrategy, SparrowStrategy, TurtleStrategy, ValueInvestStrategy]
+        print("\n[AKQuant] 多策略对比回测...")
+        strategy_classes = [
+            DragonHeadStrategy,
+            SparrowStrategy,
+            TurtleStrategy,
+            ValueInvestStrategy,
+            GridStrategy,
+            MACrossoverStrategy,
+            BollingerBandStrategy,
+            VolumeBreakoutStrategy,
+            TrendAccelerationStrategy,
+        ]
         start, end = "20240101", datetime.now().strftime("%Y%m%d")
         print(f"期间: {start} ~ {end}, 每策略 {DEFAULT_CAPITAL:,.0f}")
 
         results = self.engine.compare_strategies(strategy_classes, start, end, self.stock_pool[:30], verbose=True)
         if results:
-            print(f"\n═══ 策略对比 ═══")
-            table_data = [[r.strategy_name, f"{r.total_return:+.2f}%", f"{r.annual_return:+.2f}%",
-                           f"{r.max_drawdown:.2f}%", f"{r.sharpe_ratio:.2f}", f"{r.win_rate:.1f}%",
-                           r.total_trades, f"{r.profit_factor:.2f}"] for r in results]
-            print(tabulate(table_data, headers=["策略", "总收益", "年化", "最大回撤", "夏普", "胜率", "交易", "盈亏比"], tablefmt="grid"))
+            print("\n═══ 策略对比 ═══")
+            table_data = [
+                [
+                    r.strategy_name,
+                    f"{r.total_return:+.2f}%",
+                    f"{r.annual_return:+.2f}%",
+                    f"{r.max_drawdown:.2f}%",
+                    f"{r.sharpe_ratio:.2f}",
+                    f"{r.win_rate:.1f}%",
+                    r.total_trades,
+                    f"{r.profit_factor:.2f}",
+                ]
+                for r in results
+            ]
+            print(
+                tabulate(
+                    table_data,
+                    headers=["策略", "总收益", "年化", "最大回撤", "夏普", "胜率", "交易", "盈亏比"],
+                    tablefmt="grid",
+                )
+            )
             best = max(results, key=lambda r: r.sharpe_ratio)
             print(f"\n[推荐] {best.strategy_name} (夏普: {best.sharpe_ratio})")
             self._last_compare_results = results
@@ -335,7 +398,7 @@ class CloudKnightCLI(cmd.Cmd):
             print(f"\n[AKQuant] 赛马回放: {start} ~ {end}")
             print(f"股票池: {len(self.stock_pool)} 只")
             rankings = self.trader.run_history(start, end, self.stock_pool[:50], verbose=True)
-            print(f"\n═══ 赛马最终排名 ═══")
+            print("\n═══ 赛马最终排名 ═══")
             self._print_rankings(rankings)
 
         elif cmd == "reset":
@@ -347,7 +410,7 @@ class CloudKnightCLI(cmd.Cmd):
             print("\n赛马状态已保存")
 
         else:
-            print(f"用法: race start|status|history|reset|save")
+            print("用法: race start|status|history|reset|save")
 
     def _show_race_rankings(self):
         rankings = self.trader.get_rankings()
@@ -359,12 +422,26 @@ class CloudKnightCLI(cmd.Cmd):
         table_data = []
         for r in rankings:
             badge = {1: "[1]", 2: "[2]", 3: "[3]"}.get(r.rank, f" {r.rank} ")
-            table_data.append([badge, r.strategy_label, f"{r.total_return:+.2f}%",
-                              f"{r.total_equity:,.0f}", f"{r.daily_return:+.2f}%" if r.daily_return is not None else "-",
-                              f"{r.max_drawdown:.2f}%", r.position_count, r.trades])
-        print(tabulate(table_data, headers=["排名", "策略", "总收益", "总权益",
-                                            "日收益", "最大回撤", "持仓", "交易"],
-                       tablefmt="grid", stralign="center"))
+            table_data.append(
+                [
+                    badge,
+                    r.strategy_label,
+                    f"{r.total_return:+.2f}%",
+                    f"{r.total_equity:,.0f}",
+                    f"{r.daily_return:+.2f}%" if r.daily_return is not None else "-",
+                    f"{r.max_drawdown:.2f}%",
+                    r.position_count,
+                    r.trades,
+                ]
+            )
+        print(
+            tabulate(
+                table_data,
+                headers=["排名", "策略", "总收益", "总权益", "日收益", "最大回撤", "持仓", "交易"],
+                tablefmt="grid",
+                stralign="center",
+            )
+        )
 
     # ─── 股票池 (保持不变) ────────────────────────────
 
@@ -388,9 +465,9 @@ class CloudKnightCLI(cmd.Cmd):
                 self.pool_mgr.screen_one(strategy, codes, verbose=True)
                 self._show_pool_list(strategy)
             else:
-                print(f"\n开始为四种策略筛选独立股票池...")
+                print("\n开始为四种策略筛选独立股票池...")
                 results = self.pool_mgr.screen_all(codes, verbose=True)
-                print(f"\n═══ 筛选完成 ═══")
+                print("\n═══ 筛选完成 ═══")
                 for key, items in results.items():
                     print(f"  {STRATEGIES.get(key, key)}: {len(items)} 只 (最高评分: {items[0].score if items else 0})")
 
@@ -490,7 +567,7 @@ class CloudKnightCLI(cmd.Cmd):
         elif cmd == "tiers":
             """查看各策略池的层级统计"""
             overview = self.pool_mgr.tier_overview()
-            print(f"\n═══ 股票池层级统计 ═══")
+            print("\n═══ 股票池层级统计 ═══")
             for key, counts in overview.items():
                 label = STRATEGIES.get(key, key)
                 total = sum(counts.values())
@@ -504,20 +581,15 @@ class CloudKnightCLI(cmd.Cmd):
             print(f"未知子命令: {cmd}")
 
     def _pool_overview(self):
-        print(f"\n═══ 自选股票池概览 ═══")
+        print("\n═══ 自选股票池概览 ═══")
         print(f"(每种策略独立筛选评分，池容量 {POOL_MAX_SIZE} 只)\n")
         table_data = []
         for s in self.pool_mgr.overview():
-            top_codes = ", ".join([f"{t['code']}({t['score']})" for t in s['top5']])
-            table_data.append([
-                s["strategy"], s["total"],
-                s["avg_score"],
-                s["last_screened"] or "未筛选",
-                top_codes[:60]
-            ])
-        print(tabulate(table_data,
-                       headers=["策略", "数量", "均分", "最近筛选", "Top5 代码(评分)"],
-                       tablefmt="grid"))
+            top_codes = ", ".join([f"{t['code']}({t['score']})" for t in s["top5"]])
+            table_data.append(
+                [s["strategy"], s["total"], s["avg_score"], s["last_screened"] or "未筛选", top_codes[:60]]
+            )
+        print(tabulate(table_data, headers=["策略", "数量", "均分", "最近筛选", "Top5 代码(评分)"], tablefmt="grid"))
 
     def _show_eval_result(self, strategy: str, result: dict):
         """显示层级评估结果"""
@@ -540,8 +612,10 @@ class CloudKnightCLI(cmd.Cmd):
         tiers = [("focus", "精选"), ("watch", "观察"), ("broad", "备选")]
         for t, t_label in tiers:
             parts.append(f"{t_label}:{tc.get(t, 0)}")
-        print(f"  [{label}] 评估{result.get('evaluated', 0)}只 | 淘汰{result.get('eliminated', 0)}只 | "
-              f"补入{result.get('replenished', 0)}只 | {' | '.join(parts)}")
+        print(
+            f"  [{label}] 评估{result.get('evaluated', 0)}只 | 淘汰{result.get('eliminated', 0)}只 | "
+            f"补入{result.get('replenished', 0)}只 | {' | '.join(parts)}"
+        )
 
     def _show_pool_list(self, strategy: str):
         pool = self.pool_mgr.get_pool(strategy)
@@ -562,7 +636,7 @@ class CloudKnightCLI(cmd.Cmd):
         print(f"综合评分: {item.score} / 100")
         print(f"入池时间: {item.screened_at}")
         print(f"状态: {item.status}")
-        print(f"\n评分明细:")
+        print("\n评分明细:")
         bar_data = []
         for k, v in item.components.items():
             bar_len = int(v / 100 * 30)
@@ -571,9 +645,17 @@ class CloudKnightCLI(cmd.Cmd):
         print(tabulate(bar_data, headers=["维度", "得分", "分布"], tablefmt="simple"))
 
     def _normalize_df(self, df):
-        col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-                   "最低": "low", "成交量": "volume", "成交额": "amount",
-                   "涨跌幅": "pct_change", "换手率": "turnover"}
+        col_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "涨跌幅": "pct_change",
+            "换手率": "turnover",
+        }
         return df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
     def _get_stock_name(self, code: str) -> str:
@@ -622,8 +704,9 @@ class CloudKnightCLI(cmd.Cmd):
             if eng["engine"].state.value in ("running", "starting"):
                 return print("\n实时引擎已在运行中！")
 
-        from .live_engine import LiveTradingEngine
         import threading
+
+        from .live_engine import LiveTradingEngine
 
         engine = LiveTradingEngine()
         engine.pool_mgr = self.pool_mgr  # 共享股票池
@@ -632,7 +715,7 @@ class CloudKnightCLI(cmd.Cmd):
         today = cal.get_current_phase()
         is_trade = cal.is_trading_day()
 
-        print(f"\n═══ 启动实时交易引擎 ═══")
+        print("\n═══ 启动实时交易引擎 ═══")
         print(f"当前阶段: {get_phase_label(today)}")
         print(f"交易日: {'是' if is_trade else '否'}")
 
@@ -654,6 +737,7 @@ class CloudKnightCLI(cmd.Cmd):
                     print(f"  [{ts}] [{phase}] {entry.event}")
                 last_idx = max(last_idx, len(logs))
                 import time
+
                 time.sleep(2)
 
         threading.Thread(target=_log_printer, daemon=True).start()
@@ -666,7 +750,7 @@ class CloudKnightCLI(cmd.Cmd):
         eng = self._live_engine["engine"]
         status = eng.get_status()
 
-        print(f"\n═══ 实时引擎状态 ═══")
+        print("\n═══ 实时引擎状态 ═══")
         print(f"运行状态: {status['state']}")
         print(f"当前阶段: {status['phase_label']}")
         print(f"交易日: {'是' if status['is_trading_day'] else '否'}")
@@ -677,10 +761,10 @@ class CloudKnightCLI(cmd.Cmd):
         sd = status.get("signal_details", {})
         if sd:
             print(f"\n最新扫描信号 ({status['latest_signals']} 条):")
-            for name, info in sd.items():
-                print(f"  [{info['strategy']}] "
-                      f"买{info['buy']} 卖{info['sell']} "
-                      f"({info['count']}条, {info['duration']}s)")
+            for _name, info in sd.items():
+                print(
+                    f"  [{info['strategy']}] 买{info['buy']} 卖{info['sell']} ({info['count']}条, {info['duration']}s)"
+                )
 
     def _live_market(self):
         """查看市场快照"""
@@ -690,19 +774,20 @@ class CloudKnightCLI(cmd.Cmd):
         analyzer = MarketAnalyzer()
         sentiment = analyzer.get_market_sentiment()
 
-        print(f"\n═══ 市场情绪 ═══")
+        print("\n═══ 市场情绪 ═══")
         print(f"情绪: {sentiment['sentiment'].upper()}")
         print(f"评分: {sentiment['score']}/100")
 
         if "indices" in sentiment:
-            print(f"\n核心指数:")
+            print("\n核心指数:")
             status = sentiment["indices"]
-            for code, info in status.items():
-                print(f"  {info['name']}: {info['pct']:+.2f}% "
-                      f"趋势{info['trend']} MACD:{info['macd']} KDJ:{info['kdj']}")
+            for _code, info in status.items():
+                print(
+                    f"  {info['name']}: {info['pct']:+.2f}% 趋势{info['trend']} MACD:{info['macd']} KDJ:{info['kdj']}"
+                )
 
         if "factors" in sentiment:
-            print(f"\n情绪因子:")
+            print("\n情绪因子:")
             for k, v in sentiment["factors"].items():
                 bar = "█" * (v // 5) + "░" * (20 - v // 5)
                 print(f"  {k}: {bar} {v}")
@@ -724,15 +809,22 @@ class CloudKnightCLI(cmd.Cmd):
         if plan and plan.signals:
             table_data = []
             for s in plan.signals:
-                table_data.append([
-                    s.code, s.name,
-                    STRATEGIES.get(s.strategy, s.strategy),
-                    s.signal_type.upper(), s.confidence,
-                    f"{s.price:.2f}", s.reason[:50]
-                ])
-            print(tabulate(table_data,
-                           headers=["代码", "名称", "策略", "方向", "置信度", "价格", "原因"],
-                           tablefmt="grid"))
+                table_data.append(
+                    [
+                        s.code,
+                        s.name,
+                        STRATEGIES.get(s.strategy, s.strategy),
+                        s.signal_type.upper(),
+                        s.confidence,
+                        f"{s.price:.2f}",
+                        s.reason[:50],
+                    ]
+                )
+            print(
+                tabulate(
+                    table_data, headers=["代码", "名称", "策略", "方向", "置信度", "价格", "原因"], tablefmt="grid"
+                )
+            )
         else:
             print("无最新交易信号")
 
@@ -763,14 +855,16 @@ class CloudKnightCLI(cmd.Cmd):
     # ─── 系统 ─────────────────────────────────────────
 
     def do_status(self, arg):
-        from .version import get_version
         from datetime import datetime
-        print(f"\n═══ 系统状态 ═══")
+
+        from .version import get_version
+
+        print("\n═══ 系统状态 ═══")
         print(f"版本: v{get_version()} | 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         cls = self.current_strategy_cls
         inst = cls() if cls else None
         print(f"策略: {inst.description if inst else '未选择'}")
-        print(f"引擎: AKQuant 高性能事件驱动回测")
+        print("引擎: AKQuant 高性能事件驱动回测")
 
         # 交易日历状态
         phase = self.calendar.get_current_phase()
@@ -808,8 +902,16 @@ def main():
         df = fetcher.fetch_daily_kline(code, start_date="20240101")
         if df.empty:
             return print(f"未找到 {code} 的数据")
-        col_map = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-                   "最低": "low", "成交量": "volume", "涨跌幅": "pct_change", "换手率": "turnover"}
+        col_map = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "涨跌幅": "pct_change",
+            "换手率": "turnover",
+        }
         df_std = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
         results = comprehensive_analysis(df_std)
         score = trend_score(df_std)

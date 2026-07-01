@@ -5,20 +5,25 @@
 支持每日赛马、收益率排名、持仓跟踪。
 """
 
+import contextlib
 import json
 import logging
 import os
-from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import ClassVar
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from .config import (
-    DEFAULT_CAPITAL, DEFAULT_COMMISSION, DEFAULT_STAMP_TAX,
-    DEFAULT_SLIPPAGE, DATA_DIR, BACKTEST_LOT_SIZE, BACKTEST_T_PLUS_ONE,
+    BACKTEST_LOT_SIZE,
     BACKTEST_MIN_COMMISSION,
+    BACKTEST_T_PLUS_ONE,
+    DATA_DIR,
+    DEFAULT_COMMISSION,
+    DEFAULT_SLIPPAGE,
+    DEFAULT_STAMP_TAX,
 )
 from .data_manager import DataFetcher
 from .stock_pool import PoolManager
@@ -31,9 +36,11 @@ SNAPSHOT_FILE = os.path.join(DATA_DIR, "paper_race.json")
 
 # ─── 数据结构 ─────────────────────────────────────────────
 
+
 @dataclass
 class PaperPosition:
     """模拟持仓"""
+
     code: str
     name: str
     cost: float
@@ -48,6 +55,7 @@ class PaperPosition:
 @dataclass
 class PaperTrade:
     """模拟成交记录"""
+
     date: str
     code: str
     name: str
@@ -62,13 +70,14 @@ class PaperTrade:
 @dataclass
 class PaperAccount:
     """模拟账户"""
+
     strategy_name: str
     strategy_label: str
     initial_capital: float = RACE_CAPITAL
     cash: float = RACE_CAPITAL
-    positions: Dict[str, PaperPosition] = field(default_factory=dict)
-    trades: List[PaperTrade] = field(default_factory=list)
-    daily_snapshots: List[Dict] = field(default_factory=list)
+    positions: dict[str, PaperPosition] = field(default_factory=dict)
+    trades: list[PaperTrade] = field(default_factory=list)
+    daily_snapshots: list[dict] = field(default_factory=list)
     status: str = "idle"
 
     @property
@@ -85,14 +94,14 @@ class PaperAccount:
         return len(self.positions)
 
     @property
-    def daily_return(self) -> Optional[float]:
+    def daily_return(self) -> float | None:
         if len(self.daily_snapshots) >= 2:
             prev = self.daily_snapshots[-2]["equity"]
             curr = self.daily_snapshots[-1]["equity"]
             return (curr / prev - 1) * 100 if prev > 0 else 0
         return None
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         return {
             "strategy_name": self.strategy_name,
             "strategy_label": self.strategy_label,
@@ -108,11 +117,12 @@ class PaperAccount:
 @dataclass
 class RaceRanking:
     """赛马排名条目"""
+
     rank: int
     strategy_label: str
     total_return: float
     total_equity: float
-    daily_return: Optional[float]
+    daily_return: float | None
     position_count: int
     max_drawdown: float
     trades: int
@@ -120,40 +130,60 @@ class RaceRanking:
 
 # ─── 模拟盘引擎 ───────────────────────────────────────────
 
+
 class PaperTrader:
     """本地模拟盘 - 基于 AKQuant 的多策略赛马"""
 
-    STRATEGY_KEYS = ["dragon", "sparrow", "turtle", "value"]
-    STRATEGY_LABELS = {
-        "dragon": "龙头战法", "sparrow": "麻雀战法",
-        "turtle": "海龟战法", "value": "价值投资",
+    STRATEGY_KEYS: ClassVar[list[str]] = [
+        "dragon",
+        "sparrow",
+        "turtle",
+        "value",
+        "grid",
+        "ma_cross",
+        "bollinger",
+        "volume_breakout",
+        "trend_accel",
+    ]
+    STRATEGY_LABELS: ClassVar[dict[str, str]] = {
+        "dragon": "龙头战法",
+        "sparrow": "麻雀战法",
+        "turtle": "海龟战法",
+        "value": "价值投资",
+        "grid": "网格交易",
+        "ma_cross": "均线交叉",
+        "bollinger": "布林带回归",
+        "volume_breakout": "量价突破",
+        "trend_accel": "趋势加速",
     }
 
-    def __init__(self, commission: float = None, stamp_tax: float = None, slippage: float = None):
+    def __init__(self, commission: float | None = None, stamp_tax: float | None = None, slippage: float | None = None):
         self.commission = commission or DEFAULT_COMMISSION
         self.stamp_tax = stamp_tax or DEFAULT_STAMP_TAX
         self.slippage = slippage or DEFAULT_SLIPPAGE
         self.fetcher = DataFetcher()
-        self.accounts: Dict[str, PaperAccount] = {}
-        self.stock_pool: List[str] = []
+        self.accounts: dict[str, PaperAccount] = {}
+        self.stock_pool: list[str] = []
         self.pool_mgr = PoolManager()
-        self.current_date: Optional[str] = None
+        self.current_date: str | None = None
         self._init_accounts()
 
     def _init_accounts(self):
         for key in self.STRATEGY_KEYS:
             label = self.STRATEGY_LABELS[key]
             self.accounts[key] = PaperAccount(
-                strategy_name=key, strategy_label=label,
-                initial_capital=RACE_CAPITAL, cash=RACE_CAPITAL,
+                strategy_name=key,
+                strategy_label=label,
+                initial_capital=RACE_CAPITAL,
+                cash=RACE_CAPITAL,
             )
 
-    def set_stock_pool(self, codes: List[str]):
+    def set_stock_pool(self, codes: list[str]):
         self.stock_pool = codes
 
     # ─── 每日赛马 ──────────────────────────────────────
 
-    def run_daily(self, date: str = None, verbose: bool = False) -> Dict[str, Dict]:
+    def run_daily(self, date: str | None = None, verbose: bool = False) -> dict[str, dict]:
         """
         执行一个交易日的赛马：
         1. 获取各策略独立股票池
@@ -179,20 +209,24 @@ class PaperTrader:
                 if len(acc.daily_snapshots) > prev_snapshots:
                     pass  # 回测内部已记录
                 else:
-                    acc.daily_snapshots.append({
-                        "date": self.current_date,
-                        "equity": round(equity, 2),
-                        "cash": round(acc.cash, 2),
-                        "positions": acc.position_count,
-                    })
+                    acc.daily_snapshots.append(
+                        {
+                            "date": self.current_date,
+                            "equity": round(equity, 2),
+                            "cash": round(acc.cash, 2),
+                            "positions": acc.position_count,
+                        }
+                    )
 
                 # 重新估值
                 self._mark_to_market(key)
 
                 results[key] = acc.to_dict()
                 if verbose:
-                    logger.info(f"  {acc.strategy_label}: 权益 {equity:,.0f} "
-                                f"({acc.total_return_pct:+.2f}%), 持仓 {acc.position_count}")
+                    logger.info(
+                        f"  {acc.strategy_label}: 权益 {equity:,.0f} "
+                        f"({acc.total_return_pct:+.2f}%), 持仓 {acc.position_count}"
+                    )
 
             except Exception as e:
                 logger.error(f"账户 {key} 日跑异常: {e}")
@@ -200,10 +234,10 @@ class PaperTrader:
         self.save()
         return results
 
-    def _run_strategy_backtest(self, key: str, acc: PaperAccount,
-                               pool_codes: List[str], date: str):
+    def _run_strategy_backtest(self, key: str, acc: PaperAccount, pool_codes: list[str], date: str):
         """通过 AKQuant 运行策略在指定日期池上的回测"""
         from .strategies import STRATEGY_CLASSES
+
         strategy_cls = STRATEGY_CLASSES.get(key)
         if strategy_cls is None:
             return
@@ -221,14 +255,18 @@ class PaperTrader:
             # 准备数据
             data = {}
             for code in pool_codes[:20]:
-                df = self.fetcher.fetch_daily_kline(
-                    str(code), start_date=start_dt, end_date=date
-                )
+                df = self.fetcher.fetch_daily_kline(str(code), start_date=start_dt, end_date=date)
                 if df is None or df.empty or len(df) < 20:
                     continue
-                col_map = {"日期": "date", "开盘": "open", "收盘": "close",
-                          "最高": "high", "最低": "low", "成交量": "volume",
-                          "成交额": "amount"}
+                col_map = {
+                    "日期": "date",
+                    "开盘": "open",
+                    "收盘": "close",
+                    "最高": "high",
+                    "最低": "low",
+                    "成交量": "volume",
+                    "成交额": "amount",
+                }
                 df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
                 required = ["date", "open", "high", "low", "close", "volume"]
                 if not all(c in df.columns for c in required):
@@ -277,16 +315,22 @@ class PaperTrader:
             equity_df = result.equity_curve if hasattr(result, "equity_curve") else None
             if equity_df is not None and not equity_df.empty:
                 # 取最新权益
-                final_equity = float(equity_df["equity"].iloc[-1]) if "equity" in equity_df.columns else acc.initial_capital
+                final_equity = (
+                    float(equity_df["equity"].iloc[-1]) if "equity" in equity_df.columns else acc.initial_capital
+                )
                 acc.cash = 0
                 for s in acc.daily_snapshots:
                     if s["date"] == date:
                         s.update({"equity": round(final_equity, 2), "cash": 0, "positions": 0})
                         return
-                acc.daily_snapshots.append({
-                    "date": date, "equity": round(final_equity, 2),
-                    "cash": 0, "positions": 0,
-                })
+                acc.daily_snapshots.append(
+                    {
+                        "date": date,
+                        "equity": round(final_equity, 2),
+                        "cash": 0,
+                        "positions": 0,
+                    }
+                )
             else:
                 # 无权益曲线时，使用 metrics
                 metrics = result.metrics_df if hasattr(result, "metrics_df") else None
@@ -295,18 +339,20 @@ class PaperTrader:
                     for k in ["final_value", "final_capital", "ending_value", "total_equity"]:
                         if k in cols_lower:
                             final_equity = float(metrics.iloc[0][cols_lower[k]])
-                            acc.daily_snapshots.append({
-                                "date": date, "equity": round(final_equity, 2),
-                                "cash": 0, "positions": 0,
-                            })
+                            acc.daily_snapshots.append(
+                                {
+                                    "date": date,
+                                    "equity": round(final_equity, 2),
+                                    "cash": 0,
+                                    "positions": 0,
+                                }
+                            )
                             return
         except Exception as e:
             logger.debug(f"合并 AKQ 结果异常: {e}")
 
-    def _run_fallback_logic(self, key: str, acc: PaperAccount,
-                            pool_codes: List[str], date: str):
+    def _run_fallback_logic(self, key: str, acc: PaperAccount, pool_codes: list[str], date: str):
         """备用逻辑：简单记录快照（不交易）"""
-        prev = acc.cash
         for pos in acc.positions.values():
             mp = self._get_market_price(pos.code, date)
             if mp:
@@ -317,15 +363,18 @@ class PaperTrader:
         exists = False
         for s in acc.daily_snapshots:
             if s["date"] == date:
-                s.update({"equity": round(equity, 2), "cash": round(acc.cash, 2),
-                         "positions": acc.position_count})
+                s.update({"equity": round(equity, 2), "cash": round(acc.cash, 2), "positions": acc.position_count})
                 exists = True
                 break
         if not exists:
-            acc.daily_snapshots.append({
-                "date": date, "equity": round(equity, 2),
-                "cash": round(acc.cash, 2), "positions": acc.position_count,
-            })
+            acc.daily_snapshots.append(
+                {
+                    "date": date,
+                    "equity": round(equity, 2),
+                    "cash": round(acc.cash, 2),
+                    "positions": acc.position_count,
+                }
+            )
 
     # ─── 持仓估值 ──────────────────────────────────────
 
@@ -338,7 +387,7 @@ class PaperTrader:
                 pos.market_value = mp * pos.volume
                 pos.profit_pct = (mp / pos.cost - 1) * 100 if pos.cost > 0 else 0
 
-    def _get_market_price(self, code: str, date: str) -> Optional[float]:
+    def _get_market_price(self, code: str, date: str) -> float | None:
         df = self.fetcher.fetch_daily_kline(code)
         if df.empty:
             return None
@@ -351,20 +400,22 @@ class PaperTrader:
 
     # ─── 赛马排名 ──────────────────────────────────────
 
-    def get_rankings(self) -> List[RaceRanking]:
+    def get_rankings(self) -> list[RaceRanking]:
         rankings = []
         for key, acc in self.accounts.items():
             md = self._calc_max_drawdown(key)
-            rankings.append(RaceRanking(
-                rank=0,
-                strategy_label=acc.strategy_label,
-                total_return=round(acc.total_return_pct, 2),
-                total_equity=round(acc.total_equity, 2),
-                daily_return=round(acc.daily_return, 2) if acc.daily_return is not None else None,
-                position_count=acc.position_count,
-                max_drawdown=round(md, 2),
-                trades=len(acc.trades),
-            ))
+            rankings.append(
+                RaceRanking(
+                    rank=0,
+                    strategy_label=acc.strategy_label,
+                    total_return=round(acc.total_return_pct, 2),
+                    total_equity=round(acc.total_equity, 2),
+                    daily_return=round(acc.daily_return, 2) if acc.daily_return is not None else None,
+                    position_count=acc.position_count,
+                    max_drawdown=round(md, 2),
+                    trades=len(acc.trades),
+                )
+            )
         rankings.sort(key=lambda r: r.total_return, reverse=True)
         for i, r in enumerate(rankings):
             r.rank = i + 1
@@ -382,8 +433,9 @@ class PaperTrader:
 
     # ─── 历史回放 ──────────────────────────────────────
 
-    def run_history(self, start_date: str, end_date: str = None,
-                    stock_pool: List[str] = None, verbose: bool = False) -> List[RaceRanking]:
+    def run_history(
+        self, start_date: str, end_date: str | None = None, stock_pool: list[str] | None = None, verbose: bool = False
+    ) -> list[RaceRanking]:
         """从历史数据回放赛马"""
         self.reset()
         if stock_pool:
@@ -436,7 +488,7 @@ class PaperTrader:
         if not os.path.exists(SNAPSHOT_FILE):
             return False
         try:
-            with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            with open(SNAPSHOT_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             self.current_date = data.get("current_date")
             self.stock_pool = data.get("stock_pool", [])
@@ -455,7 +507,5 @@ class PaperTrader:
         self._init_accounts()
         self.current_date = None
         if os.path.exists(SNAPSHOT_FILE):
-            try:
+            with contextlib.suppress(Exception):
                 os.remove(SNAPSHOT_FILE)
-            except Exception:
-                pass

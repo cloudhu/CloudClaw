@@ -3,7 +3,7 @@
 所有策略继承自 akquant.Strategy，实现 on_bar() 回调
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Any
 
 import numpy as np
 
@@ -29,17 +29,17 @@ class CloudKnightStrategy(_AKStrategy):
     name: str = "base"
     description: str = "策略基类"
 
-    def __init__(self, params: Dict[str, Any] = None):
+    def __init__(self, params: dict[str, Any] | None = None):
         super().__init__()
         self._params = params or {}
-        self._entry_price: Dict[str, float] = {}    # symbol -> entry price
-        self._entry_count: Dict[str, int] = {}      # symbol -> entry count (for batch/pyramid)
+        self._entry_price: dict[str, float] = {}  # symbol -> entry price
+        self._entry_count: dict[str, int] = {}  # symbol -> entry count (for batch/pyramid)
 
     @property
     def warmup_period(self) -> int:
         return 60
 
-    def get_params_info(self) -> Dict[str, Any]:
+    def get_params_info(self) -> dict[str, Any]:
         """返回策略参数"""
         return dict(self._params)
 
@@ -92,11 +92,7 @@ class CloudKnightStrategy(_AKStrategy):
         tr = np.zeros(n)
         tr[0] = highs[0] - lows[0]
         for i in range(1, n):
-            tr[i] = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1])
-            )
+            tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
         alpha = 2 / (period + 1)
         atr = np.zeros(n)
         atr[0] = tr[0]
@@ -105,8 +101,9 @@ class CloudKnightStrategy(_AKStrategy):
         return float(atr[-1])
 
     @staticmethod
-    def _calc_kdj(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-                  n: int = 9, m1: int = 3, m2: int = 3) -> tuple:
+    def _calc_kdj(
+        highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, n: int = 9, m1: int = 3, m2: int = 3
+    ) -> tuple:
         """返回 (K, D, J) 最新值"""
         length = min(len(highs), len(lows), len(closes))
         if length < n:
@@ -118,8 +115,8 @@ class CloudKnightStrategy(_AKStrategy):
         alpha_d = 2 / (m2 + 1) if m2 > 0 else 1.0
 
         for i in range(n - 1, length):
-            hh = np.max(highs[i - n + 1:i + 1])
-            ll = np.min(lows[i - n + 1:i + 1])
+            hh = np.max(highs[i - n + 1 : i + 1])
+            ll = np.min(lows[i - n + 1 : i + 1])
             rsv = (closes[i] - ll) / (hh - ll) * 100 if hh > ll else 50.0
             if i == n - 1:
                 k_vals[i] = 50 * (1 - alpha_k) + rsv * alpha_k
