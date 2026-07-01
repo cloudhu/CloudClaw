@@ -44,7 +44,6 @@ from .auction_analyzer import AuctionAnalyzer, AuctionSnapshot
 from .config import (
     DEFAULT_CAPITAL,
     LIVE_ENGINE_CHECK_INTERVAL,
-    LIVE_ENGINE_SCAN_INTERVAL,
     LIVE_LOG_DIR,
     ML_GATE_DIRECTION_THRESHOLD,
     ML_GATE_ENABLED,
@@ -146,7 +145,6 @@ class LiveTradingEngine:
         # 交易日状态
         self._current_phase: TradingPhase = TradingPhase.CLOSED
         self._last_phase: TradingPhase = TradingPhase.CLOSED
-        self._phase_completed: set[str] = set()
 
         # 分析结果缓存
         self._latest_snapshot: MarketSnapshot | None = None
@@ -166,6 +164,7 @@ class LiveTradingEngine:
         self._lifecycle_last_run: dict[str, datetime] = {}  # 各阶段上次执行时间
         self._lifecycle_pause_until: datetime | None = None  # 异常暂停
         self._idle_since: datetime | None = None          # 进入 IDLE 的时间（用于循环重启）
+        self._daily_ops_done: set[str] = set()            # 当日已完成的一次性操作（如 market_snapshot, auction_analysis）
 
         # ── 各策略独立生命周期阶段跟踪 ──
         self._strategy_phase: dict[str, str] = {k: LifecyclePhase.IDLE.value[0] for k in STRATEGIES}
@@ -215,7 +214,6 @@ class LiveTradingEngine:
 
         self.state = EngineState.STARTING
         self._stop_event.clear()
-        self._phase_completed.clear()
         self._clear_daily_cache()
         self._log = self._add_log  # 重定向方法引用
 
@@ -267,7 +265,7 @@ class LiveTradingEngine:
     # ═══════════════════════════════════════════
 
     def _run_loop(self):
-        """引擎主循环 - 时间周期驱动"""
+        """引擎主循环 - TradingPhase 负责时间感知，LifecyclePhase 统一调度所有业务操作。"""
         self.state = EngineState.RUNNING
         self._log(TradingPhase.CLOSED, "主循环启动")
 
@@ -275,22 +273,18 @@ class LiveTradingEngine:
             try:
                 now = datetime.now()
 
-                # 确定当前阶段
+                # 确定当前时间段（仅用于时间感知，不触发业务操作）
                 phase = self.calendar.get_current_phase(now)
                 self._current_phase = phase
 
-                # 阶段切换检测
+                # 阶段切换检测 → 只做状态管理（重置缓存、加载池等一次性操作）
                 if phase != self._last_phase:
                     self._on_phase_enter(phase, now)
                     self._last_phase = phase
 
-                # 根据当前阶段执行任务
+                # 统一入口：LifecyclePhase 调度所有业务操作
                 if self.state == EngineState.RUNNING:
-                    self._dispatch_phase_action(phase, now)
-
-                # 心跳：驱动策略日常生命周期（所有时段，每次循环检查）
-                if self.state == EngineState.RUNNING:
-                    self._lifecycle_tick(now, phase)
+                    self._lifecycle_tick(now)
 
                 # 等待下次检查
                 self._stop_event.wait(timeout=LIVE_ENGINE_CHECK_INTERVAL)
@@ -303,109 +297,51 @@ class LiveTradingEngine:
         self.state = EngineState.STOPPED
 
     def _on_phase_enter(self, phase: TradingPhase, now: datetime):
-        """进入新阶段时的回调"""
-        # 重置阶段完成标记（新的一轮）
+        """进入新时间段时的状态管理回调（不执行业务操作，业务统一由 LifecyclePhase 调度）。"""
+        # 新交易日：重置缓存和生命周期
         if phase == TradingPhase.PRE_MARKET:
-            self._phase_completed.clear()
             self._clear_daily_cache()
-            self._reset_lifecycle()  # 新交易日，重置生命周期
+            self._daily_ops_done.clear()
+            self._reset_lifecycle()
+            self.pool_mgr.load_all()
+            self.fetcher.reset_unavailable_sources()
+
+        # 盘后：保存每日总结
+        elif phase == TradingPhase.POST_MARKET:
+            self._save_daily_summary()
 
         label = get_phase_label(phase)
         self._log(phase, f">>> 进入 [{label}] 阶段")
 
-    def _dispatch_phase_action(self, phase: TradingPhase, now: datetime):
-        """根据当前阶段分发执行动作"""
-        # 每个阶段只执行一次（避免重复执行）
-        phase_key = f"{phase.value}_{now.strftime('%Y%m%d')}"
-        if phase_key in self._phase_completed:
-            return
-
-        if phase == TradingPhase.CLOSED:
-            # 非交易日 → 选股模式
-            if not self.calendar.is_trading_day(now):
-                self._action_non_trading_day(now)
-
-        elif phase == TradingPhase.PRE_MARKET:
-            self._action_pre_market(now)
-
-        elif phase == TradingPhase.AUCTION:
-            self._action_auction(now)
-
-        elif phase == TradingPhase.AUCTION_RESULT:
-            self._action_auction_result(now)
-
-        elif phase == TradingPhase.MORNING:
-            self._action_morning(now)
-
-        elif phase == TradingPhase.LUNCH:
-            self._action_lunch(now)
-
-        elif phase == TradingPhase.AFTERNOON:
-            self._action_afternoon(now)
-
-        elif phase == TradingPhase.POST_MARKET:
-            self._action_post_market(now)
-
-        self._phase_completed.add(phase_key)
-
-        # 保存引擎状态供 Web 仪表盘读取
-        self._save_state()
-
     # ═══════════════════════════════════════════
-    # 各阶段行为实现
+    # 辅助方法（由 LifecyclePhase 调度调用）
     # ═══════════════════════════════════════════
 
-    def _action_non_trading_day(self, now: datetime):
-        """非交易日：启动生命周期选股流程（心跳自动分批执行）"""
-        self._log(TradingPhase.CLOSED, "非交易日 → 生命周期自动选股启动")
-        # 重置数据源状态
-        self.fetcher.reset_unavailable_sources()
-        # 重置选股状态，让生命周期开始循环
-        self._screening_done = False
-        self._screened_codes.clear()
-        self._lifecycle_completed.discard(LifecyclePhase.SCREENING.value[0])
-        self._log(TradingPhase.CLOSED, f"全市场 {5528}+ 只股票将通过心跳分批诊股入池")
-
-    def _action_pre_market(self, now: datetime):
-        """盘前准备 08:30-09:15"""
-        self._log(TradingPhase.PRE_MARKET, "盘前准备开始...")
-
-        # 重置数据源状态，允许之前不可用的数据源恢复尝试
-        self.fetcher.reset_unavailable_sources()
-
-        # 1. 判断是否为交易日
-        if not self.calendar.is_trading_day(now):
-            self._log(TradingPhase.PRE_MARKET, "今日非交易日，跳过盘前分析")
+    def _ensure_market_snapshot(self, now: datetime):
+        """确保当日有市场快照（大盘指数、板块热度、情绪），仅执行一次。"""
+        if "market_snapshot" in self._daily_ops_done:
             return
+        self._daily_ops_done.add("market_snapshot")
 
-        # 2. 加载股票池
-        self.pool_mgr.load_all()
-        pool_summary = self.pool_mgr.summary()
-        self._log(TradingPhase.PRE_MARKET, f"已加载股票池: {pool_summary}")
-
-        # 3. 大盘指数分析
-        self._log(TradingPhase.PRE_MARKET, "正在分析六大核心指数...")
+        self._log(self._current_phase, "正在分析六大核心指数...")
         indices = self.market.analyze_indices(days=60)
         for idx in indices.values():
             arrow = "▲" if idx.pct_change >= 0 else "▼"
             self._log(
-                TradingPhase.PRE_MARKET,
+                self._current_phase,
                 f"  {arrow} {idx.name}: {idx.close:.2f} ({idx.pct_change:+.2f}%) "
                 + f"MACD:{idx.macd_signal} KDJ:{idx.kdj_signal} "
                 f"RSI:{idx.rsi_value}",
             )
 
-        # 4. 板块热度分析
-        self._log(TradingPhase.PRE_MARKET, "正在分析板块热度...")
+        self._log(self._current_phase, "正在分析板块热度...")
         sectors = self.market.analyze_sectors(top_n=10)
         for s in sectors[:5]:
-            self._log(TradingPhase.PRE_MARKET, f"  {s.strength_rank}. {s.name}: {s.pct_change:+.2f}%")
+            self._log(self._current_phase, f"  {s.strength_rank}. {s.name}: {s.pct_change:+.2f}%")
 
-        # 5. 市场情绪评估
         sentiment = self.market.get_market_sentiment()
-        self._log(TradingPhase.PRE_MARKET, f"市场情绪: {sentiment['sentiment'].upper()} (评分:{sentiment['score']})")
+        self._log(self._current_phase, f"市场情绪: {sentiment['sentiment'].upper()} (评分:{sentiment['score']})")
 
-        # 6. 生成市场快照
         self._latest_snapshot = MarketSnapshot(
             timestamp=now,
             is_trading_day=True,
@@ -418,47 +354,34 @@ class LiveTradingEngine:
             capital_flow_summary="盘前",
         )
 
-        # 7. 盘前股票池信号扫描
-        self._log(TradingPhase.PRE_MARKET, "盘前信号扫描...")
-        self._scan_pool_signals(now, sentiment["sentiment"])
+    def _ensure_auction_analysis(self, now: datetime):
+        """确保当日执行了竞价分析，仅执行一次。"""
+        if "auction_analysis" in self._daily_ops_done:
+            return
+        self._daily_ops_done.add("auction_analysis")
 
-        self._log(TradingPhase.PRE_MARKET, "盘前准备完成，等待集合竞价")
-
-    def _action_auction(self, now: datetime):
-        """集合竞价监控 09:15-09:25"""
-        self._log(TradingPhase.AUCTION, "集合竞价进行中...")
-        # 实际系统中此处可订阅实时竞价数据流
-        # 当前通过 akshare 的延时数据做近似监控
-
-    def _action_auction_result(self, now: datetime):
-        """竞价结果分析 09:26-09:29"""
-        self._log(TradingPhase.AUCTION_RESULT, "分析竞价结果...")
-
-        # 获取所有策略关注的股票代码
         watch_codes = set()
         for strategy_name in STRATEGIES:
             pool = self.pool_mgr.get_pool(strategy_name)
             if pool:
-                for item in pool.ranked()[:10]:  # 每策略取前10
+                for item in pool.ranked()[:10]:
                     watch_codes.add(item.code)
 
         if not watch_codes:
-            self._log(TradingPhase.AUCTION_RESULT, "无关注标的，跳过竞价分析")
+            self._log(self._current_phase, "无关注标的，跳过竞价分析")
             return
 
-        self._log(TradingPhase.AUCTION_RESULT, f"竞价分析 {len(watch_codes)} 只关注标的...")
-
-        # 竞价分析
+        self._log(self._current_phase, f"竞价分析 {len(watch_codes)} 只关注标的...")
         self._latest_auction = self.auction.analyze_auction(list(watch_codes), verbose=True)
 
         auc = self._latest_auction
         self._log(
-            TradingPhase.AUCTION_RESULT,
-            f"竞价结果: 强势{auc.strong_auction_count} 只, " + f"弱势{auc.weak_auction_count} 只, "
-            f"偏{bias_cn(auc.market_bias)}",
+            self._current_phase,
+            f"竞价结果: 强势{auc.strong_auction_count} 只, "
+            + f"弱势{auc.weak_auction_count} 只, "
+            + f"偏{bias_cn(auc.market_bias)}",
         )
 
-        # 开盘交易决策
         watch_by_strategy = {}
         for strategy_name in STRATEGIES:
             pool = self.pool_mgr.get_pool(strategy_name)
@@ -466,132 +389,17 @@ class LiveTradingEngine:
                 watch_by_strategy[strategy_name] = [item.code for item in pool.ranked()[:10]]
 
         decisions = self.auction.make_open_trade_decision(auc, watch_by_strategy)
-
         self._todays_decisions = []
         for strategy, dec_list in decisions.items():
             label = STRATEGIES.get(strategy, strategy)
             for d in dec_list:
                 self._todays_decisions.append(d)
                 self._log(
-                    TradingPhase.AUCTION_RESULT,
-                    f"  [{label}] {d['code']} → {d['action']}: " + f"{d['reason']} (置信度:{d['confidence']})",
+                    self._current_phase,
+                    f"  [{label}] {d['code']} → {d['action']}: {d['reason']} (置信度:{d['confidence']})",
                 )
 
-        self._log(TradingPhase.AUCTION_RESULT, f"开盘决策: {len(self._todays_decisions)} 条")
-
-    def _action_morning(self, now: datetime):
-        """早盘交易 09:30-11:30"""
-        if not self._phase_completed_full("morning"):
-            self._log(TradingPhase.MORNING, "早盘开盘! 开始分时走势跟踪与信号扫描")
-
-            # 输出开盘决策摘要
-            if self._todays_decisions:
-                buy_dec = [d for d in self._todays_decisions if d["action"] in ("buy_at_open", "buy")]
-                sell_dec = [d for d in self._todays_decisions if d["action"] == "sell_at_open"]
-                if buy_dec:
-                    self._log(TradingPhase.MORNING, f"竞价买入决策: {len(buy_dec)} 条")
-                    for d in buy_dec[:3]:
-                        self._log(TradingPhase.MORNING, f"  → {d['code']} @ {d.get('price', 0):.2f}")
-                if sell_dec:
-                    self._log(TradingPhase.MORNING, f"竞价卖出决策: {len(sell_dec)} 条")
-
-        # 定期信号扫描（每扫描间隔执行一次）
-        if self._should_scan(now, "morning_scan"):
-            self._scan_pool_signals(now)
-            self._log(TradingPhase.MORNING, "早盘信号扫描完成")
-            self._report_current_signals()
-
-    def _action_lunch(self, now: datetime):
-        """午间休市 11:30-13:00"""
-        self._log(TradingPhase.LUNCH, "午间休市 - 早盘复盘")
-
-        # 1. 15分钟K线分析
-        self._log(TradingPhase.LUNCH, "15分钟K线技术分析 (早盘)...")
-        self._analyze_15min_kline(now)
-
-        # 2. 早盘信号回顾
-        self._log(TradingPhase.LUNCH, "早盘信号回顾:")
-        self._report_current_signals()
-
-        # 3. 制定下午交易计划
-        self._log(TradingPhase.LUNCH, "制定下午交易计划...")
-        self._make_afternoon_plan(now)
-
-        self._log(TradingPhase.LUNCH, "午间分析完成，等待下午开盘")
-
-    def _action_afternoon(self, now: datetime):
-        """午盘交易 13:00-15:00"""
-        if not self._phase_completed_full("afternoon"):
-            self._log(TradingPhase.AFTERNOON, "午盘开盘! 继续分时跟踪")
-
-            if self._trading_plan and self._trading_plan.signals:
-                pm_sigs = [s for s in self._trading_plan.signals if s.signal_type in ("buy", "sell")]
-                if pm_sigs:
-                    self._log(TradingPhase.AFTERNOON, f"下午待执行信号: {len(pm_sigs)} 条")
-
-        # 定期信号扫描
-        if self._should_scan(now, "afternoon_scan"):
-            self._scan_pool_signals(now)
-            self._log(TradingPhase.AFTERNOON, "午盘信号扫描完成")
-            self._report_current_signals()
-
-    def _action_post_market(self, now: datetime):
-        """盘后选股 15:00-次日"""
-        # 双保险：仅在 15:00 后执行（防止跨天/时区等边缘场景）
-        if now.time() < time(15, 0):
-            self._log(TradingPhase.POST_MARKET, "未到收盘时间，暂不执行盘后作业")
-            return
-
-        self._log(TradingPhase.POST_MARKET, "收盘! 开始盘后选股")
-
-        # 1. 保存当日日志
-        self._save_daily_summary()
-
-        # 2. 获取全市场股票列表
-        codes = self.fetcher.build_stock_pool(filter_st=True, filter_new=True)
-        self._log(TradingPhase.POST_MARKET, f"基础池: {len(codes)} 只")
-
-        # 3. 为四种策略筛选股票
-        self._log(TradingPhase.POST_MARKET, "策略独立选股中...")
-        results = self.pool_mgr.screen_all(codes, verbose=False)
-
-        for key, items in results.items():
-            label = STRATEGIES.get(key, key)
-            top_items = items[:5]
-            top_str = ", ".join(f"{i.code}({i.score})" for i in top_items)
-            self._log(TradingPhase.POST_MARKET, f"  [{label}] {len(items)} 只 → Top5: {top_str}")
-
-        # 4. 保存股票池
-        self.pool_mgr.save_all()
-
-        # 5. 制定次日交易计划
-        self._log(TradingPhase.POST_MARKET, "制定次日交易计划...")
-        self._make_next_day_plan(now)
-
-        self._log(TradingPhase.POST_MARKET, "盘后选股完成，等待次日")
-
-    # ═══════════════════════════════════════════
-    # 辅助方法
-    # ═══════════════════════════════════════════
-
-    def _scan_pool_signals(self, now: datetime, sentiment: str = "neutral"):
-        """扫描各策略股票池的交易信号"""
-        stock_pool_map = {}
-        for strategy_name in STRATEGIES:
-            pool = self.pool_mgr.get_pool(strategy_name)
-            if pool:
-                codes = [item.code for item in pool.ranked()[:POOL_MAX_SIZE]]
-                if codes:
-                    stock_pool_map[strategy_name] = codes
-
-        if not stock_pool_map:
-            self._log(self._current_phase, "股票池为空，跳过信号扫描")
-            return
-
-        self._latest_signals = self.hunter.scan_all_strategies(stock_pool_map, days=120, verbose=False)
-
-        # 生成交易计划
-        self._trading_plan = self.hunter.build_trading_plan(self._latest_signals, sentiment)
+        self._log(self._current_phase, f"开盘决策: {len(self._todays_decisions)} 条")
 
     def _analyze_15min_kline(self, now: datetime):
         """15分钟K线技术分析（午间复盘用，使用内置指标库 analyze_* 系列）"""
@@ -697,18 +505,6 @@ class LiveTradingEngine:
                         f"  [卖] {s.code} {s.name} @ ~{s.price:.2f} " + f"[{s.confidence}] {s.reason[:40]}",
                     )
 
-    def _should_scan(self, now: datetime, key: str) -> bool:
-        """判断是否应该执行扫描"""
-        attr = f"_last_{key}"
-        last = getattr(self, attr, None)
-        if last is None:
-            setattr(self, attr, now)
-            return True
-        if (now - last).total_seconds() >= LIVE_ENGINE_SCAN_INTERVAL:
-            setattr(self, attr, now)
-            return True
-        return False
-
     # ═══════════════════════════════════════════
     # 心跳驱动的策略日常生命周期
     # ═══════════════════════════════════════════
@@ -733,18 +529,19 @@ class LiveTradingEngine:
     # 生命周期主驱动
     # ═══════════════════════════════════════════
 
-    def _lifecycle_tick(self, now: datetime, trading_phase: TradingPhase):
+    def _lifecycle_tick(self, now: datetime):
         """心跳主入口：根据当前交易时段确定并执行生命周期阶段。
 
         在引擎主循环每次 tick 时调用（所有时段）。
         交易时段与非交易时段采用不同的阶段调度策略。
+        LifecyclePhase 统一负责所有业务操作的调度，TradingPhase 仅提供时间上下文。
         """
         # 异常暂停检查
         if self._lifecycle_pause_until and now < self._lifecycle_pause_until:
             return
 
         # 确定当前应执行的生命周期阶段
-        target_phase = self._lifecycle_determine_phase(now, trading_phase)
+        target_phase = self._lifecycle_determine_phase(now)
 
         # IDLE/ML 阶段时同步策略阶段状态（供前端展示）
         if target_phase in (LifecyclePhase.IDLE, LifecyclePhase.MACHINE_LEARNING):
@@ -752,14 +549,14 @@ class LiveTradingEngine:
             self._save_state()  # 持久化 IDLE/ML 状态变更，供 Web 仪表盘实时读取
 
         # 冷却检查
-        if not self._lifecycle_can_run(target_phase, now, trading_phase):
+        if not self._lifecycle_can_run(target_phase, now):
             return
 
         # 执行阶段动作
-        self._lifecycle_execute(target_phase, now, trading_phase)
+        self._lifecycle_execute(target_phase, now)
         self._save_state()  # 持久化策略生命周期阶段，供 Web 仪表盘实时读取
 
-    def _lifecycle_determine_phase(self, now: datetime, trading_phase: TradingPhase) -> LifecyclePhase:
+    def _lifecycle_determine_phase(self, now: datetime) -> LifecyclePhase:
         """根据当前交易时段确定应执行的生命周期阶段。
 
         非交易时段 (CLOSED): 顺序推进 选股 → 信号 → 止损 → 计划 → 回测 → 空闲
@@ -770,9 +567,10 @@ class LiveTradingEngine:
           2. 策略股票池有精选的股票需要训练（focus/watch 层）
           满足以上两条件时，在空闲阶段转入 MACHINE_LEARNING。
         """
+        tp = self._current_phase  # 当前时间段（TradingPhase → LifecyclePhase 映射）
+
         # ── 非交易时段：顺序推进（不含 ML，ML 在空闲时机会触发） ──
-        if trading_phase == TradingPhase.CLOSED and not self.calendar.is_trading_day(now):
-            # 非交易日：全生命周期循环（选股 → 信号 → 止损 → 计划 → 回测 → 空闲）
+        if tp == TradingPhase.CLOSED and not self.calendar.is_trading_day(now):
             phases_order = [
                 LifecyclePhase.SCREENING,
                 LifecyclePhase.SIGNAL_SCAN,
@@ -783,7 +581,7 @@ class LiveTradingEngine:
             return self._resolve_phase_with_idle_restart(phases_order, now)
 
         # ── 盘后 (POST_MARKET) ──
-        if trading_phase == TradingPhase.POST_MARKET:
+        if tp == TradingPhase.POST_MARKET:
             phases_order = [
                 LifecyclePhase.SCREENING,
                 LifecyclePhase.TRADE_PLAN,
@@ -791,18 +589,18 @@ class LiveTradingEngine:
             ]
             return self._resolve_phase_with_idle_restart(phases_order, now)
 
-        # ── 盘前/竞价 → 信号扫描 + 交易计划 ──
-        if trading_phase in (TradingPhase.PRE_MARKET, TradingPhase.AUCTION, TradingPhase.AUCTION_RESULT):
-            if trading_phase == TradingPhase.PRE_MARKET:
+        # ── 盘前/竞价 → 交易计划 + 信号扫描 ──
+        if tp in (TradingPhase.PRE_MARKET, TradingPhase.AUCTION, TradingPhase.AUCTION_RESULT):
+            if tp == TradingPhase.PRE_MARKET:
                 return LifecyclePhase.TRADE_PLAN
             return LifecyclePhase.SIGNAL_SCAN
 
         # ── 交易时段（早盘/午盘） → 信号 + 止损 + 执行交易（时间轮转） ──
-        if trading_phase in (TradingPhase.MORNING, TradingPhase.AFTERNOON):
+        if tp in (TradingPhase.MORNING, TradingPhase.AFTERNOON):
             return self._resolve_trading_phase(now)
 
         # ── 午间 → 交易计划 ──
-        if trading_phase == TradingPhase.LUNCH:
+        if tp == TradingPhase.LUNCH:
             return LifecyclePhase.TRADE_PLAN
 
         return LifecyclePhase.IDLE
@@ -895,7 +693,7 @@ class LiveTradingEngine:
             return LifecyclePhase.TRADE_EXEC
         return LifecyclePhase.STOP_MONITOR
 
-    def _lifecycle_can_run(self, phase: LifecyclePhase, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _lifecycle_can_run(self, phase: LifecyclePhase, now: datetime) -> bool:
         """检查阶段是否可以执行（冷却间隔控制）"""
         if phase == LifecyclePhase.IDLE:
             return False
@@ -904,8 +702,8 @@ class LiveTradingEngine:
         if last is None:
             return True
 
-        # 根据时段和阶段选择间隔
-        is_trading = trading_phase.is_trading_phase()
+        # 根据当前时段选择冷却间隔
+        is_trading = self._current_phase.is_trading_phase()
         intervals = {
             LifecyclePhase.SCREENING: self._INTERVAL_SCREENING,
             LifecyclePhase.SIGNAL_SCAN: self._INTERVAL_SIGNAL_SCAN if is_trading else self._INTERVAL_SCREENING,
@@ -935,7 +733,7 @@ class LiveTradingEngine:
             self._strategy_phase_label[strategy_key] = phase.label
             self._strategy_phase_updated[strategy_key] = now.strftime("%H:%M:%S")
 
-    def _lifecycle_execute(self, phase: LifecyclePhase, now: datetime, trading_phase: TradingPhase):
+    def _lifecycle_execute(self, phase: LifecyclePhase, now: datetime):
         """执行生命周期阶段动作"""
         self._lifecycle_phase = phase
         self._lifecycle_last_run[phase.value[0]] = now
@@ -957,12 +755,12 @@ class LiveTradingEngine:
         handler = handlers.get(phase)
         if handler:
             try:
-                completed = handler(now, trading_phase)
+                completed = handler(now)
                 if completed:
                     self._lifecycle_completed.add(phase.value[0])
             except Exception as e:
                 logger.warning(f"生命周期 [{phase.label}] 异常: {e}")
-                self._log(trading_phase, f"生命周期 [{phase.label}] 异常: {e}")
+                self._log(self._current_phase, f"生命周期 [{phase.label}] 异常: {e}")
                 self._lifecycle_pause_until = datetime.fromtimestamp(
                     datetime.now().timestamp() + self._PAUSE_ON_ERROR
                 )
@@ -971,12 +769,13 @@ class LiveTradingEngine:
     # ① 选股 SCREENING
     # ═══════════════════════════════════════════
 
-    def _lifecycle_screening(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _lifecycle_screening(self, now: datetime) -> bool:
         """选股：拉取代码诊股入池，直到所有策略池精选层满额。
 
         Returns:
             True = 本阶段完成，可进入下一阶段
         """
+        trading_phase = self._current_phase
         # 已全部完成
         if self._screening_done:
             return True
@@ -988,10 +787,11 @@ class LiveTradingEngine:
             return True
 
         # 执行一轮诊股入池
-        return self._screen_one_batch(now, trading_phase)
+        return self._screen_one_batch(now)
 
-    def _screen_one_batch(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _screen_one_batch(self, now: datetime) -> bool:
         """执行一轮选股：取下一批代码 → 诊股入池 → 评估层级"""
+        trading_phase = self._current_phase
         try:
             from .stock_info_cache import get_stock_info_cache
             from .stock_pool import SCREEN_SAMPLE_SIZE
@@ -1057,8 +857,41 @@ class LiveTradingEngine:
     # ② 信号扫描 SIGNAL_SCAN
     # ═══════════════════════════════════════════
 
-    def _lifecycle_signal_scan(self, now: datetime, trading_phase: TradingPhase) -> bool:
-        """观察买入/卖出信号：对池中股票进行多策略并行信号扫描"""
+    def _lifecycle_signal_scan(self, now: datetime) -> bool:
+        """观察买入/卖出信号：对池中股票进行多策略并行信号扫描。
+        
+        SIGNAL_SCAN 统一负责：
+        - 竞价结果阶段: 竞价分析 + 开盘交易决策（仅一次）
+        - 交易时段: 定期股票池信号扫描 + 信号报告
+        """
+        trading_phase = self._current_phase
+
+        # 竞价结果阶段执行竞价分析（仅一次）
+        if trading_phase == TradingPhase.AUCTION_RESULT:
+            self._ensure_auction_analysis(now)
+
+        # 早盘/午盘开盘日志（仅一次）
+        if trading_phase == TradingPhase.MORNING and "morning_open_log" not in self._daily_ops_done:
+            self._daily_ops_done.add("morning_open_log")
+            self._log(trading_phase, "早盘开盘! 开始分时走势跟踪与信号扫描")
+            if self._todays_decisions:
+                buy_dec = [d for d in self._todays_decisions if d["action"] in ("buy_at_open", "buy")]
+                sell_dec = [d for d in self._todays_decisions if d["action"] == "sell_at_open"]
+                if buy_dec:
+                    self._log(trading_phase, f"竞价买入决策: {len(buy_dec)} 条")
+                    for d in buy_dec[:3]:
+                        self._log(trading_phase, f"  → {d['code']} @ {d.get('price', 0):.2f}")
+                if sell_dec:
+                    self._log(trading_phase, f"竞价卖出决策: {len(sell_dec)} 条")
+
+        if trading_phase == TradingPhase.AFTERNOON and "afternoon_open_log" not in self._daily_ops_done:
+            self._daily_ops_done.add("afternoon_open_log")
+            self._log(trading_phase, "午盘开盘! 继续分时跟踪")
+            if self._trading_plan and self._trading_plan.signals:
+                pm_sigs = [s for s in self._trading_plan.signals if s.signal_type in ("buy", "sell")]
+                if pm_sigs:
+                    self._log(trading_phase, f"下午待执行信号: {len(pm_sigs)} 条")
+
         # 构建各策略的股票代码映射
         stock_pool_map: dict[str, list[str]] = {}
         for strategy_name in STRATEGIES:
@@ -1093,14 +926,19 @@ class LiveTradingEngine:
             total_sell += sum(1 for s in result.signals if s.signal_type in ("sell", "reduce", "close"))
 
         self._log(trading_phase, f"  信号结果: 买入 {total_buy} | 卖出 {total_sell}")
+        
+        # 输出详细信号报告
+        self._report_current_signals()
+        
         return True  # 信号扫描每轮即完成
 
     # ═══════════════════════════════════════════
     # ③ 止盈止损监控 STOP_MONITOR
     # ═══════════════════════════════════════════
 
-    def _lifecycle_stop_monitor(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _lifecycle_stop_monitor(self, now: datetime) -> bool:
         """监控止盈止损条件触发：检查 PaperTrader 持仓是否触发止盈/止损"""
+        trading_phase = self._current_phase
         if not self.paper_trader or not self.paper_trader.accounts:
             return True
 
@@ -1186,8 +1024,9 @@ class LiveTradingEngine:
     # ④ 执行交易 TRADE_EXEC
     # ═══════════════════════════════════════════
 
-    def _lifecycle_trade_exec(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _lifecycle_trade_exec(self, now: datetime) -> bool:
         """执行交易：根据信号或止盈止损触发执行模拟交易"""
+        trading_phase = self._current_phase
         if not self.paper_trader or not self.paper_trader.accounts:
             return True
 
@@ -1290,8 +1129,35 @@ class LiveTradingEngine:
     # ⑤ 制定交易计划 TRADE_PLAN
     # ═══════════════════════════════════════════
 
-    def _lifecycle_trade_plan(self, now: datetime, trading_phase: TradingPhase) -> bool:
-        """制定/更新交易计划：为池中精选层股票生成交易计划"""
+    def _lifecycle_trade_plan(self, now: datetime) -> bool:
+        """制定/更新交易计划：为池中精选层股票生成交易计划。
+        
+        TRADE_PLAN 统一负责：
+        - 盘前: 市场快照生成（大盘指数、板块热度、情绪，仅执行一次）
+        - 午间: 15分钟K线分析 + 下午交易计划调整
+        - 盘后: 次日交易计划概要
+        - 全部时段: 精选层股票交易计划生成
+        """
+        trading_phase = self._current_phase
+
+        # 盘前时生成市场快照（仅一次）
+        if trading_phase == TradingPhase.PRE_MARKET:
+            self._ensure_market_snapshot(now)
+
+        # 午间时做 K 线分析和下午计划
+        if trading_phase == TradingPhase.LUNCH and "lunch_analysis" not in self._daily_ops_done:
+            self._daily_ops_done.add("lunch_analysis")
+            self._log(trading_phase, "午间休市 - 早盘复盘")
+            self._analyze_15min_kline(now)
+            self._report_current_signals()
+            self._make_afternoon_plan(now)
+
+        # 盘后时生成次日计划概要
+        if trading_phase == TradingPhase.POST_MARKET and "next_day_plan" not in self._daily_ops_done:
+            self._daily_ops_done.add("next_day_plan")
+            self._make_next_day_plan(now)
+
+        # 核心：为精选层股票生成交易计划
         plans_generated = 0
 
         for strategy_name in STRATEGIES:
@@ -1333,8 +1199,9 @@ class LiveTradingEngine:
     # ⑥ 数据回测 BACKTEST
     # ═══════════════════════════════════════════
 
-    def _lifecycle_backtest(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _lifecycle_backtest(self, now: datetime) -> bool:
         """数据回测：对各策略进行历史回测，优化策略参数"""
+        trading_phase = self._current_phase
         today_str = now.strftime("%Y%m%d")
         if self._backtest_date == today_str:
             return True  # 今天已回测
@@ -1401,7 +1268,7 @@ class LiveTradingEngine:
 
     _ML_BACKTEST_DAYS = 120  # 降级模式用：历史数据天数
 
-    def _lifecycle_machine_learning(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _lifecycle_machine_learning(self, now: datetime) -> bool:
         """机器学习：基于 AKQuant §12 最佳实践，训练模型辅助交易决策。
 
         触发规则（双重守卫）：
@@ -1419,6 +1286,7 @@ class LiveTradingEngine:
 
         若 sklearn 不可用，自动降级为 Z-Score 线性打分模式。
         """
+        trading_phase = self._current_phase
         today_str = now.strftime("%Y%m%d")
 
         # ── 守卫：检查是否有精选标的需要训练 ──
@@ -1432,7 +1300,7 @@ class LiveTradingEngine:
             last_dt = datetime.strptime(self._ml_last_train_date, "%Y%m%d")
             if (now - last_dt).days < ML_RETRAIN_DAYS:
                 # 已训练，仅做预测同步
-                return self._ml_predict_only(now, trading_phase)
+                return self._ml_predict_only(now)
 
         self._log(trading_phase, f"🧠 [{LifecyclePhase.MACHINE_LEARNING.label}] 启动机器学习流程...")
         self._log(trading_phase, f"  模型: {ML_MODEL_TYPE} | 标签: {ML_LABEL_METHOD} | 训练窗口: {ML_TRAIN_WINDOW}日")
@@ -1495,7 +1363,7 @@ class LiveTradingEngine:
             self._build_ml_prediction_cache(predictions)
 
             # ── 验证上一个交易日的 ML 决策 ──
-            self._validate_ml_decisions(now, trading_phase)
+            self._validate_ml_decisions(now)
 
         except Exception as e:
             logger.warning(f"机器学习异常: {e}")
@@ -1503,8 +1371,9 @@ class LiveTradingEngine:
 
         return True  # 每轮执行即完成
 
-    def _ml_predict_only(self, now: datetime, trading_phase: TradingPhase) -> bool:
+    def _ml_predict_only(self, now: datetime) -> bool:
         """仅预测模式：使用已有模型对池中标的生产预测（不重新训练）"""
+        trading_phase = self._current_phase
         # 收集标的
         all_candidates: list = []
         seen = set()
@@ -1532,7 +1401,7 @@ class LiveTradingEngine:
             self._build_ml_prediction_cache(predictions)
 
             # 验证上一个交易日的 ML 决策
-            self._validate_ml_decisions(now, trading_phase)
+            self._validate_ml_decisions(now)
 
         except Exception as e:
             logger.warning(f"ML 预测异常: {e}")
@@ -1547,8 +1416,9 @@ class LiveTradingEngine:
             self._ml_prediction_cache[p.code] = p.direction
             self._ml_score_cache[p.code] = p.ml_score
 
-    def _validate_ml_decisions(self, now: datetime, trading_phase: TradingPhase):
+    def _validate_ml_decisions(self, now: datetime):
         """验证上一个交易日的 ML 决策准确性，动态调整决策权重。"""
+        trading_phase = self._current_phase
         today_str = now.strftime("%Y%m%d")
         if self._ml_last_validate_date == today_str:
             return
@@ -1601,15 +1471,6 @@ class LiveTradingEngine:
             self._strategy_phase[k] = LifecyclePhase.IDLE.value[0]
             self._strategy_phase_label[k] = LifecyclePhase.IDLE.label
             self._strategy_phase_updated[k] = ""
-
-    def _phase_completed_full(self, prefix: str) -> bool:
-        """检查阶段是否已完成全部初始化"""
-        today = datetime.now().strftime("%Y%m%d")
-        full_key = f"morning_init_{today}" if prefix == "morning" else f"afternoon_init_{today}"
-        if full_key in self._phase_completed:
-            return True
-        self._phase_completed.add(full_key)
-        return False
 
     def _clear_daily_cache(self):
         """清除每日临时缓存"""
